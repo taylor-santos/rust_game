@@ -25,16 +25,18 @@ use cgmath::{Matrix3, Matrix4, Point3, Rad, Vector3};
 use std::sync::Arc;
 use std::time::Instant;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::command_buffer::{RenderingAttachmentInfo, RenderingInfo};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::image::{ImageCreateInfo, ImageType};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::{Pipeline, PipelineBindPoint};
+use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
+use vulkano::shader::EntryPoint;
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        RenderingAttachmentInfo, RenderingInfo,
     },
     device::{
         physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, Features,
@@ -56,9 +58,8 @@ use vulkano::{
             GraphicsPipelineCreateInfo,
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
-        DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+        GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
     },
-    render_pass::{AttachmentLoadOp, AttachmentStoreOp},
     swapchain::{
         acquire_next_image, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
     },
@@ -354,22 +355,6 @@ fn main() {
         },
     );
 
-    let depth_buffer = ImageView::new_default(
-        Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: Format::D32_SFLOAT,
-                extent: images[0].extent(),
-                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-
     // First, we load the shaders that the pipeline will use:
     // the vertex shader and the fragment shader.
     //
@@ -387,123 +372,14 @@ fn main() {
     // At this point, OpenGL initialization would be finished. However in Vulkan it is not. OpenGL
     // implicitly does a lot of computation whenever you draw. In Vulkan, you have to do all this
     // manually.
-
-    // Before we draw, we have to create what is called a **pipeline**. A pipeline describes how
-    // a GPU operation is to be performed. It is similar to an OpenGL program, but it also contains
-    // many settings for customization, all baked into a single object. For drawing, we create
-    // a **graphics** pipeline, but there are also other types of pipeline.
-    let pipeline = {
-        // Automatically generate a vertex input state from the vertex shader's input interface,
-        // that takes a single vertex buffer containing `Vertex` structs.
-        let vertex_input_state = [Position::per_vertex(), Normal::per_vertex()]
-            .definition(&vs.info().input_interface)
-            .unwrap();
-
-        // Make a list of the shader stages that the pipeline will have.
-        let stages = [
-            PipelineShaderStageCreateInfo::new(vs),
-            PipelineShaderStageCreateInfo::new(fs),
-        ];
-
-        // We must now create a **pipeline layout** object, which describes the locations and types of
-        // descriptor sets and push constants used by the shaders in the pipeline.
-        //
-        // Multiple pipelines can share a common layout object, which is more efficient.
-        // The shaders in a pipeline must use a subset of the resources described in its pipeline
-        // layout, but the pipeline layout is allowed to contain resources that are not present in the
-        // shaders; they can be used by shaders in other pipelines that share the same layout.
-        // Thus, it is a good idea to design shaders so that many pipelines have common resource
-        // locations, which allows them to share pipeline layouts.
-        let layout = PipelineLayout::new(
-            device.clone(),
-            // Since we only have one pipeline in this example, and thus one pipeline layout,
-            // we automatically generate the creation info for it from the resources used in the
-            // shaders. In a real application, you would specify this information manually so that you
-            // can re-use one layout in multiple pipelines.
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .unwrap(),
-        )
-        .unwrap();
-
-        // We describe the formats of attachment images where the colors, depth and/or stencil
-        // information will be written. The pipeline will only be usable with this particular
-        // configuration of the attachment images.
-        let subpass = PipelineRenderingCreateInfo {
-            // We specify a single color attachment that will be rendered to. When we begin
-            // rendering, we will specify a swapchain image to be used as this attachment, so here
-            // we set its format to be the same format as the swapchain.
-            color_attachment_formats: vec![Some(swapchain.image_format())],
-            depth_attachment_format: Some(Format::D32_SFLOAT),
-            ..Default::default()
-        };
-
-        // Finally, create the pipeline.
-        GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                // How vertex data is read from the vertex buffers into the vertex shader.
-                vertex_input_state: Some(vertex_input_state),
-                // How vertices are arranged into primitive shapes.
-                // The default primitive shape is a triangle.
-                input_assembly_state: Some(InputAssemblyState::default()),
-                // How primitives are transformed and clipped to fit the framebuffer.
-                // We use a resizable viewport, set to draw over the entire window.
-                viewport_state: Some(ViewportState::default()),
-                // How polygons are culled and converted into a raster of pixels.
-                // The default value does not perform any culling.
-                rasterization_state: Some(RasterizationState::default()),
-                // How multiple fragment shader samples are converted to a single pixel value.
-                // The default value does not perform any multisampling.
-                depth_stencil_state: Some(DepthStencilState {
-                    depth: Some(DepthState::simple()),
-                    ..Default::default()
-                }),
-                multisample_state: Some(MultisampleState::default()),
-                // How pixel values are combined with the values already present in the framebuffer.
-                // The default value overwrites the old value with the new one, without any blending.
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.color_attachment_formats.len() as u32,
-                    ColorBlendAttachmentState::default(),
-                )),
-                // Dynamic states allows us to specify parts of the pipeline settings when
-                // recording the command buffer, before we perform drawing.
-                // Here, we specify that the viewport should be dynamic.
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(subpass.into()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
-        .unwrap()
-    };
-
-    // Dynamic viewports allow us to recreate just the viewport when the window is resized.
-    // Otherwise we would have to recreate the whole pipeline.
-    let mut viewport = Viewport {
-        offset: [0.0, 0.0],
-        extent: [0.0, 0.0],
-        depth_range: 0.0..=1.0,
-    };
-
-    // When creating the swapchain, we only created plain images. To use them as an attachment for
-    // rendering, we must wrap then in an image view.
-    //
-    // Since we need to draw to multiple images, we are going to create a different image view for
-    // each image.
-    let mut attachment_image_views = window_size_dependent_setup(&images, &mut viewport);
-
-    let descriptor_set_allocator =
-        StandardDescriptorSetAllocator::new(device.clone(), Default::default());
-
-    // Before we can start creating and recording command buffers, we need a way of allocating
-    // them. Vulkano provides a command buffer allocator, which manages raw Vulkan command pools
-    // underneath and provides a safe interface for them.
-    let command_buffer_allocator =
-        StandardCommandBufferAllocator::new(device.clone(), Default::default());
-
-    // Initialization is finally finished!
+    let (mut pipeline, mut framebuffers, mut depth_buffer) = window_size_dependent_setup(
+        device.clone(),
+        vs.clone(),
+        fs.clone(),
+        swapchain.image_format(),
+        &images,
+        memory_allocator.clone(),
+    );
 
     // In some situations, the swapchain will become invalid by itself. This includes for example
     // when the window is resized (as the images of the swapchain will no longer match the
@@ -523,7 +399,19 @@ fn main() {
     // Destroying the `GpuFuture` blocks until the GPU is finished executing it. In order to avoid
     // that, we store the submission of the previous frame here.
     let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
+
     let rotation_start = Instant::now();
+
+    let descriptor_set_allocator =
+        StandardDescriptorSetAllocator::new(device.clone(), Default::default());
+
+    // Before we can start creating and recording command buffers, we need a way of allocating
+    // them. Vulkano provides a command buffer allocator, which manages raw Vulkan command pools
+    // underneath and provides a safe interface for them.
+    let command_buffer_allocator =
+        StandardCommandBufferAllocator::new(device.clone(), Default::default());
+
+    // Initialization is finally finished!
 
     event_loop.run(move |event, _, control_flow| {
         match event {
@@ -566,12 +454,18 @@ fn main() {
                         .expect("failed to recreate swapchain");
 
                     swapchain = new_swapchain;
-
-                    // Now that we have new swapchain images, we must create new image views from
-                    // them as well.
-                    attachment_image_views =
-                        window_size_dependent_setup(&new_images, &mut viewport);
-
+                    let (new_pipeline, new_framebuffers, new_depth_buffer) =
+                        window_size_dependent_setup(
+                            device.clone(),
+                            vs.clone(),
+                            fs.clone(),
+                            swapchain.image_format(),
+                            &new_images,
+                            memory_allocator.clone(),
+                        );
+                    pipeline = new_pipeline;
+                    framebuffers = new_framebuffers;
+                    depth_buffer = new_depth_buffer;
                     recreate_swapchain = false;
                 }
 
@@ -683,7 +577,7 @@ fn main() {
                             ..RenderingAttachmentInfo::image_view(
                                 // We specify image view corresponding to the currently acquired
                                 // swapchain image, to use for this attachment.
-                                attachment_image_views[image_index as usize].clone(),
+                                framebuffers[image_index as usize].clone(),
                             )
                         })],
                         depth_attachment: Some(RenderingAttachmentInfo {
@@ -694,11 +588,6 @@ fn main() {
                         }),
                         ..Default::default()
                     })
-                    .unwrap()
-                    // We are now inside the first subpass of the render pass.
-                    //
-                    // TODO: Document state setting and how it affects subsequent draw commands.
-                    .set_viewport(0, [viewport.clone()].into_iter().collect())
                     .unwrap()
                     .bind_pipeline_graphics(pipeline.clone())
                     .unwrap()
@@ -764,16 +653,126 @@ fn main() {
 
 /// This function is called once during initialization, then again whenever the window is resized.
 fn window_size_dependent_setup(
+    device: Arc<Device>,
+    vs: EntryPoint,
+    fs: EntryPoint,
+    color_format: Format,
     images: &[Arc<Image>],
-    viewport: &mut Viewport,
-) -> Vec<Arc<ImageView>> {
-    let extent = images[0].extent();
-    viewport.extent = [extent[0] as f32, extent[1] as f32];
-
-    images
+    memory_allocator: Arc<StandardMemoryAllocator>,
+) -> (Arc<GraphicsPipeline>, Vec<Arc<ImageView>>, Arc<ImageView>) {
+    let attachment_image_views = images
         .iter()
         .map(|image| ImageView::new_default(image.clone()).unwrap())
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+
+    let depth_buffer = ImageView::new_default(
+        Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::D32_SFLOAT,
+                extent: images[0].extent(),
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT, // Include ` | ImageUsage::TRANSIENT_ATTACHMENT` if the depth buffer will not be sampled
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Automatically generate a vertex input state from the vertex shader's input interface,
+    // that takes a single vertex buffer containing `Vertex` structs.
+    let vertex_input_state = [Position::per_vertex(), Normal::per_vertex()]
+        .definition(&vs.info().input_interface)
+        .unwrap();
+
+    // Make a list of the shader stages that the pipeline will have.
+    let stages = [
+        PipelineShaderStageCreateInfo::new(vs),
+        PipelineShaderStageCreateInfo::new(fs),
+    ];
+
+    // We must now create a **pipeline layout** object, which describes the locations and types of
+    // descriptor sets and push constants used by the shaders in the pipeline.
+    //
+    // Multiple pipelines can share a common layout object, which is more efficient.
+    // The shaders in a pipeline must use a subset of the resources described in its pipeline
+    // layout, but the pipeline layout is allowed to contain resources that are not present in the
+    // shaders; they can be used by shaders in other pipelines that share the same layout.
+    // Thus, it is a good idea to design shaders so that many pipelines have common resource
+    // locations, which allows them to share pipeline layouts.
+    let layout = PipelineLayout::new(
+        device.clone(),
+        // Since we only have one pipeline in this example, and thus one pipeline layout,
+        // we automatically generate the creation info for it from the resources used in the
+        // shaders. In a real application, you would specify this information manually so that you
+        // can re-use one layout in multiple pipelines.
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap(),
+    )
+    .unwrap();
+
+    // We describe the formats of attachment images where the colors, depth and/or stencil
+    // information will be written. The pipeline will only be usable with this particular
+    // configuration of the attachment images.
+    let subpass = PipelineRenderingCreateInfo {
+        // We specify a single color attachment that will be rendered to. When we begin
+        // rendering, we will specify a swapchain image to be used as this attachment, so here
+        // we set its format to be the same format as the swapchain.
+        color_attachment_formats: vec![Some(color_format)],
+        depth_attachment_format: Some(Format::D32_SFLOAT),
+        ..Default::default()
+    };
+
+    let extent = images[0].extent();
+    let viewport_state = ViewportState {
+        viewports: [Viewport {
+            offset: [0.0, 0.0],
+            extent: [extent[0] as f32, extent[1] as f32],
+            depth_range: 0.0..=1.0,
+        }]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    let pipeline = GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            // How vertex data is read from the vertex buffers into the vertex shader.
+            vertex_input_state: Some(vertex_input_state),
+            // How vertices are arranged into primitive shapes.
+            // The default primitive shape is a triangle.
+            input_assembly_state: Some(InputAssemblyState::default()),
+            // How primitives are transformed and clipped to fit the framebuffer.
+            viewport_state: Some(viewport_state),
+            // How polygons are culled and converted into a raster of pixels.
+            // The default value does not perform any culling.
+            rasterization_state: Some(RasterizationState::default()),
+            // How multiple fragment shader samples are converted to a single pixel value.
+            // The default value does not perform any multisampling.
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState::simple()),
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            // How pixel values are combined with the values already present in the framebuffer.
+            // The default value overwrites the old value with the new one, without any blending.
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.color_attachment_formats.len() as u32,
+                ColorBlendAttachmentState::default(),
+            )),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .unwrap();
+
+    (pipeline, attachment_image_views, depth_buffer)
 }
 
 mod vs {
