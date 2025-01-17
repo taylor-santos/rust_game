@@ -21,9 +21,17 @@
 // `khr_dynamic_rendering` extension, or if you want to see how to support older versions, see the
 // original triangle example.
 
+use cgmath::{Matrix3, Matrix4, Point3, Rad, Vector3};
 use std::sync::Arc;
+use std::time::Instant;
+use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
+use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
+use vulkano::image::{ImageCreateInfo, ImageType};
+use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
+use vulkano::pipeline::{Pipeline, PipelineBindPoint};
 use vulkano::{
-    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage},
+    buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
         RenderingAttachmentInfo, RenderingInfo,
@@ -32,6 +40,7 @@ use vulkano::{
         physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, Features,
         QueueCreateInfo, QueueFlags,
     },
+    format::Format,
     image::{view::ImageView, Image, ImageUsage},
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
@@ -61,6 +70,9 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
+
+mod model;
+use crate::model::{Normal, Position, INDICES, NORMALS, POSITIONS};
 
 fn main() {
     let event_loop = EventLoop::new();
@@ -289,29 +301,8 @@ fn main() {
 
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
-    // We now create a buffer that will store the shape of our triangle. We use `#[repr(C)]` here
-    // to force rustc to use a defined layout for our data, as the default representation has *no
-    // guarantees*.
-    #[derive(BufferContents, Vertex)]
-    #[repr(C)]
-    struct Vertex {
-        #[format(R32G32_SFLOAT)]
-        position: [f32; 2],
-    }
-
-    let vertices = [
-        Vertex {
-            position: [-0.5, -0.25],
-        },
-        Vertex {
-            position: [0.0, 0.5],
-        },
-        Vertex {
-            position: [0.25, -0.1],
-        },
-    ];
     let vertex_buffer = Buffer::from_iter(
-        memory_allocator,
+        memory_allocator.clone(),
         BufferCreateInfo {
             usage: BufferUsage::VERTEX_BUFFER,
             ..Default::default()
@@ -321,53 +312,77 @@ fn main() {
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
-        vertices,
+        POSITIONS,
+    )
+    .unwrap();
+    let normals_buffer = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        NORMALS,
+    )
+    .unwrap();
+    let index_buffer = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::INDEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        INDICES,
     )
     .unwrap();
 
-    // The next step is to create the shaders.
+    let uniform_buffer = SubbufferAllocator::new(
+        memory_allocator.clone(),
+        SubbufferAllocatorCreateInfo {
+            buffer_usage: BufferUsage::UNIFORM_BUFFER,
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+    );
+
+    let depth_buffer = ImageView::new_default(
+        Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::D32_SFLOAT,
+                extent: images[0].extent(),
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    // First, we load the shaders that the pipeline will use:
+    // the vertex shader and the fragment shader.
     //
-    // The raw shader creation API provided by the vulkano library is unsafe for various reasons,
-    // so The `shader!` macro provides a way to generate a Rust module from GLSL source - in the
-    // example below, the source is provided as a string input directly to the shader, but a path
-    // to a source file can be provided as well. Note that the user must specify the type of shader
-    // (e.g. "vertex", "fragment", etc.) using the `ty` option of the macro.
-    //
-    // The items generated by the `shader!` macro include a `load` function which loads the shader
-    // using an input logical device. The module also includes type definitions for layout
-    // structures defined in the shader source, for example uniforms and push constants.
-    //
-    // A more detailed overview of what the `shader!` macro generates can be found in the
-    // vulkano-shaders crate docs. You can view them at https://docs.rs/vulkano-shaders/
-    mod vs {
-        vulkano_shaders::shader! {
-            ty: "vertex",
-            src: r"
-                #version 450
-
-                layout(location = 0) in vec2 position;
-
-                void main() {
-                    gl_Position = vec4(position, 0.0, 1.0);
-                }
-            ",
-        }
-    }
-
-    mod fs {
-        vulkano_shaders::shader! {
-            ty: "fragment",
-            src: r"
-                #version 450
-
-                layout(location = 0) out vec4 f_color;
-
-                void main() {
-                    f_color = vec4(1.0, 0.0, 0.0, 1.0);
-                }
-            ",
-        }
-    }
+    // A Vulkan shader can in theory contain multiple entry points, so we have to specify which
+    // one.
+    let vs = vs::load(device.clone())
+        .unwrap()
+        .entry_point("main")
+        .unwrap();
+    let fs = fs::load(device.clone())
+        .unwrap()
+        .entry_point("main")
+        .unwrap();
 
     // At this point, OpenGL initialization would be finished. However in Vulkan it is not. OpenGL
     // implicitly does a lot of computation whenever you draw. In Vulkan, you have to do all this
@@ -378,23 +393,9 @@ fn main() {
     // many settings for customization, all baked into a single object. For drawing, we create
     // a **graphics** pipeline, but there are also other types of pipeline.
     let pipeline = {
-        // First, we load the shaders that the pipeline will use:
-        // the vertex shader and the fragment shader.
-        //
-        // A Vulkan shader can in theory contain multiple entry points, so we have to specify which
-        // one.
-        let vs = vs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap();
-        let fs = fs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap();
-
         // Automatically generate a vertex input state from the vertex shader's input interface,
         // that takes a single vertex buffer containing `Vertex` structs.
-        let vertex_input_state = Vertex::per_vertex()
+        let vertex_input_state = [Position::per_vertex(), Normal::per_vertex()]
             .definition(&vs.info().input_interface)
             .unwrap();
 
@@ -433,6 +434,7 @@ fn main() {
             // rendering, we will specify a swapchain image to be used as this attachment, so here
             // we set its format to be the same format as the swapchain.
             color_attachment_formats: vec![Some(swapchain.image_format())],
+            depth_attachment_format: Some(Format::D32_SFLOAT),
             ..Default::default()
         };
 
@@ -455,6 +457,10 @@ fn main() {
                 rasterization_state: Some(RasterizationState::default()),
                 // How multiple fragment shader samples are converted to a single pixel value.
                 // The default value does not perform any multisampling.
+                depth_stencil_state: Some(DepthStencilState {
+                    depth: Some(DepthState::simple()),
+                    ..Default::default()
+                }),
                 multisample_state: Some(MultisampleState::default()),
                 // How pixel values are combined with the values already present in the framebuffer.
                 // The default value overwrites the old value with the new one, without any blending.
@@ -488,6 +494,9 @@ fn main() {
     // each image.
     let mut attachment_image_views = window_size_dependent_setup(&images, &mut viewport);
 
+    let descriptor_set_allocator =
+        StandardDescriptorSetAllocator::new(device.clone(), Default::default());
+
     // Before we can start creating and recording command buffers, we need a way of allocating
     // them. Vulkano provides a command buffer allocator, which manages raw Vulkan command pools
     // underneath and provides a safe interface for them.
@@ -514,6 +523,7 @@ fn main() {
     // Destroying the `GpuFuture` blocks until the GPU is finished executing it. In order to avoid
     // that, we store the submission of the previous frame here.
     let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
+    let rotation_start = Instant::now();
 
     event_loop.run(move |event, _, control_flow| {
         match event {
@@ -564,6 +574,50 @@ fn main() {
 
                     recreate_swapchain = false;
                 }
+
+                let uniform_buffer_subbuffer = {
+                    let elapsed = rotation_start.elapsed();
+                    let rotation =
+                        elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0;
+                    let rotation = Matrix3::from_angle_y(Rad(rotation as f32));
+
+                    // note: this teapot was meant for OpenGL where the origin is at the lower left
+                    //       instead the origin is at the upper left in Vulkan, so we reverse the Y axis
+                    let aspect_ratio =
+                        swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
+                    let proj = cgmath::perspective(
+                        Rad(std::f32::consts::FRAC_PI_2),
+                        aspect_ratio,
+                        0.01,
+                        100.0,
+                    );
+                    let view = Matrix4::look_at_rh(
+                        Point3::new(0.3, 0.3, 1.0),
+                        Point3::new(0.0, 0.0, 0.0),
+                        Vector3::new(0.0, -1.0, 0.0),
+                    );
+                    let scale = Matrix4::from_scale(0.01);
+
+                    let uniform_data = vs::Data {
+                        world: Matrix4::from(rotation).into(),
+                        view: (view * scale).into(),
+                        proj: proj.into(),
+                    };
+
+                    let subbuffer = uniform_buffer.allocate_sized().unwrap();
+                    *subbuffer.write().unwrap() = uniform_data;
+
+                    subbuffer
+                };
+
+                let layout = pipeline.layout().set_layouts().get(0).unwrap();
+                let set = PersistentDescriptorSet::new(
+                    &descriptor_set_allocator,
+                    layout.clone(),
+                    [WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer)],
+                    [],
+                )
+                .unwrap();
 
                 // Before we can draw on the output, we have to *acquire* an image from the
                 // swapchain. If no image is available (which happens if you submit draw commands
@@ -632,6 +686,12 @@ fn main() {
                                 attachment_image_views[image_index as usize].clone(),
                             )
                         })],
+                        depth_attachment: Some(RenderingAttachmentInfo {
+                            load_op: AttachmentLoadOp::Clear,
+                            store_op: AttachmentStoreOp::Store,
+                            clear_value: Some(1.0f32.into()), // clear depth to 1.0
+                            ..RenderingAttachmentInfo::image_view(depth_buffer.clone())
+                        }),
                         ..Default::default()
                     })
                     .unwrap()
@@ -642,10 +702,19 @@ fn main() {
                     .unwrap()
                     .bind_pipeline_graphics(pipeline.clone())
                     .unwrap()
-                    .bind_vertex_buffers(0, vertex_buffer.clone())
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipeline.layout().clone(),
+                        0,
+                        set,
+                    )
+                    .unwrap()
+                    .bind_vertex_buffers(0, (vertex_buffer.clone(), normals_buffer.clone()))
+                    .unwrap()
+                    .bind_index_buffer(index_buffer.clone())
                     .unwrap()
                     // We add a draw command.
-                    .draw(vertex_buffer.len() as u32, 1, 0, 0)
+                    .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
                     .unwrap()
                     // We leave the render pass.
                     .end_rendering()
@@ -705,4 +774,18 @@ fn window_size_dependent_setup(
         .iter()
         .map(|image| ImageView::new_default(image.clone()).unwrap())
         .collect::<Vec<_>>()
+}
+
+mod vs {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        path: "src/vert.glsl",
+    }
+}
+
+mod fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "src/frag.glsl",
+    }
 }
