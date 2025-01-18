@@ -21,13 +21,19 @@
 // `khr_dynamic_rendering` extension, or if you want to see how to support older versions, see the
 // original triangle example.
 
+use crate::gltf::{load_gltf, TextureFormat};
 use cgmath::{Matrix3, Matrix4, Point3, Rad, Vector3};
+use image::{DynamicImage, ImageBuffer};
 use std::sync::Arc;
 use std::time::Instant;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
-use vulkano::command_buffer::{RenderingAttachmentInfo, RenderingInfo};
+use vulkano::buffer::BufferContents;
+use vulkano::command_buffer::{
+    CopyBufferToImageInfo, PrimaryCommandBufferAbstract, RenderingAttachmentInfo, RenderingInfo,
+};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
+use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::{ImageCreateInfo, ImageType};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::{Pipeline, PipelineBindPoint};
@@ -72,10 +78,34 @@ use winit::{
     window::WindowBuilder,
 };
 
-mod model;
-use crate::model::{Normal, Position, INDICES, NORMALS, POSITIONS};
+mod gltf;
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+pub struct Position {
+    #[format(R32G32B32_SFLOAT)]
+    position: [f32; 3],
+}
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+pub struct Normal {
+    #[format(R32G32B32_SFLOAT)]
+    normal: [f32; 3],
+}
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+pub struct Texcoord {
+    #[format(R32G32_SFLOAT)]
+    texcoord: [f32; 2],
+}
 
 fn main() {
+    let (meshes, textures, materials) = load_gltf("models/sponza.glb").unwrap();
+
+    let mesh = meshes.into_iter().nth(0).unwrap();
+
     let event_loop = EventLoop::new();
 
     let library = VulkanLibrary::new().unwrap();
@@ -313,10 +343,10 @@ fn main() {
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
-        POSITIONS,
+        mesh.positions,
     )
     .unwrap();
-    let normals_buffer = Buffer::from_iter(
+    let normal_buffer = Buffer::from_iter(
         memory_allocator.clone(),
         BufferCreateInfo {
             usage: BufferUsage::VERTEX_BUFFER,
@@ -327,7 +357,21 @@ fn main() {
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
-        NORMALS,
+        mesh.normals,
+    )
+    .unwrap();
+    let texcoords_buffer = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        mesh.texcoords,
     )
     .unwrap();
     let index_buffer = Buffer::from_iter(
@@ -341,7 +385,7 @@ fn main() {
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
-        INDICES,
+        mesh.indices,
     )
     .unwrap();
 
@@ -410,6 +454,77 @@ fn main() {
     // underneath and provides a safe interface for them.
     let command_buffer_allocator =
         StandardCommandBufferAllocator::new(device.clone(), Default::default());
+
+    let mut uploads = AutoCommandBufferBuilder::primary(
+        &command_buffer_allocator,
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .unwrap();
+
+    let images = textures
+        .into_iter()
+        .map(|texture| {
+            let pixels = match texture.format {
+                TextureFormat::R8G8B8A8 => texture.pixels,
+                TextureFormat::R8G8B8 => DynamicImage::ImageRgb8(
+                    ImageBuffer::from_raw(texture.width, texture.height, texture.pixels).unwrap(),
+                )
+                .to_rgba8()
+                .into_raw(),
+                _ => panic!("unsupported texture format: {:?}", texture.format),
+            };
+            let extent: [u32; 3] = [texture.width, texture.height, 1];
+            let upload_buffer = Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_SRC,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                pixels.into_iter(),
+            )
+            .unwrap();
+
+            let image = Image::new(
+                memory_allocator.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: Format::R8G8B8A8_UNORM,
+                    extent,
+                    usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .unwrap();
+
+            uploads
+                .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
+                    upload_buffer,
+                    image.clone(),
+                ))
+                .unwrap();
+
+            ImageView::new_default(image).unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let upload_command_buffer = uploads.build().unwrap();
+
+    upload_command_buffer
+        .execute(queue.clone())
+        .unwrap()
+        .then_signal_fence_and_flush()
+        .unwrap()
+        .wait(None)
+        .unwrap();
+
+    let sampler = Sampler::new(device.clone(), SamplerCreateInfo::simple_repeat_linear()).unwrap();
 
     // Initialization is finally finished!
 
@@ -508,7 +623,14 @@ fn main() {
                 let set = PersistentDescriptorSet::new(
                     &descriptor_set_allocator,
                     layout.clone(),
-                    [WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer)],
+                    [
+                        WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer),
+                        WriteDescriptorSet::image_view_sampler(
+                            1,
+                            images[0].clone(),
+                            sampler.clone(),
+                        ),
+                    ],
                     [],
                 )
                 .unwrap();
@@ -598,7 +720,14 @@ fn main() {
                         set,
                     )
                     .unwrap()
-                    .bind_vertex_buffers(0, (vertex_buffer.clone(), normals_buffer.clone()))
+                    .bind_vertex_buffers(
+                        0,
+                        (
+                            vertex_buffer.clone(),
+                            normal_buffer.clone(),
+                            texcoords_buffer.clone(),
+                        ),
+                    )
                     .unwrap()
                     .bind_index_buffer(index_buffer.clone())
                     .unwrap()
@@ -683,9 +812,13 @@ fn window_size_dependent_setup(
 
     // Automatically generate a vertex input state from the vertex shader's input interface,
     // that takes a single vertex buffer containing `Vertex` structs.
-    let vertex_input_state = [Position::per_vertex(), Normal::per_vertex()]
-        .definition(&vs.info().input_interface)
-        .unwrap();
+    let vertex_input_state = [
+        Position::per_vertex(),
+        Normal::per_vertex(),
+        Texcoord::per_vertex(),
+    ]
+    .definition(&vs.info().input_interface)
+    .unwrap();
 
     // Make a list of the shader stages that the pipeline will have.
     let stages = [
