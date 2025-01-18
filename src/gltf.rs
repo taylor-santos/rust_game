@@ -5,6 +5,7 @@ use std::time::Instant;
 
 type TextureID = usize;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Material {
     pub name: Option<String>,
@@ -46,15 +47,6 @@ pub fn load_gltf(path: &str) -> Result<(Vec<Mesh>, Vec<Texture>, Vec<Material>),
     let (doc, buffers, textures) = gltf::import(path)?;
     println!("Loaded gltf in {:?}", start_time.elapsed());
     start_time = Instant::now();
-
-    let samplers = doc
-        .samplers()
-        .map(|sampler| {
-            dbg!(sampler.min_filter());
-            dbg!(sampler.mag_filter());
-            dbg!(sampler.extras());
-        })
-        .collect::<Vec<_>>();
 
     let materials = doc
         .materials()
@@ -144,7 +136,6 @@ pub fn load_gltf(path: &str) -> Result<(Vec<Mesh>, Vec<Texture>, Vec<Material>),
         meshes.len(),
         start_time.elapsed()
     );
-    start_time = Instant::now();
 
     Ok((meshes, textures, materials))
 }

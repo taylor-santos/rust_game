@@ -27,7 +27,7 @@ use image::{DynamicImage, ImageBuffer};
 use std::sync::Arc;
 use std::time::Instant;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
-use vulkano::buffer::BufferContents;
+use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{
     CopyBufferToImageInfo, PrimaryCommandBufferAbstract, RenderingAttachmentInfo, RenderingInfo,
 };
@@ -39,6 +39,7 @@ use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::{Pipeline, PipelineBindPoint};
 use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
 use vulkano::shader::EntryPoint;
+use vulkano::swapchain::PresentMode;
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
@@ -103,8 +104,6 @@ pub struct Texcoord {
 
 fn main() {
     let (meshes, textures, materials) = load_gltf("models/sponza.glb").unwrap();
-
-    let mesh = meshes.into_iter().nth(0).unwrap();
 
     let event_loop = EventLoop::new();
 
@@ -316,6 +315,17 @@ fn main() {
 
                 image_usage: ImageUsage::COLOR_ATTACHMENT,
 
+                // The present mode determines how the swapchain behaves when multiple images are
+                // waiting in the queue to be presented.
+                //
+                // `PresentMode::Immediate` (vsync off) displays the latest image immediately,
+                // without waiting for the next vertical blanking period. This may cause tearing.
+                //
+                // `PresentMode::Fifo` (vsync on) appends the latest image to the end of the queue,
+                // and the front of the queue is removed during each vertical blanking period to be
+                // presented. No tearing will be visible.
+                present_mode: PresentMode::FifoRelaxed,
+
                 // The alpha mode indicates how the alpha value of the final image will behave. For
                 // example, you can choose whether the window will be opaque or transparent.
                 composite_alpha: surface_capabilities
@@ -331,63 +341,6 @@ fn main() {
     };
 
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
-
-    let vertex_buffer = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        mesh.positions,
-    )
-    .unwrap();
-    let normal_buffer = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        mesh.normals,
-    )
-    .unwrap();
-    let texcoords_buffer = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        mesh.texcoords,
-    )
-    .unwrap();
-    let index_buffer = Buffer::from_iter(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::INDEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        mesh.indices,
-    )
-    .unwrap();
 
     let uniform_buffer = SubbufferAllocator::new(
         memory_allocator.clone(),
@@ -455,76 +408,180 @@ fn main() {
     let command_buffer_allocator =
         StandardCommandBufferAllocator::new(device.clone(), Default::default());
 
-    let mut uploads = AutoCommandBufferBuilder::primary(
-        &command_buffer_allocator,
-        queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .unwrap();
+    struct MeshInfo {
+        pub vertex_buffer: Subbuffer<[f32]>,
+        pub normal_buffer: Subbuffer<[f32]>,
+        pub texcoord_buffer: Subbuffer<[f32]>,
+        pub index_buffer: Subbuffer<[u32]>,
+        pub index_count: u32,
+        pub mat_idx: usize,
+    }
 
-    let images = textures
+    let mesh_infos = meshes
         .into_iter()
-        .map(|texture| {
-            let pixels = match texture.format {
-                TextureFormat::R8G8B8A8 => texture.pixels,
-                TextureFormat::R8G8B8 => DynamicImage::ImageRgb8(
-                    ImageBuffer::from_raw(texture.width, texture.height, texture.pixels).unwrap(),
-                )
-                .to_rgba8()
-                .into_raw(),
-                _ => panic!("unsupported texture format: {:?}", texture.format),
-            };
-            let extent: [u32; 3] = [texture.width, texture.height, 1];
-            let upload_buffer = Buffer::from_iter(
+        .map(|mesh| {
+            let vertex_buffer = Buffer::from_iter(
                 memory_allocator.clone(),
                 BufferCreateInfo {
-                    usage: BufferUsage::TRANSFER_SRC,
+                    usage: BufferUsage::VERTEX_BUFFER,
                     ..Default::default()
                 },
                 AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                pixels.into_iter(),
+                mesh.positions,
             )
             .unwrap();
-
-            let image = Image::new(
+            let normal_buffer = Buffer::from_iter(
                 memory_allocator.clone(),
-                ImageCreateInfo {
-                    image_type: ImageType::Dim2d,
-                    format: Format::R8G8B8A8_UNORM,
-                    extent,
-                    usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
                     ..Default::default()
                 },
-                AllocationCreateInfo::default(),
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                mesh.normals,
             )
             .unwrap();
-
-            uploads
-                .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
-                    upload_buffer,
-                    image.clone(),
-                ))
-                .unwrap();
-
-            ImageView::new_default(image).unwrap()
+            let texcoord_buffer = Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                mesh.texcoords,
+            )
+            .unwrap();
+            let index_count = mesh.indices.len() as u32;
+            let index_buffer = Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::INDEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                mesh.indices,
+            )
+            .unwrap();
+            MeshInfo {
+                vertex_buffer,
+                normal_buffer,
+                texcoord_buffer,
+                index_buffer,
+                index_count,
+                mat_idx: mesh.mat_idx,
+            }
         })
         .collect::<Vec<_>>();
 
-    let upload_command_buffer = uploads.build().unwrap();
+    let sampler = Sampler::new(device.clone(), SamplerCreateInfo::simple_repeat_linear()).unwrap();
 
-    upload_command_buffer
-        .execute(queue.clone())
-        .unwrap()
-        .then_signal_fence_and_flush()
-        .unwrap()
-        .wait(None)
+    let image_sets = {
+        let mut builder = AutoCommandBufferBuilder::primary(
+            &command_buffer_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
         .unwrap();
 
-    let sampler = Sampler::new(device.clone(), SamplerCreateInfo::simple_repeat_linear()).unwrap();
+        let image_buffer_time = Instant::now();
+        let images = textures
+            .into_iter()
+            .map(|texture| {
+                let pixels = match texture.format {
+                    TextureFormat::R8G8B8A8 => texture.pixels,
+                    TextureFormat::R8G8B8 => DynamicImage::ImageRgb8(
+                        ImageBuffer::from_raw(texture.width, texture.height, texture.pixels)
+                            .unwrap(),
+                    )
+                    .to_rgba8()
+                    .into_raw(),
+                    _ => panic!("unsupported texture format: {:?}", texture.format),
+                };
+                let extent: [u32; 3] = [texture.width, texture.height, 1];
+                let upload_buffer = Buffer::from_iter(
+                    memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::TRANSFER_SRC,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    pixels.into_iter(),
+                )
+                .unwrap();
+
+                let image = Image::new(
+                    memory_allocator.clone(),
+                    ImageCreateInfo {
+                        image_type: ImageType::Dim2d,
+                        format: Format::R8G8B8A8_UNORM,
+                        extent,
+                        usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo::default(),
+                )
+                .unwrap();
+
+                builder
+                    .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
+                        upload_buffer,
+                        image.clone(),
+                    ))
+                    .unwrap();
+
+                ImageView::new_default(image).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let upload_command_buffer = builder.build().unwrap();
+
+        upload_command_buffer
+            .execute(queue.clone())
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap();
+        dbg!(image_buffer_time.elapsed());
+
+        let texture_layout = pipeline.layout().set_layouts().get(1).unwrap();
+
+        images
+            .into_iter()
+            .map(|image| {
+                PersistentDescriptorSet::new(
+                    &descriptor_set_allocator,
+                    texture_layout.clone(),
+                    [WriteDescriptorSet::image_view_sampler(
+                        0,
+                        image.clone(),
+                        sampler.clone(),
+                    )],
+                    [],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
 
     // Initialization is finally finished!
 
@@ -619,22 +676,6 @@ fn main() {
                     subbuffer
                 };
 
-                let layout = pipeline.layout().set_layouts().get(0).unwrap();
-                let set = PersistentDescriptorSet::new(
-                    &descriptor_set_allocator,
-                    layout.clone(),
-                    [
-                        WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer),
-                        WriteDescriptorSet::image_view_sampler(
-                            1,
-                            images[0].clone(),
-                            sampler.clone(),
-                        ),
-                    ],
-                    [],
-                )
-                .unwrap();
-
                 // Before we can draw on the output, we have to *acquire* an image from the
                 // swapchain. If no image is available (which happens if you submit draw commands
                 // too quickly), then the function will block. This operation returns the index of
@@ -676,6 +717,15 @@ fn main() {
                 )
                 .unwrap();
 
+                let layout0 = pipeline.layout().set_layouts().get(0).unwrap();
+                let uniform_set = PersistentDescriptorSet::new(
+                    &descriptor_set_allocator,
+                    layout0.clone(),
+                    [WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer)],
+                    [],
+                )
+                .unwrap();
+
                 builder
                     // Before we can draw, we have to *enter a render pass*. We specify which
                     // attachments we are going to use for rendering here, which needs to match
@@ -712,28 +762,42 @@ fn main() {
                     })
                     .unwrap()
                     .bind_pipeline_graphics(pipeline.clone())
-                    .unwrap()
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        pipeline.layout().clone(),
-                        0,
-                        set,
-                    )
-                    .unwrap()
-                    .bind_vertex_buffers(
-                        0,
-                        (
-                            vertex_buffer.clone(),
-                            normal_buffer.clone(),
-                            texcoords_buffer.clone(),
-                        ),
-                    )
-                    .unwrap()
-                    .bind_index_buffer(index_buffer.clone())
-                    .unwrap()
-                    // We add a draw command.
-                    .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
-                    .unwrap()
+                    .unwrap();
+
+                for mesh in &mesh_infos {
+                    let mat = &materials[mesh.mat_idx];
+                    let texture_set = &image_sets[mat.base_color_texture.unwrap_or(0)];
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            pipeline.layout().clone(),
+                            0,
+                            uniform_set.clone(),
+                        )
+                        .unwrap()
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            pipeline.layout().clone(),
+                            1,
+                            texture_set.clone(),
+                        )
+                        .unwrap()
+                        .bind_vertex_buffers(
+                            0,
+                            (
+                                mesh.vertex_buffer.clone(),
+                                mesh.normal_buffer.clone(),
+                                mesh.texcoord_buffer.clone(),
+                            ),
+                        )
+                        .unwrap()
+                        .bind_index_buffer(mesh.index_buffer.clone())
+                        .unwrap()
+                        .draw_indexed(mesh.index_count, 1, 0, 0, 0)
+                        .unwrap();
+                }
+
+                builder
                     // We leave the render pass.
                     .end_rendering()
                     .unwrap();

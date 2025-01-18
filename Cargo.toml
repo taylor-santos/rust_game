@@ -11,5 +11,11 @@ vulkano = "0.34.0"
 vulkano-shaders = "0.34.0"
 winit = "0.28"
 
+[profile.dev]
+opt-level = 0
+
 [profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
 opt-level = 3
