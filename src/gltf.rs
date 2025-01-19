@@ -8,9 +8,66 @@ use std::time::Instant;
 pub struct Mesh {
     pub positions: Vec<f32>,
     pub normals: Vec<f32>,
+    pub tangents: Vec<f32>,
     pub texcoords: Vec<f32>,
     pub indices: Vec<u32>,
     pub mat_idx: usize,
+}
+
+impl mikktspace::Geometry for Mesh {
+    fn num_faces(&self) -> usize {
+        self.indices.len() / 3
+    }
+
+    fn num_vertices_of_face(&self, _face: usize) -> usize {
+        3
+    }
+
+    fn position(&self, face: usize, vert: usize) -> [f32; 3] {
+        let tri = self.indices[face * 3 + vert] as usize;
+        let v0 = self.positions[tri * 3 + 0];
+        let v1 = self.positions[tri * 3 + 1];
+        let v2 = self.positions[tri * 3 + 2];
+        [v0, v1, v2]
+    }
+
+    fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
+        let tri = self.indices[face * 3 + vert] as usize;
+        let n0 = self.normals[tri * 3 + 0];
+        let n1 = self.normals[tri * 3 + 1];
+        let n2 = self.normals[tri * 3 + 2];
+        [n0, n1, n2]
+    }
+
+    fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
+        let tri = self.indices[face * 3 + vert] as usize;
+        let uv0 = self.texcoords[tri * 2 + 0];
+        let uv1 = self.texcoords[tri * 2 + 1];
+        [uv0, uv1]
+    }
+
+    fn set_tangent(
+        &mut self,
+        tangent: [f32; 3],
+        _bi_tangent: [f32; 3],
+        _f_mag_s: f32,
+        _f_mag_t: f32,
+        bi_tangent_preserves_orientation: bool,
+        face: usize,
+        vert: usize,
+    ) {
+        let tri = self.indices[face * 3 + vert] as usize;
+        self.tangents[tri * 3 + 0] = tangent[0];
+        self.tangents[tri * 3 + 1] = tangent[1];
+        self.tangents[tri * 3 + 2] = tangent[2];
+    }
+
+    fn set_tangent_encoded(&mut self, _tangent: [f32; 4], _face: usize, _vert: usize) {
+        let tri = self.indices[_face * 3 + _vert] as usize;
+        self.tangents[tri * 3 + 0] = _tangent[0];
+        self.tangents[tri * 3 + 1] = _tangent[1];
+        self.tangents[tri * 3 + 2] = _tangent[2];
+    }
 }
 
 impl From<gltf::Material<'_>> for Material {
@@ -101,6 +158,54 @@ pub fn load_gltf(path: &str) -> Result<(Vec<Mesh>, Vec<TextureData>, Vec<Materia
                     .into_f32()
                     .flatten()
                     .collect::<Vec<_>>();
+
+                let opt_tangents = reader
+                    .read_tangents()
+                    .map(|t| t.flatten().collect::<Vec<_>>());
+
+                /*
+                let tangents = {
+                    let mut tangents = vec![[0f32; 3]; positions.len()];
+                    let ps = reader.read_positions().unwrap().collect::<Vec<_>>();
+                    let uvs = reader
+                        .read_tex_coords(0)
+                        .unwrap()
+                        .into_f32()
+                        .collect::<Vec<_>>();
+                    let tris = reader
+                        .read_indices()
+                        .unwrap()
+                        .into_u32()
+                        .collect::<Vec<_>>();
+                    for tri in tris.chunks_exact(3) {
+                        let t0 = tri[0] as usize;
+                        let t1 = tri[1] as usize;
+                        let t2 = tri[2] as usize;
+                        let p0 = ps[t0];
+                        let p1 = ps[t1];
+                        let p2 = ps[t2];
+                        let uv0 = uvs[t0];
+                        let uv1 = uvs[t1];
+                        let uv2 = uvs[t2];
+                        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+                        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+                        let duv1 = [uv1[0] - uv0[0], uv1[1] - uv0[1]];
+                        let duv2 = [uv2[0] - uv0[0], uv2[1] - uv0[1]];
+                        let f = 1.0 / (duv1[0] * duv2[1] - duv2[0] * duv1[1]);
+                        let tangent = [
+                            f * (duv2[1] * e1[0] - duv1[1] * e2[0]),
+                            f * (duv2[1] * e1[1] - duv1[1] * e2[1]),
+                            f * (duv2[1] * e1[2] - duv1[1] * e2[2]),
+                        ];
+                        for i in tri {
+                            tangents[*i as usize][0] += tangent[0];
+                            tangents[*i as usize][1] += tangent[1];
+                            tangents[*i as usize][2] += tangent[2];
+                        }
+                    }
+                    tangents.into_iter().flatten().collect()
+                };
+                 */
                 let indices = reader
                     .read_indices()
                     .unwrap()
@@ -108,13 +213,29 @@ pub fn load_gltf(path: &str) -> Result<(Vec<Mesh>, Vec<TextureData>, Vec<Materia
                     .collect::<Vec<_>>();
                 let mat_idx = prim.material().index().unwrap();
 
-                Mesh {
+                let num_verts = positions.len();
+                let mut mesh = Mesh {
                     positions,
                     normals,
+                    tangents: Vec::new(),
                     texcoords,
                     indices,
                     mat_idx,
+                };
+
+                match opt_tangents {
+                    Some(tangents) => {
+                        mesh.tangents = tangents;
+                    }
+                    None => {
+                        mesh.tangents = vec![[0f32; 3]; num_verts].into_iter().flatten().collect();
+                        let start_time = Instant::now();
+                        mikktspace::generate_tangents(&mut mesh);
+                        println!("Generated tangents in {:?}", start_time.elapsed());
+                    }
                 }
+
+                mesh
             })
         })
         .flatten()

@@ -21,9 +21,11 @@
 // `khr_dynamic_rendering` extension, or if you want to see how to support older versions, see the
 // original triangle example.
 
+use crate::camera::FirstPersonCamera;
 use crate::gltf::{load_gltf, TextureFormat};
-use cgmath::{Matrix3, Matrix4, Point3, Rad, Vector3};
+use cgmath::{Matrix4, Point3, Rad, SquareMatrix};
 use image::{DynamicImage, ImageBuffer};
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
 use std::sync::Arc;
 use std::time::Instant;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
@@ -73,12 +75,15 @@ use vulkano::{
     sync::{self, GpuFuture},
     Validated, Version, VulkanError, VulkanLibrary,
 };
+use winit::event::{DeviceEvent, ElementState, MouseButton, VirtualKeyCode};
+use winit::window::{CursorGrabMode, Window};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
 
+mod camera;
 mod gltf;
 mod material;
 
@@ -94,6 +99,13 @@ pub struct Position {
 pub struct Normal {
     #[format(R32G32B32_SFLOAT)]
     normal: [f32; 3],
+}
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+pub struct Tangent {
+    #[format(R32G32B32_SFLOAT)]
+    tangent: [f32; 3],
 }
 
 #[derive(BufferContents, Vertex)]
@@ -325,7 +337,7 @@ fn main() {
                 // `PresentMode::Fifo` (vsync on) appends the latest image to the end of the queue,
                 // and the front of the queue is removed during each vertical blanking period to be
                 // presented. No tearing will be visible.
-                present_mode: PresentMode::FifoRelaxed,
+                present_mode: PresentMode::Immediate,
 
                 // The alpha mode indicates how the alpha value of the final image will behave. For
                 // example, you can choose whether the window will be opaque or transparent.
@@ -412,6 +424,7 @@ fn main() {
     struct MeshInfo {
         pub vertex_buffer: Subbuffer<[f32]>,
         pub normal_buffer: Subbuffer<[f32]>,
+        pub tangent_buffer: Subbuffer<[f32]>,
         pub texcoord_buffer: Subbuffer<[f32]>,
         pub index_buffer: Subbuffer<[u32]>,
         pub index_count: u32,
@@ -449,6 +462,20 @@ fn main() {
                 mesh.normals,
             )
             .unwrap();
+            let tangent_buffer = Buffer::from_iter(
+                memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                mesh.tangents,
+            )
+            .unwrap();
             let texcoord_buffer = Buffer::from_iter(
                 memory_allocator.clone(),
                 BufferCreateInfo {
@@ -481,6 +508,7 @@ fn main() {
             MeshInfo {
                 vertex_buffer,
                 normal_buffer,
+                tangent_buffer,
                 texcoord_buffer,
                 index_buffer,
                 index_count,
@@ -569,19 +597,76 @@ fn main() {
 
     // Initialization is finally finished!
 
+    let mut camera = FirstPersonCamera::new();
+    camera.position = Point3::new(6.0, 1.5, -0.5);
+    camera.yaw = Rad(FRAC_PI_2);
+
+    set_cursor_confinement(window.as_ref(), false);
+
+    let mut mouse_attached = false;
+    let mut forward = false;
+    let mut right = false;
+    let mut backward = false;
+    let mut left = false;
+    let mut last_instant = Instant::now();
+
     event_loop.run(move |event, _, control_flow| {
         match event {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
+            Event::WindowEvent { event, .. } => match event {
+                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                WindowEvent::Resized(_) => recreate_swapchain = true,
+                WindowEvent::MouseInput {
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    set_cursor_confinement(window.as_ref(), true);
+                    mouse_attached = true;
+                }
+                WindowEvent::KeyboardInput { input, .. } => {
+                    let pressed = input.state == ElementState::Pressed;
+
+                    match input.virtual_keycode {
+                        Some(VirtualKeyCode::W) => forward = pressed,
+                        Some(VirtualKeyCode::A) => left = pressed,
+                        Some(VirtualKeyCode::S) => backward = pressed,
+                        Some(VirtualKeyCode::D) => right = pressed,
+                        Some(VirtualKeyCode::Q) => *control_flow = ControlFlow::Exit,
+                        Some(VirtualKeyCode::Escape) => {
+                            set_cursor_confinement(window.as_ref(), false);
+                            mouse_attached = false;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            },
+            Event::DeviceEvent {
+                event: DeviceEvent::MouseMotion { delta: (x, y) },
                 ..
             } => {
-                *control_flow = ControlFlow::Exit;
+                if mouse_attached {
+                    camera.rotate(x as f32, y as f32);
+                }
             }
-            Event::WindowEvent {
-                event: WindowEvent::Resized(_),
-                ..
-            } => {
-                recreate_swapchain = true;
+            Event::MainEventsCleared => {
+                let now = Instant::now();
+                let delta_time = now.duration_since(last_instant);
+                last_instant = now;
+
+                let delta_t = delta_time.as_secs_f32();
+
+                if forward {
+                    camera.move_forward(delta_t);
+                }
+                if left {
+                    camera.move_left(delta_t);
+                }
+                if right {
+                    camera.move_right(delta_t);
+                }
+                if backward {
+                    camera.move_backward(delta_t);
+                }
             }
             Event::RedrawEventsCleared => {
                 // Do not draw the frame when the screen size is zero. On Windows, this can
@@ -602,6 +687,7 @@ fn main() {
                 // window size. In this example that includes the swapchain, the framebuffers and
                 // the dynamic state viewport.
                 if recreate_swapchain {
+                    dbg!(recreate_swapchain);
                     let (new_swapchain, new_images) = swapchain
                         .recreate(SwapchainCreateInfo {
                             image_extent,
@@ -624,41 +710,6 @@ fn main() {
                     depth_buffer = new_depth_buffer;
                     recreate_swapchain = false;
                 }
-
-                let uniform_buffer_subbuffer = {
-                    let elapsed = rotation_start.elapsed();
-                    let rotation =
-                        elapsed.as_secs() as f64 + elapsed.subsec_nanos() as f64 / 1_000_000_000.0;
-                    let rotation = Matrix3::from_angle_y(Rad(rotation as f32));
-
-                    // note: this teapot was meant for OpenGL where the origin is at the lower left
-                    //       instead the origin is at the upper left in Vulkan, so we reverse the Y axis
-                    let aspect_ratio =
-                        swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
-                    let proj = cgmath::perspective(
-                        Rad(std::f32::consts::FRAC_PI_2),
-                        aspect_ratio,
-                        0.01,
-                        100.0,
-                    );
-                    let view = Matrix4::look_at_rh(
-                        Point3::new(0.3, 0.3, 1.0),
-                        Point3::new(0.0, 0.0, 0.0),
-                        Vector3::new(0.0, -1.0, 0.0),
-                    );
-                    let scale = Matrix4::from_scale(0.01);
-
-                    let uniform_data = vs::Data {
-                        world: Matrix4::from(rotation).into(),
-                        view: (view * scale).into(),
-                        proj: proj.into(),
-                    };
-
-                    let subbuffer = uniform_buffer.allocate_sized().unwrap();
-                    *subbuffer.write().unwrap() = uniform_data;
-
-                    subbuffer
-                };
 
                 // Before we can draw on the output, we have to *acquire* an image from the
                 // swapchain. If no image is available (which happens if you submit draw commands
@@ -701,11 +752,58 @@ fn main() {
                 )
                 .unwrap();
 
+                let (mvp_buffer, light_buffer) = {
+                    let proj = {
+                        let aspect_ratio =
+                            swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
+                        let near = 0.005;
+                        let far = 10000.0;
+
+                        let proj = cgmath::perspective(Rad(FRAC_PI_4), aspect_ratio, near, far);
+                        // Vulkan clip space has inverted Y and half Z, compared with OpenGL.
+                        // A corrective transformation is needed to make an OpenGL perspective matrix
+                        // work properly. See here for more info:
+                        // https://matthewwellings.com/blog/the-new-vulkan-coordinate-system/
+                        let correction = Matrix4::<f32>::new(
+                            1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
+                            0.5, 1.0,
+                        );
+
+                        correction * proj
+                    };
+
+                    let elapsed = rotation_start.elapsed();
+                    let rotation =
+                        elapsed.as_secs() as f32 + elapsed.subsec_nanos() as f32 / 1_000_000_000.0;
+
+                    let view = camera.get_view_matrix();
+                    let scale = Matrix4::from_scale(0.01);
+                    let mvp = vs::MVP {
+                        model: Matrix4::identity().into(),
+                        viewproj: (proj * view * scale).into(),
+                    };
+                    let mvp_subbuffer = uniform_buffer.allocate_sized().unwrap();
+                    *mvp_subbuffer.write().unwrap() = mvp;
+
+                    let light = fs::Light {
+                        direction: [0.0, -1.0, 0.0].into(),
+                        color: [1.0, 1.0, 1.0].into(),
+                        ambient: [0.4, 0.4, 0.4].into(),
+                    };
+                    let light_subbuffer = uniform_buffer.allocate_sized().unwrap();
+                    *light_subbuffer.write().unwrap() = light;
+
+                    (mvp_subbuffer, light_subbuffer)
+                };
+
                 let layout0 = pipeline.layout().set_layouts().get(0).unwrap();
                 let uniform_set = PersistentDescriptorSet::new(
                     &descriptor_set_allocator,
                     layout0.clone(),
-                    [WriteDescriptorSet::buffer(0, uniform_buffer_subbuffer)],
+                    [
+                        WriteDescriptorSet::buffer(0, mvp_buffer),
+                        WriteDescriptorSet::buffer(1, light_buffer),
+                    ],
                     [],
                 )
                 .unwrap();
@@ -789,6 +887,7 @@ fn main() {
                             (
                                 mesh.vertex_buffer.clone(),
                                 mesh.normal_buffer.clone(),
+                                mesh.tangent_buffer.clone(),
                                 mesh.texcoord_buffer.clone(),
                             ),
                         )
@@ -881,6 +980,7 @@ fn window_size_dependent_setup(
     let vertex_input_state = [
         Position::per_vertex(),
         Normal::per_vertex(),
+        Tangent::per_vertex(),
         Texcoord::per_vertex(),
     ]
     .definition(&vs.info().input_interface)
@@ -974,16 +1074,29 @@ fn window_size_dependent_setup(
     (pipeline, attachment_image_views, depth_buffer)
 }
 
+fn set_cursor_confinement(window: &Window, state: bool) {
+    if state {
+        window
+            .set_cursor_grab(CursorGrabMode::Confined)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
+            .unwrap();
+    } else {
+        window.set_cursor_grab(CursorGrabMode::None).unwrap();
+    }
+    // No cursor if mouse is confined
+    window.set_cursor_visible(!state);
+}
+
 mod vs {
     vulkano_shaders::shader! {
         ty: "vertex",
-        path: "src/vert.glsl",
+        path: "shaders/vert.glsl",
     }
 }
 
 mod fs {
     vulkano_shaders::shader! {
         ty: "fragment",
-        path: "src/frag.glsl",
+        path: "shaders/frag.glsl",
     }
 }

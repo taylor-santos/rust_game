@@ -18,6 +18,7 @@ gltf = { version = "1.4.1", features = [
     "KHR_materials_emissive_strength",
 ] }
 image = "0.25.5"
+mikktspace = "0.3.0"
 vulkano = "0.34.0"
 vulkano-shaders = "0.34.0"
 winit = "0.28"
