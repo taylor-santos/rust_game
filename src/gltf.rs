@@ -89,7 +89,6 @@ pub fn load_gltf(path: &str) -> Result<(Vec<Mesh>, Vec<TextureData>, Vec<Materia
         .map(|prims| {
             prims.map(|prim| {
                 let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
-
                 let positions = reader
                     .read_positions()
                     .unwrap()

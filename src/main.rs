@@ -491,7 +491,7 @@ fn main() {
 
     let sampler = Sampler::new(device.clone(), SamplerCreateInfo::simple_repeat_linear()).unwrap();
 
-    let image_sets = {
+    let images = {
         let mut builder = AutoCommandBufferBuilder::primary(
             &command_buffer_allocator,
             queue.queue_family_index(),
@@ -564,24 +564,7 @@ fn main() {
             .unwrap();
         dbg!(image_buffer_time.elapsed());
 
-        let texture_layout = pipeline.layout().set_layouts().get(1).unwrap();
-
         images
-            .into_iter()
-            .map(|image| {
-                PersistentDescriptorSet::new(
-                    &descriptor_set_allocator,
-                    texture_layout.clone(),
-                    [WriteDescriptorSet::image_view_sampler(
-                        0,
-                        image.clone(),
-                        sampler.clone(),
-                    )],
-                    [],
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>()
     };
 
     // Initialization is finally finished!
@@ -767,21 +750,38 @@ fn main() {
 
                 for mesh in &mesh_infos {
                     let mat = &materials[mesh.mat_idx];
-                    let texture_set =
-                        &image_sets[mat.base_color_texture.clone().map(|t| t.index).unwrap()];
+                    let albedo_image =
+                        &images[mat.base_color_texture.clone().map_or(0, |t| t.index)];
+                    let normal_image =
+                        &images[mat.normal_texture.clone().map_or(1, |t| t.texture.index)];
+                    let texture_layout = pipeline.layout().set_layouts().get(1).unwrap();
+                    let texture_set = PersistentDescriptorSet::new(
+                        &descriptor_set_allocator,
+                        texture_layout.clone(),
+                        [
+                            // binding = 0
+                            WriteDescriptorSet::image_view_sampler(
+                                0,
+                                albedo_image.clone(),
+                                sampler.clone(),
+                            ),
+                            // binding = 1
+                            WriteDescriptorSet::image_view_sampler(
+                                1,
+                                normal_image.clone(),
+                                sampler.clone(),
+                            ),
+                        ],
+                        [],
+                    )
+                    .unwrap();
+
                     builder
                         .bind_descriptor_sets(
                             PipelineBindPoint::Graphics,
                             pipeline.layout().clone(),
                             0,
-                            uniform_set.clone(),
-                        )
-                        .unwrap()
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Graphics,
-                            pipeline.layout().clone(),
-                            1,
-                            texture_set.clone(),
+                            (uniform_set.clone(), texture_set.clone()),
                         )
                         .unwrap()
                         .bind_vertex_buffers(
