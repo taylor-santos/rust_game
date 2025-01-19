@@ -80,6 +80,7 @@ use winit::{
 };
 
 mod gltf;
+mod material;
 
 #[derive(BufferContents, Vertex)]
 #[repr(C)]
@@ -766,7 +767,8 @@ fn main() {
 
                 for mesh in &mesh_infos {
                     let mat = &materials[mesh.mat_idx];
-                    let texture_set = &image_sets[mat.base_color_texture.unwrap_or(0)];
+                    let texture_set =
+                        &image_sets[mat.base_color_texture.clone().map(|t| t.index).unwrap()];
                     builder
                         .bind_descriptor_sets(
                             PipelineBindPoint::Graphics,

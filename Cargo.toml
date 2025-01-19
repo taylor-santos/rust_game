@@ -5,7 +5,18 @@ edition = "2021"
 
 [dependencies]
 cgmath = "0.18.0"
-gltf = "1.4.1"
+gltf = { version = "1.4.1", features = [
+    "KHR_lights_punctual",
+    "KHR_materials_pbrSpecularGlossiness",
+    "KHR_materials_unlit",
+    "KHR_texture_transform",
+    "KHR_materials_variants",
+    "KHR_materials_volume",
+    "KHR_materials_specular",
+    "KHR_materials_transmission",
+    "KHR_materials_ior",
+    "KHR_materials_emissive_strength",
+] }
 image = "0.25.5"
 vulkano = "0.34.0"
 vulkano-shaders = "0.34.0"
