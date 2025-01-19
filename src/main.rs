@@ -116,7 +116,7 @@ pub struct Texcoord {
 }
 
 fn main() {
-    let (meshes, textures, materials) = load_gltf("models/sponza.glb").unwrap();
+    let (meshes, textures, materials) = load_gltf("models/DamagedHelmet.glb").unwrap();
 
     let event_loop = EventLoop::new();
 
@@ -752,7 +752,7 @@ fn main() {
                 )
                 .unwrap();
 
-                let (mvp_buffer, light_buffer) = {
+                let subbuffers = {
                     let proj = {
                         let aspect_ratio =
                             swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
@@ -777,7 +777,7 @@ fn main() {
                         elapsed.as_secs() as f32 + elapsed.subsec_nanos() as f32 / 1_000_000_000.0;
 
                     let view = camera.get_view_matrix();
-                    let scale = Matrix4::from_scale(0.01);
+                    let scale = Matrix4::from_scale(1.0);
                     let mvp = vs::MVP {
                         model: Matrix4::identity().into(),
                         viewproj: (proj * view * scale).into(),
@@ -793,17 +793,24 @@ fn main() {
                     let light_subbuffer = uniform_buffer.allocate_sized().unwrap();
                     *light_subbuffer.write().unwrap() = light;
 
-                    (mvp_subbuffer, light_subbuffer)
+                    let cam_data = fs::Camera {
+                        position: camera.position.into(),
+                    };
+                    let camera_subbuffer = uniform_buffer.allocate_sized().unwrap();
+                    *camera_subbuffer.write().unwrap() = cam_data;
+
+                    [
+                        WriteDescriptorSet::buffer(0, mvp_subbuffer),
+                        WriteDescriptorSet::buffer(1, light_subbuffer),
+                        WriteDescriptorSet::buffer(2, camera_subbuffer),
+                    ]
                 };
 
                 let layout0 = pipeline.layout().set_layouts().get(0).unwrap();
                 let uniform_set = PersistentDescriptorSet::new(
                     &descriptor_set_allocator,
                     layout0.clone(),
-                    [
-                        WriteDescriptorSet::buffer(0, mvp_buffer),
-                        WriteDescriptorSet::buffer(1, light_buffer),
-                    ],
+                    subbuffers,
                     [],
                 )
                 .unwrap();

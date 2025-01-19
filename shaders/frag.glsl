@@ -4,6 +4,7 @@ layout(location = 0) in vec3 v_normal;
 layout(location = 1) in vec3 v_tangent;
 layout(location = 2) in vec3 v_bitangent;
 layout(location = 3) in vec2 v_texcoord;
+layout(location = 4) in vec3 v_worldPos;
 
 layout(location = 0) out vec4 f_color;
 
@@ -15,6 +16,10 @@ layout(set = 0, binding = 1) uniform Light {
     vec3 color;
     vec3 ambient;
 } light;
+
+layout(set = 0, binding = 2) uniform Camera {
+    vec3 position;
+} camera;
 
 void main() {
     // Fetch the base color from the texture
@@ -35,6 +40,12 @@ void main() {
     // Add ambient lighting
     vec3 ambient = light.ambient * baseColor.rgb;
 
+    // Compute specular highlight (assume view direction is -z)
+    vec3 viewDir = normalize(camera.position - v_worldPos);
+    vec3 halfVector = normalize(-light.direction + viewDir);
+    float spec = pow(max(dot(worldNormal, halfVector), 0.0), 64.0);
+    vec3 specular = light.color * spec; // Specular intensity
+
     // Output final color
-    f_color = vec4(diffuse + ambient, 1.0);
+    f_color = vec4(diffuse + specular, 1.0);
 }

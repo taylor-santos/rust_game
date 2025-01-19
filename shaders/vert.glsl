@@ -9,6 +9,7 @@ layout(location = 0) out vec3 v_normal;
 layout(location = 1) out vec3 v_tangent;
 layout(location = 2) out vec3 v_bitangent;
 layout(location = 3) out vec2 v_texcoord;
+layout(location = 4) out vec3 v_worldPos;
 
 layout(set = 0, binding = 0) uniform MVP {
     mat4 model;
@@ -16,12 +17,13 @@ layout(set = 0, binding = 0) uniform MVP {
 } mvp;
 
 void main() {
-    vec3 bitangent = cross(normal, tangent);
+    vec4 worldPos = mvp.model * vec4(position, 1.0);
+    v_worldPos = worldPos.xyz;
 
     v_normal = mat3(mvp.model) * normal;
     v_tangent = mat3(mvp.model) * tangent;
-    v_bitangent = mat3(mvp.model) * bitangent;
+    v_bitangent = mat3(mvp.model) * cross(normal, tangent);
     v_texcoord = texcoord;
 
-    gl_Position = mvp.viewproj * mvp.model * vec4(position, 1.0);
+    gl_Position = mvp.viewproj * worldPos;
 }
