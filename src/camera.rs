@@ -15,13 +15,7 @@ pub struct FirstPersonCamera {
 
 impl FirstPersonCamera {
     pub fn new() -> FirstPersonCamera {
-        FirstPersonCamera {
-            position: Point3::new(0.0, 0.0, 0.0),
-            yaw: Rad(0.0),
-            pitch: Rad(0.0),
-            speed: 5.0,
-            sensitivity: 0.1,
-        }
+        FirstPersonCamera::default()
     }
 
     pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
@@ -82,5 +76,17 @@ impl FirstPersonCamera {
         let up = self.get_up();
 
         Matrix4::look_at_rh(self.position, self.position + forward, up)
+    }
+}
+
+impl Default for FirstPersonCamera {
+    fn default() -> Self {
+        Self {
+            position: Point3::new(0.0, 0.0, 0.0),
+            yaw: Rad(0.0),
+            pitch: Rad(0.0),
+            speed: 5.0,
+            sensitivity: 0.1,
+        }
     }
 }

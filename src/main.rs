@@ -23,9 +23,9 @@
 
 use crate::camera::FirstPersonCamera;
 use crate::gltf::{load_gltf, TextureFormat};
-use cgmath::{Matrix4, Point3, Rad, SquareMatrix};
-use image::{DynamicImage, ImageBuffer};
-use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+use cgmath::{Deg, Matrix4, Point3, Rad, SquareMatrix};
+use image::{DynamicImage, EncodableLayout, ImageBuffer, ImageDecoder};
+use std::f32::consts::FRAC_PI_4;
 use std::sync::Arc;
 use std::time::Instant;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
@@ -595,11 +595,70 @@ fn main() {
         images
     };
 
+    let null_texture = {
+        let pixel = vec![0u8, 0u8, 0u8, 255u8]; // RGBA black
+        let extent: [u32; 3] = [1, 1, 1]; // 1x1 texture
+        let upload_buffer = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            pixel.into_iter(),
+        )
+        .unwrap();
+
+        let image = Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::R8G8B8A8_UNORM,
+                extent,
+                usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap();
+
+        let mut builder = AutoCommandBufferBuilder::primary(
+            &command_buffer_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        builder
+            .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
+                upload_buffer,
+                image.clone(),
+            ))
+            .unwrap();
+
+        let command_buffer = builder.build().unwrap();
+
+        command_buffer
+            .execute(queue.clone())
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap();
+
+        ImageView::new_default(image).unwrap()
+    };
+
     // Initialization is finally finished!
 
-    let mut camera = FirstPersonCamera::new();
-    camera.position = Point3::new(6.0, 1.5, -0.5);
-    camera.yaw = Rad(FRAC_PI_2);
+    let mut camera = FirstPersonCamera {
+        position: Point3::new(0., 0., -4.),
+        ..Default::default()
+    };
 
     set_cursor_confinement(window.as_ref(), false);
 
@@ -752,69 +811,6 @@ fn main() {
                 )
                 .unwrap();
 
-                let subbuffers = {
-                    let proj = {
-                        let aspect_ratio =
-                            swapchain.image_extent()[0] as f32 / swapchain.image_extent()[1] as f32;
-                        let near = 0.005;
-                        let far = 10000.0;
-
-                        let proj = cgmath::perspective(Rad(FRAC_PI_4), aspect_ratio, near, far);
-                        // Vulkan clip space has inverted Y and half Z, compared with OpenGL.
-                        // A corrective transformation is needed to make an OpenGL perspective matrix
-                        // work properly. See here for more info:
-                        // https://matthewwellings.com/blog/the-new-vulkan-coordinate-system/
-                        let correction = Matrix4::<f32>::new(
-                            1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
-                            0.5, 1.0,
-                        );
-
-                        correction * proj
-                    };
-
-                    let elapsed = rotation_start.elapsed();
-                    let rotation =
-                        elapsed.as_secs() as f32 + elapsed.subsec_nanos() as f32 / 1_000_000_000.0;
-
-                    let view = camera.get_view_matrix();
-                    let scale = Matrix4::from_scale(1.0);
-                    let mvp = vs::MVP {
-                        model: Matrix4::identity().into(),
-                        viewproj: (proj * view * scale).into(),
-                    };
-                    let mvp_subbuffer = uniform_buffer.allocate_sized().unwrap();
-                    *mvp_subbuffer.write().unwrap() = mvp;
-
-                    let light = fs::Light {
-                        direction: [0.0, -1.0, 0.0].into(),
-                        color: [1.0, 1.0, 1.0].into(),
-                        ambient: [0.4, 0.4, 0.4].into(),
-                    };
-                    let light_subbuffer = uniform_buffer.allocate_sized().unwrap();
-                    *light_subbuffer.write().unwrap() = light;
-
-                    let cam_data = fs::Camera {
-                        position: camera.position.into(),
-                    };
-                    let camera_subbuffer = uniform_buffer.allocate_sized().unwrap();
-                    *camera_subbuffer.write().unwrap() = cam_data;
-
-                    [
-                        WriteDescriptorSet::buffer(0, mvp_subbuffer),
-                        WriteDescriptorSet::buffer(1, light_subbuffer),
-                        WriteDescriptorSet::buffer(2, camera_subbuffer),
-                    ]
-                };
-
-                let layout0 = pipeline.layout().set_layouts().get(0).unwrap();
-                let uniform_set = PersistentDescriptorSet::new(
-                    &descriptor_set_allocator,
-                    layout0.clone(),
-                    subbuffers,
-                    [],
-                )
-                .unwrap();
-
                 builder
                     // Before we can draw, we have to *enter a render pass*. We specify which
                     // attachments we are going to use for rendering here, which needs to match
@@ -853,30 +849,120 @@ fn main() {
                     .bind_pipeline_graphics(pipeline.clone())
                     .unwrap();
 
+                {
+                    let camera_subbuffer = {
+                        let proj = {
+                            let aspect_ratio = swapchain.image_extent()[0] as f32
+                                / swapchain.image_extent()[1] as f32;
+                            let near = 0.005;
+                            let far = 10000.0;
+
+                            let proj = cgmath::perspective(Rad(FRAC_PI_4), aspect_ratio, near, far);
+                            // Vulkan clip space has inverted Y and half Z, compared with OpenGL.
+                            // A corrective transformation is needed to make an OpenGL perspective matrix
+                            // work properly. See here for more info:
+                            // https://matthewwellings.com/blog/the-new-vulkan-coordinate-system/
+                            let correction = Matrix4::<f32>::new(
+                                1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0,
+                                0.0, 0.5, 1.0,
+                            );
+
+                            correction * proj
+                        };
+                        let view = camera.get_view_matrix();
+
+                        let camera_uniform = vs::Camera {
+                            viewproj: (proj * view).into(),
+                            position: camera.position.into(),
+                        };
+                        let camera_subbuffer = uniform_buffer.allocate_sized().unwrap();
+                        *camera_subbuffer.write().unwrap() = camera_uniform;
+                        camera_subbuffer
+                    };
+
+                    let light_subbuffer = {
+                        let light = fs::Light {
+                            direction: [0.5, 1.0, 0.0].into(),
+                            color: [1.0, 1.0, 1.0].into(),
+                            ambient: [0.4, 0.4, 0.4].into(),
+                        };
+                        let light_subbuffer = uniform_buffer.allocate_sized().unwrap();
+                        *light_subbuffer.write().unwrap() = light;
+                        light_subbuffer
+                    };
+
+                    let write_sets = [
+                        WriteDescriptorSet::buffer(0, camera_subbuffer),
+                        WriteDescriptorSet::buffer(1, light_subbuffer),
+                    ];
+
+                    let layout0 = pipeline.layout().set_layouts().get(0).unwrap();
+                    let persistent_sets = PersistentDescriptorSet::new(
+                        &descriptor_set_allocator,
+                        layout0.clone(),
+                        write_sets,
+                        [],
+                    )
+                    .unwrap();
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            pipeline.layout().clone(),
+                            0,
+                            persistent_sets,
+                        )
+                        .unwrap()
+                };
+
                 for mesh in &mesh_infos {
                     let mat = &materials[mesh.mat_idx];
-                    let albedo_image =
-                        &images[mat.base_color_texture.clone().map_or(0, |t| t.index)];
-                    let normal_image =
-                        &images[mat.normal_texture.clone().map_or(1, |t| t.texture.index)];
-                    let texture_layout = pipeline.layout().set_layouts().get(1).unwrap();
-                    let texture_set = PersistentDescriptorSet::new(
+
+                    let layout1 = pipeline.layout().set_layouts().get(1).unwrap();
+                    let object_set = {
+                        // let model = Matrix4::from_scale(0.01);
+                        let model =
+                            Matrix4::from_angle_y(Deg(180.0)) * Matrix4::from_angle_x(Deg(90.0));
+                        let uniform_obj = fs::Object {
+                            model: model.into(),
+                            baseColorFactor: mat.pbr_metallic_roughness.base_color_factor.into(),
+                            metallicFactor: mat.pbr_metallic_roughness.metallic_factor.into(),
+                            roughnessFactor: mat.pbr_metallic_roughness.roughness_factor.into(),
+                            emissiveFactor: mat.emissive_factor.into(),
+                            emissiveStrength: mat.emissive_strength.unwrap_or(1.0).into(),
+                        };
+                        let obj_subbuffer = uniform_buffer.allocate_sized().unwrap();
+                        *obj_subbuffer.write().unwrap() = uniform_obj;
+                        WriteDescriptorSet::buffer(0, obj_subbuffer)
+                    };
+
+                    let images = [
+                        mat.base_color_texture.as_ref().map(|t| &images[t.index]),
+                        mat.normal_texture
+                            .as_ref()
+                            .map(|t| &images[t.texture.index]),
+                        mat.pbr_metallic_roughness
+                            .metallic_roughness_texture
+                            .as_ref()
+                            .map(|t| &images[t.index]),
+                        mat.emissive_texture.as_ref().map(|t| &images[t.index]),
+                    ];
+                    let persistent_set = PersistentDescriptorSet::new(
                         &descriptor_set_allocator,
-                        texture_layout.clone(),
-                        [
-                            // binding = 0
-                            WriteDescriptorSet::image_view_sampler(
-                                0,
-                                albedo_image.clone(),
-                                sampler.clone(),
-                            ),
-                            // binding = 1
-                            WriteDescriptorSet::image_view_sampler(
-                                1,
-                                normal_image.clone(),
-                                sampler.clone(),
-                            ),
-                        ],
+                        layout1.clone(),
+                        std::iter::once(object_set).chain(images.into_iter().enumerate().map(
+                            |(idx, image)| match image {
+                                Some(image) => WriteDescriptorSet::image_view_sampler(
+                                    1 + idx as u32,
+                                    image.clone(),
+                                    sampler.clone(),
+                                ),
+                                None => WriteDescriptorSet::image_view_sampler(
+                                    1 + idx as u32,
+                                    null_texture.clone(),
+                                    sampler.clone(),
+                                ),
+                            },
+                        )),
                         [],
                     )
                     .unwrap();
@@ -885,8 +971,8 @@ fn main() {
                         .bind_descriptor_sets(
                             PipelineBindPoint::Graphics,
                             pipeline.layout().clone(),
-                            0,
-                            (uniform_set.clone(), texture_set.clone()),
+                            1,
+                            persistent_set.clone(),
                         )
                         .unwrap()
                         .bind_vertex_buffers(
