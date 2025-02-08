@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Material {
     pub name: Option<String>,
@@ -17,18 +18,21 @@ pub struct Material {
     pub emissive_factor: [f32; 3],
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Texture {
     pub index: usize,
     pub tex_coord: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NormalTexture {
     pub texture: Texture,
     pub scale: f32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PbrMetallicRoughness {
     pub base_color_factor: [f32; 4],
@@ -37,6 +41,7 @@ pub struct PbrMetallicRoughness {
     pub metallic_roughness_texture: Option<Texture>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PbrSpecularGlossiness {
     pub diffuse_factor: [f32; 4],
@@ -46,6 +51,7 @@ pub struct PbrSpecularGlossiness {
     pub specular_glossiness_texture: Option<Texture>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TextureTransform {
     pub offset: [f32; 2],
@@ -54,6 +60,7 @@ pub struct TextureTransform {
     pub tex_coord: Option<u32>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Volume {
     pub thickness_factor: f32,
@@ -62,6 +69,7 @@ pub struct Volume {
     pub attenuation_distance: f32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Specular {
     pub specular_factor: f32,
@@ -70,6 +78,7 @@ pub struct Specular {
     pub specular_color_texture: Option<Texture>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Transmission {
     pub transmission_factor: f32,

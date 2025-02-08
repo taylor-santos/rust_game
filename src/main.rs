@@ -23,8 +23,8 @@
 
 use crate::camera::FirstPersonCamera;
 use crate::gltf::{load_gltf, TextureFormat};
-use cgmath::{Deg, Matrix4, Point3, Rad, SquareMatrix};
-use image::{DynamicImage, EncodableLayout, ImageBuffer, ImageDecoder};
+use cgmath::{Deg, Matrix4, Rad};
+use image::{DynamicImage, ImageBuffer};
 use std::f32::consts::FRAC_PI_4;
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,6 +38,7 @@ use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::{ImageCreateInfo, ImageType};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::rasterization::CullMode;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint};
 use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
 use vulkano::shader::EntryPoint;
@@ -115,12 +116,12 @@ pub struct Texcoord {
     texcoord: [f32; 2],
 }
 
-fn main() {
-    let (meshes, textures, materials) = load_gltf("models/DamagedHelmet.glb").unwrap();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (meshes, textures, materials) = load_gltf("models/DamagedHelmet.glb")?;
 
     let event_loop = EventLoop::new();
 
-    let library = VulkanLibrary::new().unwrap();
+    let library = VulkanLibrary::new()?;
 
     // The first step of any Vulkan program is to create an instance.
     //
@@ -141,8 +142,7 @@ fn main() {
             enabled_extensions: required_extensions,
             ..Default::default()
         },
-    )
-    .unwrap();
+    )?;
 
     // The objective of this example is to draw a triangle on a window. To do so, we first need to
     // create the window. We use the `WindowBuilder` from the `winit` crate to do that here.
@@ -150,8 +150,8 @@ fn main() {
     // Before we can render to a window, we must first create a `vulkano::swapchain::Surface`
     // object from it, which represents the drawable surface of a window. For that we must wrap the
     // `winit::window::Window` in an `Arc`.
-    let window = Arc::new(WindowBuilder::new().build(&event_loop).unwrap());
-    let surface = Surface::from_window(instance.clone(), window.clone()).unwrap();
+    let window = Arc::new(WindowBuilder::new().build(&event_loop)?);
+    let surface = Surface::from_window(instance.clone(), window.clone())?;
 
     // Choose device extensions that we're going to use. In order to present images to a surface,
     // we need a `Swapchain`, which is provided by the `khr_swapchain` extension.
@@ -163,8 +163,7 @@ fn main() {
     // We then choose which physical device to use. First, we enumerate all the available physical
     // devices, then apply filters to narrow them down to those that can support our needs.
     let (physical_device, queue_family_index) = instance
-        .enumerate_physical_devices()
-        .unwrap()
+        .enumerate_physical_devices()?
         .filter(|p| {
             // For this example, we require at least Vulkan 1.3, or a device that has the
             // `khr_dynamic_rendering` extension available.
@@ -273,8 +272,7 @@ fn main() {
 
             ..Default::default()
         },
-    )
-    .unwrap();
+    )?;
 
     // Since we can request multiple queues, the `queues` variable is in fact an iterator. We only
     // use one queue in this example, so we just retrieve the first and only element of the
@@ -289,14 +287,12 @@ fn main() {
         // values that are allowed by the capabilities.
         let surface_capabilities = device
             .physical_device()
-            .surface_capabilities(&surface, Default::default())
-            .unwrap();
+            .surface_capabilities(&surface, Default::default())?;
 
         // Choosing the internal format that the images will have.
         let image_format = device
             .physical_device()
-            .surface_formats(&surface, Default::default())
-            .unwrap()[0]
+            .surface_formats(&surface, Default::default())?[0]
             .0;
 
         // Please take a look at the docs for the meaning of the parameters we didn't mention.
@@ -349,8 +345,7 @@ fn main() {
 
                 ..Default::default()
             },
-        )
-        .unwrap()
+        )?
     };
 
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
@@ -370,14 +365,8 @@ fn main() {
     //
     // A Vulkan shader can in theory contain multiple entry points, so we have to specify which
     // one.
-    let vs = vs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let fs = fs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
+    let vs = vs::load(device.clone())?.entry_point("main").unwrap();
+    let fs = fs::load(device.clone())?.entry_point("main").unwrap();
 
     // At this point, OpenGL initialization would be finished. However in Vulkan it is not. OpenGL
     // implicitly does a lot of computation whenever you draw. In Vulkan, you have to do all this
@@ -409,8 +398,6 @@ fn main() {
     // Destroying the `GpuFuture` blocks until the GPU is finished executing it. In order to avoid
     // that, we store the submission of the previous frame here.
     let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
-
-    let rotation_start = Instant::now();
 
     let descriptor_set_allocator =
         StandardDescriptorSetAllocator::new(device.clone(), Default::default());
@@ -517,15 +504,14 @@ fn main() {
         })
         .collect::<Vec<_>>();
 
-    let sampler = Sampler::new(device.clone(), SamplerCreateInfo::simple_repeat_linear()).unwrap();
+    let sampler = Sampler::new(device.clone(), SamplerCreateInfo::simple_repeat_linear())?;
 
     let images = {
         let mut builder = AutoCommandBufferBuilder::primary(
             &command_buffer_allocator,
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
+        )?;
 
         let image_buffer_time = Instant::now();
         let images = textures
@@ -581,15 +567,12 @@ fn main() {
             })
             .collect::<Vec<_>>();
 
-        let upload_command_buffer = builder.build().unwrap();
+        let upload_command_buffer = builder.build()?;
 
         upload_command_buffer
-            .execute(queue.clone())
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap()
-            .wait(None)
-            .unwrap();
+            .execute(queue.clone())?
+            .then_signal_fence_and_flush()?
+            .wait(None)?;
         dbg!(image_buffer_time.elapsed());
 
         images
@@ -610,8 +593,7 @@ fn main() {
                 ..Default::default()
             },
             pixel.into_iter(),
-        )
-        .unwrap();
+        )?;
 
         let image = Image::new(
             memory_allocator.clone(),
@@ -623,42 +605,32 @@ fn main() {
                 ..Default::default()
             },
             AllocationCreateInfo::default(),
-        )
-        .unwrap();
+        )?;
 
         let mut builder = AutoCommandBufferBuilder::primary(
             &command_buffer_allocator,
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
+        )?;
 
-        builder
-            .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
-                upload_buffer,
-                image.clone(),
-            ))
-            .unwrap();
+        builder.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
+            upload_buffer,
+            image.clone(),
+        ))?;
 
-        let command_buffer = builder.build().unwrap();
+        let command_buffer = builder.build()?;
 
         command_buffer
-            .execute(queue.clone())
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap()
-            .wait(None)
-            .unwrap();
+            .execute(queue.clone())?
+            .then_signal_fence_and_flush()?
+            .wait(None)?;
 
-        ImageView::new_default(image).unwrap()
+        ImageView::new_default(image)?
     };
 
     // Initialization is finally finished!
 
-    let mut camera = FirstPersonCamera {
-        position: Point3::new(0., 0., -4.),
-        ..Default::default()
-    };
+    let mut camera = FirstPersonCamera::new();
 
     set_cursor_confinement(window.as_ref(), false);
 
@@ -1144,7 +1116,10 @@ fn window_size_dependent_setup(
             viewport_state: Some(viewport_state),
             // How polygons are culled and converted into a raster of pixels.
             // The default value does not perform any culling.
-            rasterization_state: Some(RasterizationState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..Default::default()
+            }),
             // How multiple fragment shader samples are converted to a single pixel value.
             // The default value does not perform any multisampling.
             depth_stencil_state: Some(DepthStencilState {

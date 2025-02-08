@@ -1,5 +1,4 @@
 use crate::material::{Material, NormalTexture, PbrMetallicRoughness, Texture};
-use gltf;
 use gltf::image::{Data, Format};
 use gltf::texture::Info;
 use gltf::Error;
@@ -25,7 +24,7 @@ impl mikktspace::Geometry for Mesh {
 
     fn position(&self, face: usize, vert: usize) -> [f32; 3] {
         let tri = self.indices[face * 3 + vert] as usize;
-        let v0 = self.positions[tri * 3 + 0];
+        let v0 = self.positions[tri * 3];
         let v1 = self.positions[tri * 3 + 1];
         let v2 = self.positions[tri * 3 + 2];
         [v0, v1, v2]
@@ -33,7 +32,7 @@ impl mikktspace::Geometry for Mesh {
 
     fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
         let tri = self.indices[face * 3 + vert] as usize;
-        let n0 = self.normals[tri * 3 + 0];
+        let n0 = self.normals[tri * 3];
         let n1 = self.normals[tri * 3 + 1];
         let n2 = self.normals[tri * 3 + 2];
         [n0, n1, n2]
@@ -41,7 +40,7 @@ impl mikktspace::Geometry for Mesh {
 
     fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
         let tri = self.indices[face * 3 + vert] as usize;
-        let uv0 = self.texcoords[tri * 2 + 0];
+        let uv0 = self.texcoords[tri * 2];
         let uv1 = self.texcoords[tri * 2 + 1];
         [uv0, uv1]
     }
@@ -52,19 +51,19 @@ impl mikktspace::Geometry for Mesh {
         _bi_tangent: [f32; 3],
         _f_mag_s: f32,
         _f_mag_t: f32,
-        bi_tangent_preserves_orientation: bool,
+        _bi_tangent_preserves_orientation: bool,
         face: usize,
         vert: usize,
     ) {
         let tri = self.indices[face * 3 + vert] as usize;
-        self.tangents[tri * 3 + 0] = tangent[0];
+        self.tangents[tri * 3] = tangent[0];
         self.tangents[tri * 3 + 1] = tangent[1];
         self.tangents[tri * 3 + 2] = tangent[2];
     }
 
     fn set_tangent_encoded(&mut self, _tangent: [f32; 4], _face: usize, _vert: usize) {
         let tri = self.indices[_face * 3 + _vert] as usize;
-        self.tangents[tri * 3 + 0] = _tangent[0];
+        self.tangents[tri * 3] = _tangent[0];
         self.tangents[tri * 3 + 1] = _tangent[1];
         self.tangents[tri * 3 + 2] = _tangent[2];
     }

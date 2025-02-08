@@ -82,7 +82,7 @@ impl FirstPersonCamera {
 impl Default for FirstPersonCamera {
     fn default() -> Self {
         Self {
-            position: Point3::new(0.0, 0.0, 0.0),
+            position: Point3::new(0.0, 0.0, -4.0),
             yaw: Rad(0.0),
             pitch: Rad(0.0),
             speed: 5.0,
