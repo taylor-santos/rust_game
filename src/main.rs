@@ -116,6 +116,30 @@ pub struct Texcoord {
     texcoord: [f32; 2],
 }
 
+fn create_buffer<T: BufferContents + Send + Sync, I: IntoIterator<Item = T>>(
+    allocator: Arc<StandardMemoryAllocator>,
+    usage: BufferUsage,
+    data: I,
+) -> Subbuffer<[T]>
+where
+    I::IntoIter: ExactSizeIterator,
+{
+    Buffer::from_iter(
+        allocator,
+        BufferCreateInfo {
+            usage,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        data,
+    )
+    .unwrap()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (meshes, textures, materials) = load_gltf("models/DamagedHelmet.glb")?;
 
@@ -421,77 +445,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mesh_infos = meshes
         .into_iter()
         .map(|mesh| {
-            let vertex_buffer = Buffer::from_iter(
-                memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                mesh.positions,
-            )
-            .unwrap();
-            let normal_buffer = Buffer::from_iter(
-                memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                mesh.normals,
-            )
-            .unwrap();
-            let tangent_buffer = Buffer::from_iter(
-                memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                mesh.tangents,
-            )
-            .unwrap();
-            let texcoord_buffer = Buffer::from_iter(
-                memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                mesh.texcoords,
-            )
-            .unwrap();
             let index_count = mesh.indices.len() as u32;
-            let index_buffer = Buffer::from_iter(
+            let vertex_buffer = create_buffer(
                 memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::INDEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
+                BufferUsage::VERTEX_BUFFER,
+                mesh.positions,
+            );
+            let normal_buffer = create_buffer(
+                memory_allocator.clone(),
+                BufferUsage::VERTEX_BUFFER,
+                mesh.normals,
+            );
+            let tangent_buffer = create_buffer(
+                memory_allocator.clone(),
+                BufferUsage::VERTEX_BUFFER,
+                mesh.tangents,
+            );
+            let texcoord_buffer = create_buffer(
+                memory_allocator.clone(),
+                BufferUsage::VERTEX_BUFFER,
+                mesh.texcoords,
+            );
+            let index_buffer = create_buffer(
+                memory_allocator.clone(),
+                BufferUsage::INDEX_BUFFER,
                 mesh.indices,
-            )
-            .unwrap();
+            );
             MeshInfo {
                 vertex_buffer,
                 normal_buffer,
@@ -528,20 +507,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => panic!("unsupported texture format: {:?}", texture.format),
                 };
                 let extent: [u32; 3] = [texture.width, texture.height, 1];
-                let upload_buffer = Buffer::from_iter(
+                let upload_buffer = create_buffer(
                     memory_allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::TRANSFER_SRC,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
+                    BufferUsage::TRANSFER_SRC,
                     pixels.into_iter(),
-                )
-                .unwrap();
+                );
 
                 let image = Image::new(
                     memory_allocator.clone(),
@@ -581,19 +551,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let null_texture = {
         let pixel = vec![0u8, 0u8, 0u8, 255u8]; // RGBA black
         let extent: [u32; 3] = [1, 1, 1]; // 1x1 texture
-        let upload_buffer = Buffer::from_iter(
+        let upload_buffer = create_buffer(
             memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
+            BufferUsage::TRANSFER_SRC,
             pixel.into_iter(),
-        )?;
+        );
 
         let image = Image::new(
             memory_allocator.clone(),
