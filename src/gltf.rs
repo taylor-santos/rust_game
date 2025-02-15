@@ -18,6 +18,21 @@ pub struct Mesh {
     pub primitives: Vec<Primitive>,
 }
 
+pub struct Object {
+    pub transform: Matrix4<f32>,
+    pub mesh_idx: usize,
+}
+
+pub(crate) type TextureData = Data;
+pub(crate) type TextureFormat = Format;
+
+pub struct Gltf {
+    pub meshes: Vec<Mesh>,
+    pub textures: Vec<TextureData>,
+    pub materials: Vec<Material>,
+    pub objects: Vec<Object>,
+}
+
 impl mikktspace::Geometry for Primitive {
     fn num_faces(&self) -> usize {
         self.indices.len() / 3
@@ -125,21 +140,6 @@ impl From<gltf::material::NormalTexture<'_>> for NormalTexture {
             scale: normal_texture.scale(),
         }
     }
-}
-
-pub(crate) type TextureData = Data;
-pub(crate) type TextureFormat = Format;
-
-pub struct Gltf {
-    pub meshes: Vec<Mesh>,
-    pub textures: Vec<TextureData>,
-    pub materials: Vec<Material>,
-    pub objects: Vec<Object>,
-}
-
-pub struct Object {
-    pub transform: Matrix4<f32>,
-    pub mesh_idx: usize,
 }
 
 pub fn load_gltf(path: &str) -> Result<Gltf, Error> {

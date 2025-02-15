@@ -17,6 +17,7 @@ use crate::gltf::{load_gltf, Gltf, Object, TextureFormat};
 use crate::material::Material;
 use cgmath::{Matrix4, Rad};
 use image::{DynamicImage, ImageBuffer};
+use std::collections::VecDeque;
 use std::f32::consts::FRAC_PI_4;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
@@ -93,11 +94,13 @@ struct App {
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     uniform_buffer_allocator: SubbufferAllocator,
-    null_texture: Arc<ImageView>,
-    mesh_buffers: Vec<Vec<MeshBuffer>>,
+    combined_vertex_buffer: Subbuffer<[CombinedVertex]>,
+    combined_index_buffer: Subbuffer<[u32]>,
+    draw_infos: Vec<Vec<PrimitiveDrawInfo>>,
     materials: Vec<Material>,
     objects: Vec<Object>,
     textures: Vec<Arc<ImageView>>,
+    null_texture: Arc<ImageView>,
     sampler: Arc<Sampler>,
     camera: FirstPersonCamera,
     input_state: InputState,
@@ -114,15 +117,6 @@ struct InputState {
     cursor_confined: bool,
 }
 
-struct MeshBuffer {
-    pub vertex: Subbuffer<[f32]>,
-    pub normal: Subbuffer<[f32]>,
-    pub tangent: Subbuffer<[f32]>,
-    pub texcoord: Subbuffer<[f32]>,
-    pub index: Subbuffer<[u32]>,
-    pub mat_idx: usize,
-}
-
 struct RenderContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
@@ -132,7 +126,7 @@ struct RenderContext {
     viewport: Viewport,
     recreate_swapchain: bool,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
-    previous_frame_time: Instant,
+    frame_times: VecDeque<Instant>,
 }
 
 impl App {
@@ -324,49 +318,56 @@ impl App {
             objects,
         } = load_gltf("models/DamagedHelmet.glb").expect("Couldn't load gltf model");
 
-        let mesh_buffers = meshes
-            .into_iter()
-            .map(|mesh| {
-                mesh.primitives
-                    .into_iter()
-                    .map(|prim| {
-                        let vertex = create_buffer(
-                            memory_allocator.clone(),
-                            BufferUsage::VERTEX_BUFFER,
-                            prim.positions,
-                        );
-                        let normal = create_buffer(
-                            memory_allocator.clone(),
-                            BufferUsage::VERTEX_BUFFER,
-                            prim.normals,
-                        );
-                        let tangent = create_buffer(
-                            memory_allocator.clone(),
-                            BufferUsage::VERTEX_BUFFER,
-                            prim.tangents,
-                        );
-                        let texcoord = create_buffer(
-                            memory_allocator.clone(),
-                            BufferUsage::VERTEX_BUFFER,
-                            prim.texcoords,
-                        );
-                        let index = create_buffer(
-                            memory_allocator.clone(),
-                            BufferUsage::INDEX_BUFFER,
-                            prim.indices,
-                        );
-                        MeshBuffer {
-                            vertex,
-                            normal,
-                            tangent,
-                            texcoord,
-                            index,
-                            mat_idx: prim.mat_idx,
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let (vert_count, index_count) = meshes
+            .iter()
+            .flat_map(|mesh| &mesh.primitives)
+            .map(|prim| (prim.positions.len(), prim.indices.len()))
+            .reduce(|(v1, i1), (v2, i2)| (v1 + v2, i1 + i2))
+            .unwrap_or((0, 0));
+
+        let mut combined_verts = Vec::with_capacity(vert_count / 3);
+        let mut combined_indices = Vec::with_capacity(index_count);
+        let mut draw_infos = Vec::new();
+        for mesh in meshes {
+            let mut prim_infos = Vec::new();
+            for prim in mesh.primitives {
+                prim_infos.push(PrimitiveDrawInfo {
+                    index_offset: combined_indices.len() as u32,
+                    vertex_offset: combined_verts.len() as i32,
+                    index_count: prim.indices.len() as u32,
+                    mat_idx: prim.mat_idx,
+                });
+
+                combined_indices.extend(prim.indices);
+
+                combined_verts.extend(
+                    prim.positions
+                        .chunks_exact(3)
+                        .zip(prim.normals.chunks_exact(3))
+                        .zip(prim.tangents.chunks_exact(3))
+                        .zip(prim.texcoords.chunks_exact(2))
+                        .map(|(((position, normal), tangent), texcoord)| CombinedVertex {
+                            position: position.try_into().unwrap(),
+                            normal: normal.try_into().unwrap(),
+                            tangent: tangent.try_into().unwrap(),
+                            texcoord: texcoord.try_into().unwrap(),
+                        }),
+                );
+            }
+            draw_infos.push(prim_infos);
+        }
+
+        let combined_vertex_buffer = create_buffer(
+            memory_allocator.clone(),
+            BufferUsage::VERTEX_BUFFER,
+            combined_verts,
+        );
+
+        let combined_index_buffer = create_buffer(
+            memory_allocator.clone(),
+            BufferUsage::INDEX_BUFFER,
+            combined_indices,
+        );
 
         let textures = {
             let mut builder = AutoCommandBufferBuilder::primary(
@@ -390,11 +391,8 @@ impl App {
                         _ => panic!("unsupported texture format: {:?}", texture.format),
                     };
                     let extent: [u32; 3] = [texture.width, texture.height, 1];
-                    let upload_buffer = create_buffer(
-                        memory_allocator.clone(),
-                        BufferUsage::TRANSFER_SRC,
-                        pixels.into_iter(),
-                    );
+                    let upload_buffer =
+                        create_buffer(memory_allocator.clone(), BufferUsage::TRANSFER_SRC, pixels);
 
                     let image = Image::new(
                         memory_allocator.clone(),
@@ -436,11 +434,8 @@ impl App {
         let null_texture = {
             let pixel = vec![0u8, 0u8, 0u8, 255u8]; // RGBA black
             let extent: [u32; 3] = [1, 1, 1]; // 1x1 texture
-            let upload_buffer = create_buffer(
-                memory_allocator.clone(),
-                BufferUsage::TRANSFER_SRC,
-                pixel.into_iter(),
-            );
+            let upload_buffer =
+                create_buffer(memory_allocator.clone(), BufferUsage::TRANSFER_SRC, pixel);
 
             let image = Image::new(
                 memory_allocator.clone(),
@@ -495,11 +490,13 @@ impl App {
             descriptor_set_allocator,
             command_buffer_allocator,
             uniform_buffer_allocator,
-            null_texture,
-            mesh_buffers,
+            combined_vertex_buffer,
+            combined_index_buffer,
+            draw_infos,
             materials,
             objects,
             textures,
+            null_texture,
             sampler,
             camera,
             input_state: Default::default(),
@@ -659,14 +656,7 @@ impl ApplicationHandler for App {
 
             // Automatically generate a vertex input state from the vertex shader's input
             // interface, that takes a single vertex buffer containing `Vertex` structs.
-            let vertex_input_state = [
-                Position::per_vertex(),
-                Normal::per_vertex(),
-                Tangent::per_vertex(),
-                Texcoord::per_vertex(),
-            ]
-                .definition(&vs)
-                .unwrap();
+            let vertex_input_state = CombinedVertex::per_vertex().definition(&vs).unwrap();
 
             // Make a list of the shader stages that the pipeline will have.
             let stages = [
@@ -776,7 +766,11 @@ impl ApplicationHandler for App {
         // avoid that, we store the submission of the previous frame here.
         let previous_frame_end = Some(sync::now(self.device.clone()).boxed());
 
-        let previous_frame_time = Instant::now();
+        let frame_times = {
+            let mut v = VecDeque::new();
+            v.push_back(Instant::now());
+            v
+        };
 
         self.rcx = Some(RenderContext {
             window,
@@ -787,7 +781,7 @@ impl ApplicationHandler for App {
             viewport,
             recreate_swapchain,
             previous_frame_end,
-            previous_frame_time,
+            frame_times,
         });
     }
 
@@ -826,23 +820,39 @@ impl ApplicationHandler for App {
                 self.set_cursor_confinement(true);
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    let pressed = match event.state {
-                        ElementState::Pressed => true,
-                        ElementState::Released => false,
-                    };
-                    match code {
-                        KeyCode::Escape => self.set_cursor_confinement(false),
-                        KeyCode::KeyW => self.input_state.forward = pressed,
-                        KeyCode::KeyA => self.input_state.left = pressed,
-                        KeyCode::KeyS => self.input_state.backward = pressed,
-                        KeyCode::KeyD => self.input_state.right = pressed,
-                        KeyCode::KeyQ => event_loop.exit(),
-                        _ => {}
+                if self.input_state.cursor_confined {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        let pressed = match event.state {
+                            ElementState::Pressed => true,
+                            ElementState::Released => false,
+                        };
+                        match code {
+                            KeyCode::Escape => self.set_cursor_confinement(false),
+                            KeyCode::KeyW => self.input_state.forward = pressed,
+                            KeyCode::KeyA => self.input_state.left = pressed,
+                            KeyCode::KeyS => self.input_state.backward = pressed,
+                            KeyCode::KeyD => self.input_state.right = pressed,
+                            KeyCode::KeyQ => event_loop.exit(),
+                            _ => {}
+                        }
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
+                let frame_start = Instant::now();
+                let delta_t = frame_start
+                    .duration_since(*rcx.frame_times.back().unwrap())
+                    .as_secs_f32();
+
+                let total_time = frame_start.duration_since(*rcx.frame_times.front().unwrap());
+                if total_time.as_secs_f32() >= 1.0 {
+                    let frame_time = total_time / rcx.frame_times.len() as u32;
+                    let fps = rcx.frame_times.len() as f64 / total_time.as_secs_f64();
+                    println!("{} fps ({:.2?})", fps as u32, frame_time);
+                    rcx.frame_times.clear();
+                }
+                rcx.frame_times.push_back(frame_start);
+
                 let window_size = rcx.window.inner_size();
 
                 // Do not draw the frame when the screen size is zero. On Windows, this can occur
@@ -926,9 +936,6 @@ impl ApplicationHandler for App {
                     rcx.recreate_swapchain = true;
                 }
 
-                let now = Instant::now();
-                let delta_t = now.duration_since(rcx.previous_frame_time).as_secs_f32();
-
                 if self.input_state.forward {
                     self.camera.move_forward(delta_t);
                 }
@@ -949,8 +956,6 @@ impl ApplicationHandler for App {
                 }
                 self.input_state.mouse_dx = 0.0;
                 self.input_state.mouse_dy = 0.0;
-
-                rcx.previous_frame_time = Instant::now();
 
                 // In order to draw, we have to record a *command buffer*. The command buffer
                 // object holds the list of commands that are going to be executed.
@@ -1076,9 +1081,14 @@ impl ApplicationHandler for App {
                         .unwrap()
                 };
 
+                builder
+                    .bind_vertex_buffers(0, self.combined_vertex_buffer.clone())
+                    .unwrap()
+                    .bind_index_buffer(self.combined_index_buffer.clone())
+                    .unwrap();
+
                 for object in &self.objects {
-                    let mesh = &self.mesh_buffers[object.mesh_idx];
-                    for prim in mesh.iter() {
+                    for prim in &self.draw_infos[object.mesh_idx] {
                         let mat = &self.materials[prim.mat_idx];
 
                         let layout1 = rcx.pipeline.layout().set_layouts().get(1).unwrap();
@@ -1147,22 +1157,16 @@ impl ApplicationHandler for App {
                                 1,
                                 descriptor_set,
                             )
-                            .unwrap()
-                            .bind_vertex_buffers(
-                                0,
-                                (
-                                    prim.vertex.clone(),
-                                    prim.normal.clone(),
-                                    prim.tangent.clone(),
-                                    prim.texcoord.clone(),
-                                ),
-                            )
-                            .unwrap()
-                            .bind_index_buffer(prim.index.clone())
                             .unwrap();
                         unsafe {
                             // We add a draw command.
-                            builder.draw_indexed(prim.index.len() as u32, 1, 0, 0, 0)
+                            builder.draw_indexed(
+                                prim.index_count,
+                                1,
+                                prim.index_offset,
+                                prim.vertex_offset,
+                                0,
+                            )
                         }
                         .unwrap();
                     }
@@ -1226,30 +1230,22 @@ impl ApplicationHandler for App {
 
 #[derive(BufferContents, Vertex)]
 #[repr(C)]
-pub struct Position {
+pub struct CombinedVertex {
     #[format(R32G32B32_SFLOAT)]
     position: [f32; 3],
-}
-
-#[derive(BufferContents, Vertex)]
-#[repr(C)]
-pub struct Normal {
     #[format(R32G32B32_SFLOAT)]
     normal: [f32; 3],
-}
-
-#[derive(BufferContents, Vertex)]
-#[repr(C)]
-pub struct Tangent {
     #[format(R32G32B32_SFLOAT)]
     tangent: [f32; 3],
-}
-
-#[derive(BufferContents, Vertex)]
-#[repr(C)]
-pub struct Texcoord {
     #[format(R32G32_SFLOAT)]
     texcoord: [f32; 2],
+}
+
+struct PrimitiveDrawInfo {
+    index_offset: u32,
+    vertex_offset: i32,
+    index_count: u32,
+    mat_idx: usize,
 }
 
 /// This function is called once during initialization, then again whenever the window is resized.
