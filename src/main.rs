@@ -13,9 +13,9 @@
 // original triangle example.
 
 use crate::camera::FirstPersonCamera;
-use crate::gltf::{load_gltf, Gltf, TextureFormat};
+use crate::gltf::{load_gltf, Gltf, Object, TextureFormat};
 use crate::material::Material;
-use cgmath::{Deg, Matrix4, Rad};
+use cgmath::{Matrix4, Rad};
 use image::{DynamicImage, ImageBuffer};
 use std::f32::consts::FRAC_PI_4;
 use std::time::Instant;
@@ -94,8 +94,9 @@ struct App {
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     uniform_buffer_allocator: SubbufferAllocator,
     null_texture: Arc<ImageView>,
-    mesh_buffers: Vec<MeshBuffer>,
+    mesh_buffers: Vec<Vec<MeshBuffer>>,
     materials: Vec<Material>,
+    objects: Vec<Object>,
     textures: Vec<Arc<ImageView>>,
     sampler: Arc<Sampler>,
     camera: FirstPersonCamera,
@@ -320,44 +321,50 @@ impl App {
             meshes,
             textures,
             materials,
+            objects,
         } = load_gltf("models/DamagedHelmet.glb").expect("Couldn't load gltf model");
 
         let mesh_buffers = meshes
             .into_iter()
             .map(|mesh| {
-                let vertex = create_buffer(
-                    memory_allocator.clone(),
-                    BufferUsage::VERTEX_BUFFER,
-                    mesh.positions,
-                );
-                let normal = create_buffer(
-                    memory_allocator.clone(),
-                    BufferUsage::VERTEX_BUFFER,
-                    mesh.normals,
-                );
-                let tangent = create_buffer(
-                    memory_allocator.clone(),
-                    BufferUsage::VERTEX_BUFFER,
-                    mesh.tangents,
-                );
-                let texcoord = create_buffer(
-                    memory_allocator.clone(),
-                    BufferUsage::VERTEX_BUFFER,
-                    mesh.texcoords,
-                );
-                let index = create_buffer(
-                    memory_allocator.clone(),
-                    BufferUsage::INDEX_BUFFER,
-                    mesh.indices,
-                );
-                MeshBuffer {
-                    vertex,
-                    normal,
-                    tangent,
-                    texcoord,
-                    index,
-                    mat_idx: mesh.mat_idx,
-                }
+                mesh.primitives
+                    .into_iter()
+                    .map(|prim| {
+                        let vertex = create_buffer(
+                            memory_allocator.clone(),
+                            BufferUsage::VERTEX_BUFFER,
+                            prim.positions,
+                        );
+                        let normal = create_buffer(
+                            memory_allocator.clone(),
+                            BufferUsage::VERTEX_BUFFER,
+                            prim.normals,
+                        );
+                        let tangent = create_buffer(
+                            memory_allocator.clone(),
+                            BufferUsage::VERTEX_BUFFER,
+                            prim.tangents,
+                        );
+                        let texcoord = create_buffer(
+                            memory_allocator.clone(),
+                            BufferUsage::VERTEX_BUFFER,
+                            prim.texcoords,
+                        );
+                        let index = create_buffer(
+                            memory_allocator.clone(),
+                            BufferUsage::INDEX_BUFFER,
+                            prim.indices,
+                        );
+                        MeshBuffer {
+                            vertex,
+                            normal,
+                            tangent,
+                            texcoord,
+                            index,
+                            mat_idx: prim.mat_idx,
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
 
@@ -491,6 +498,7 @@ impl App {
             null_texture,
             mesh_buffers,
             materials,
+            objects,
             textures,
             sampler,
             camera,
@@ -1068,89 +1076,96 @@ impl ApplicationHandler for App {
                         .unwrap()
                 };
 
-                for mesh in &self.mesh_buffers {
-                    let mat = &self.materials[mesh.mat_idx];
+                for object in &self.objects {
+                    let mesh = &self.mesh_buffers[object.mesh_idx];
+                    for prim in mesh.iter() {
+                        let mat = &self.materials[prim.mat_idx];
 
-                    let layout1 = rcx.pipeline.layout().set_layouts().get(1).unwrap();
-                    let object_set = {
-                        // let model = Matrix4::from_scale(0.01);
-                        let model =
-                            Matrix4::from_angle_y(Deg(180.0)) * Matrix4::from_angle_x(Deg(90.0));
-                        let uniform_obj = fs::Object {
-                            model: model.into(),
-                            baseColorFactor: mat.pbr_metallic_roughness.base_color_factor.into(),
-                            metallicFactor: mat.pbr_metallic_roughness.metallic_factor.into(),
-                            roughnessFactor: mat.pbr_metallic_roughness.roughness_factor.into(),
-                            emissiveFactor: mat.emissive_factor.into(),
-                            emissiveStrength: mat.emissive_strength.unwrap_or(1.0).into(),
+                        let layout1 = rcx.pipeline.layout().set_layouts().get(1).unwrap();
+                        let object_set = {
+                            let model = object.transform;
+                            let uniform_obj = fs::Object {
+                                model: model.into(),
+                                baseColorFactor: mat
+                                    .pbr_metallic_roughness
+                                    .base_color_factor
+                                    .into(),
+                                metallicFactor: mat.pbr_metallic_roughness.metallic_factor.into(),
+                                roughnessFactor: mat.pbr_metallic_roughness.roughness_factor.into(),
+                                emissiveFactor: mat.emissive_factor.into(),
+                                emissiveStrength: mat.emissive_strength.unwrap_or(1.0).into(),
+                            };
+                            let obj_subbuffer =
+                                self.uniform_buffer_allocator.allocate_sized().unwrap();
+                            *obj_subbuffer.write().unwrap() = uniform_obj;
+                            WriteDescriptorSet::buffer(0, obj_subbuffer)
                         };
-                        let obj_subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
-                        *obj_subbuffer.write().unwrap() = uniform_obj;
-                        WriteDescriptorSet::buffer(0, obj_subbuffer)
-                    };
 
-                    let textures = [
-                        mat.base_color_texture
-                            .as_ref()
-                            .map(|t| &self.textures[t.index]),
-                        mat.normal_texture
-                            .as_ref()
-                            .map(|t| &self.textures[t.texture.index]),
-                        mat.pbr_metallic_roughness
-                            .metallic_roughness_texture
-                            .as_ref()
-                            .map(|t| &self.textures[t.index]),
-                        mat.emissive_texture
-                            .as_ref()
-                            .map(|t| &self.textures[t.index]),
-                    ];
+                        let textures = [
+                            mat.base_color_texture
+                                .as_ref()
+                                .map(|t| &self.textures[t.index]),
+                            mat.normal_texture
+                                .as_ref()
+                                .map(|t| &self.textures[t.texture.index]),
+                            mat.pbr_metallic_roughness
+                                .metallic_roughness_texture
+                                .as_ref()
+                                .map(|t| &self.textures[t.index]),
+                            mat.emissive_texture
+                                .as_ref()
+                                .map(|t| &self.textures[t.index]),
+                        ];
 
-                    let descriptor_set = DescriptorSet::new(
-                        self.descriptor_set_allocator.clone(),
-                        layout1.clone(),
-                        std::iter::once(object_set).chain(textures.into_iter().enumerate().map(
-                            |(idx, texture)| match texture {
-                                Some(texture) => WriteDescriptorSet::image_view_sampler(
-                                    1 + idx as u32,
-                                    texture.clone(),
-                                    self.sampler.clone(),
+                        let descriptor_set = DescriptorSet::new(
+                            self.descriptor_set_allocator.clone(),
+                            layout1.clone(),
+                            std::iter::once(object_set).chain(
+                                textures.into_iter().enumerate().map(
+                                    |(idx, texture)| match texture {
+                                        Some(texture) => WriteDescriptorSet::image_view_sampler(
+                                            1 + idx as u32,
+                                            texture.clone(),
+                                            self.sampler.clone(),
+                                        ),
+                                        None => WriteDescriptorSet::image_view_sampler(
+                                            1 + idx as u32,
+                                            self.null_texture.clone(),
+                                            self.sampler.clone(),
+                                        ),
+                                    },
                                 ),
-                                None => WriteDescriptorSet::image_view_sampler(
-                                    1 + idx as u32,
-                                    self.null_texture.clone(),
-                                    self.sampler.clone(),
-                                ),
-                            },
-                        )),
-                        [],
-                    )
-                    .unwrap();
-
-                    builder
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Graphics,
-                            rcx.pipeline.layout().clone(),
-                            1,
-                            descriptor_set,
-                        )
-                        .unwrap()
-                        .bind_vertex_buffers(
-                            0,
-                            (
-                                mesh.vertex.clone(),
-                                mesh.normal.clone(),
-                                mesh.tangent.clone(),
-                                mesh.texcoord.clone(),
                             ),
+                            [],
                         )
-                        .unwrap()
-                        .bind_index_buffer(mesh.index.clone())
+                            .unwrap();
+
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                rcx.pipeline.layout().clone(),
+                                1,
+                                descriptor_set,
+                            )
+                            .unwrap()
+                            .bind_vertex_buffers(
+                                0,
+                                (
+                                    prim.vertex.clone(),
+                                    prim.normal.clone(),
+                                    prim.tangent.clone(),
+                                    prim.texcoord.clone(),
+                                ),
+                            )
+                            .unwrap()
+                            .bind_index_buffer(prim.index.clone())
+                            .unwrap();
+                        unsafe {
+                            // We add a draw command.
+                            builder.draw_indexed(prim.index.len() as u32, 1, 0, 0, 0)
+                        }
                         .unwrap();
-                    unsafe {
-                        // We add a draw command.
-                        builder.draw_indexed(mesh.index.len() as u32, 1, 0, 0, 0)
                     }
-                        .unwrap();
                 }
 
                 builder

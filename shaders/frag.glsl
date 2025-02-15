@@ -69,7 +69,18 @@ vec3 FresnelSchlick(float cosTheta, vec3 F0)
 void main()
 {
     // -------------------------------------------------------------------------
-    // 1. Derive the normal from normal map (in tangent space)
+    // 1. Sample material properties from textures & factor uniforms
+    // -------------------------------------------------------------------------
+    // Base color
+    vec4 baseColorTex = texture(u_BaseColorTex, v_texcoord);
+    if (baseColorTex.a < 0.1) discard;
+    // Multiply texture’s RGB by object’s baseColorFactor RGB (and also handle alpha if needed)
+    vec3 baseColor = baseColorTex.rgb * object.baseColorFactor.rgb;
+    // Optionally modulate alpha, if you have transparency:
+    // float alpha = baseColorTex.a * object.baseColorFactor.a;
+
+    // -------------------------------------------------------------------------
+    // 2. Derive the normal from normal map (in tangent space)
     // -------------------------------------------------------------------------
     // The normal map is assumed to be in [0..1] range, so remap to [-1..1].
     vec3 normalSample = texture(u_NormalTex, v_texcoord).xyz * 2.0 - 1.0;
@@ -78,16 +89,6 @@ void main()
     mat3 TBN = mat3(v_tangent, v_bitangent, v_normal);
     // Transform the tangent-space normal to world space
     vec3 N = normalize(TBN * normalSample);
-
-    // -------------------------------------------------------------------------
-    // 2. Sample material properties from textures & factor uniforms
-    // -------------------------------------------------------------------------
-    // Base color
-    vec4 baseColorTex = texture(u_BaseColorTex, v_texcoord);
-    // Multiply texture’s RGB by object’s baseColorFactor RGB (and also handle alpha if needed)
-    vec3 baseColor = baseColorTex.rgb * object.baseColorFactor.rgb;
-    // Optionally modulate alpha, if you have transparency:
-    // float alpha = baseColorTex.a * object.baseColorFactor.a;
 
     // Metallic (B channel) and roughness (G channel)
     vec4 mrTex      = texture(u_MetallicRoughnessTex, v_texcoord);

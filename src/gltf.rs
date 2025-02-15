@@ -1,10 +1,11 @@
 use crate::material::{Material, NormalTexture, PbrMetallicRoughness, Texture};
+use cgmath::{Matrix4, SquareMatrix};
 use gltf::image::{Data, Format};
 use gltf::texture::Info;
 use gltf::Error;
 use std::time::Instant;
 
-pub struct Mesh {
+pub struct Primitive {
     pub positions: Vec<f32>,
     pub normals: Vec<f32>,
     pub tangents: Vec<f32>,
@@ -13,7 +14,11 @@ pub struct Mesh {
     pub mat_idx: usize,
 }
 
-impl mikktspace::Geometry for Mesh {
+pub struct Mesh {
+    pub primitives: Vec<Primitive>,
+}
+
+impl mikktspace::Geometry for Primitive {
     fn num_faces(&self) -> usize {
         self.indices.len() / 3
     }
@@ -129,6 +134,12 @@ pub struct Gltf {
     pub meshes: Vec<Mesh>,
     pub textures: Vec<TextureData>,
     pub materials: Vec<Material>,
+    pub objects: Vec<Object>,
+}
+
+pub struct Object {
+    pub transform: Matrix4<f32>,
+    pub mesh_idx: usize,
 }
 
 pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
@@ -145,109 +156,115 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
     );
     start_time = Instant::now();
 
+    let nodes = doc
+        .nodes()
+        .map(|node| {
+            (
+                Matrix4::from(node.transform().matrix()),
+                node.mesh().map(|m| m.index()),
+                node.children()
+                    .map(|child| child.index())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut objects = Vec::new();
+    {
+        let mut stack = doc
+            .scenes()
+            .flat_map(|scene| {
+                scene
+                    .nodes()
+                    .map(|node| (node.index(), Matrix4::identity()))
+            })
+            .collect::<Vec<_>>();
+
+        while let Some((node_id, parent_transform)) = stack.pop() {
+            let (node_transform, mesh_idx, children) = nodes[node_id].clone();
+
+            let transform = parent_transform * node_transform;
+
+            if let Some(mesh_idx) = mesh_idx {
+                objects.push(Object {
+                    transform,
+                    mesh_idx,
+                });
+            }
+
+            for child_id in children {
+                stack.push((child_id, transform));
+            }
+        }
+    }
+
     let meshes = doc
         .meshes()
-        .map(|mesh| mesh.primitives())
-        .map(|prims| {
-            prims.map(|prim| {
-                let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
-                let positions = reader
-                    .read_positions()
-                    .unwrap()
-                    .flatten()
-                    .collect::<Vec<_>>();
-                let normals = reader.read_normals().unwrap().flatten().collect::<Vec<_>>();
-                let texcoords = reader
-                    .read_tex_coords(0) // TODO: support multiple TEXCOORDs
-                    .unwrap()
-                    .into_f32()
-                    .flatten()
-                    .collect::<Vec<_>>();
-
-                let opt_tangents = reader
-                    .read_tangents()
-                    .map(|t| t.flatten().collect::<Vec<_>>());
-
-                /*
-                let tangents = {
-                    let mut tangents = vec![[0f32; 3]; positions.len()];
-                    let ps = reader.read_positions().unwrap().collect::<Vec<_>>();
-                    let uvs = reader
-                        .read_tex_coords(0)
+        .map(|mesh| {
+            let primitives = mesh
+                .primitives()
+                .map(|prim| {
+                    let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
+                    let positions = reader
+                        .read_positions()
+                        .unwrap()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    let normals = reader.read_normals().unwrap().flatten().collect::<Vec<_>>();
+                    let texcoords = reader
+                        .read_tex_coords(0) // TODO: support multiple TEXCOORDs
                         .unwrap()
                         .into_f32()
+                        .flatten()
                         .collect::<Vec<_>>();
-                    let tris = reader
+
+                    let opt_tangents = reader
+                        .read_tangents()
+                        .map(|t| t.flatten().collect::<Vec<_>>());
+
+                    let indices = reader
                         .read_indices()
                         .unwrap()
                         .into_u32()
                         .collect::<Vec<_>>();
-                    for tri in tris.chunks_exact(3) {
-                        let t0 = tri[0] as usize;
-                        let t1 = tri[1] as usize;
-                        let t2 = tri[2] as usize;
-                        let p0 = ps[t0];
-                        let p1 = ps[t1];
-                        let p2 = ps[t2];
-                        let uv0 = uvs[t0];
-                        let uv1 = uvs[t1];
-                        let uv2 = uvs[t2];
-                        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-                        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-                        let duv1 = [uv1[0] - uv0[0], uv1[1] - uv0[1]];
-                        let duv2 = [uv2[0] - uv0[0], uv2[1] - uv0[1]];
-                        let f = 1.0 / (duv1[0] * duv2[1] - duv2[0] * duv1[1]);
-                        let tangent = [
-                            f * (duv2[1] * e1[0] - duv1[1] * e2[0]),
-                            f * (duv2[1] * e1[1] - duv1[1] * e2[1]),
-                            f * (duv2[1] * e1[2] - duv1[1] * e2[2]),
-                        ];
-                        for i in tri {
-                            tangents[*i as usize][0] += tangent[0];
-                            tangents[*i as usize][1] += tangent[1];
-                            tangents[*i as usize][2] += tangent[2];
+                    let mat_idx = prim.material().index().unwrap();
+
+                    let num_verts = positions.len();
+                    let mut prim = Primitive {
+                        positions,
+                        normals,
+                        tangents: Vec::new(),
+                        texcoords,
+                        indices,
+                        mat_idx,
+                    };
+
+                    match opt_tangents {
+                        Some(tangents) => {
+                            prim.tangents = tangents;
+                        }
+                        None => {
+                            prim.tangents =
+                                vec![[0f32; 3]; num_verts].into_iter().flatten().collect();
+                            let start_time = Instant::now();
+                            mikktspace::generate_tangents(&mut prim);
+                            println!("Generated tangents in {:?}", start_time.elapsed());
                         }
                     }
-                    tangents.into_iter().flatten().collect()
-                };
-                 */
-                let indices = reader
-                    .read_indices()
-                    .unwrap()
-                    .into_u32()
-                    .collect::<Vec<_>>();
-                let mat_idx = prim.material().index().unwrap();
 
-                let num_verts = positions.len();
-                let mut mesh = Mesh {
-                    positions,
-                    normals,
-                    tangents: Vec::new(),
-                    texcoords,
-                    indices,
-                    mat_idx,
-                };
-
-                match opt_tangents {
-                    Some(tangents) => {
-                        mesh.tangents = tangents;
-                    }
-                    None => {
-                        mesh.tangents = vec![[0f32; 3]; num_verts].into_iter().flatten().collect();
-                        let start_time = Instant::now();
-                        mikktspace::generate_tangents(&mut mesh);
-                        println!("Generated tangents in {:?}", start_time.elapsed());
-                    }
-                }
-
-                mesh
-            })
+                    prim
+                })
+                .collect();
+            Mesh { primitives }
         })
-        .flatten()
         .collect::<Vec<_>>();
+
     println!(
         "Loaded {} meshes in {:?}",
-        meshes.len(),
+        meshes
+            .iter()
+            .map(|mesh| mesh.primitives.len())
+            .sum::<usize>(),
         start_time.elapsed()
     );
 
@@ -255,5 +272,6 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
         meshes,
         textures,
         materials,
+        objects,
     })
 }
