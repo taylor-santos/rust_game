@@ -22,7 +22,7 @@ use std::f32::consts::FRAC_PI_4;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
-use vulkano::command_buffer::{CopyBufferToImageInfo, PrimaryCommandBufferAbstract};
+use vulkano::command_buffer::{CopyBufferInfo, CopyBufferToImageInfo, PrimaryCommandBufferAbstract};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
@@ -359,12 +359,16 @@ impl App {
 
         let combined_vertex_buffer = create_buffer(
             memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+            queue.clone(),
             BufferUsage::VERTEX_BUFFER,
             combined_verts,
         );
 
         let combined_index_buffer = create_buffer(
             memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+            queue.clone(),
             BufferUsage::INDEX_BUFFER,
             combined_indices,
         );
@@ -391,8 +395,13 @@ impl App {
                         _ => panic!("unsupported texture format: {:?}", texture.format),
                     };
                     let extent: [u32; 3] = [texture.width, texture.height, 1];
-                    let upload_buffer =
-                        create_buffer(memory_allocator.clone(), BufferUsage::TRANSFER_SRC, pixels);
+                    let upload_buffer = create_buffer(
+                        memory_allocator.clone(),
+                        command_buffer_allocator.clone(),
+                        queue.clone(),
+                        BufferUsage::TRANSFER_SRC,
+                        pixels,
+                    );
 
                     let image = Image::new(
                         memory_allocator.clone(),
@@ -434,8 +443,13 @@ impl App {
         let null_texture = {
             let pixel = vec![0u8, 0u8, 0u8, 255u8]; // RGBA black
             let extent: [u32; 3] = [1, 1, 1]; // 1x1 texture
-            let upload_buffer =
-                create_buffer(memory_allocator.clone(), BufferUsage::TRANSFER_SRC, pixel);
+            let upload_buffer = create_buffer(
+                memory_allocator.clone(),
+                command_buffer_allocator.clone(),
+                queue.clone(),
+                BufferUsage::TRANSFER_SRC,
+                pixel,
+            );
 
             let image = Image::new(
                 memory_allocator.clone(),
@@ -1258,26 +1272,64 @@ fn window_size_dependent_setup(images: &[Arc<Image>]) -> Vec<Arc<ImageView>> {
 
 fn create_buffer<T: BufferContents + Send + Sync, I: IntoIterator<Item=T>>(
     allocator: Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    queue: Arc<Queue>,
     usage: BufferUsage,
-    data: I,
+    data: I
 ) -> Subbuffer<[T]>
 where
     I::IntoIter: ExactSizeIterator,
 {
-    Buffer::from_iter(
-        allocator,
+    let staging_buffer = Buffer::from_iter(
+        allocator.clone(),
         BufferCreateInfo {
-            usage,
+            usage: BufferUsage::TRANSFER_SRC,
             ..Default::default()
         },
         AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
         data,
     )
+        .unwrap();
+    let device_local_buffer = Buffer::new_slice::<T>(
+        allocator,
+        BufferCreateInfo {
+            usage: usage | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        staging_buffer.len() as u64,
+    )
+        .unwrap();
+    let mut builder = AutoCommandBufferBuilder::primary(
+        command_buffer_allocator,
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+        .unwrap();
+    builder
+        .copy_buffer(CopyBufferInfo::buffers(
+            staging_buffer.clone(),
+            device_local_buffer.clone(),
+        ))
+        .unwrap();
+    let command_buffer = builder.build().unwrap();
+
+    sync::now(queue.device().clone())
+        .then_execute(queue.clone(), command_buffer)
         .unwrap()
+        .then_signal_fence_and_flush()
+        .unwrap()
+        .wait(None)
+        .unwrap();
+
+    device_local_buffer
 }
 
 // The next step is to create the shaders.
