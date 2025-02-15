@@ -125,7 +125,13 @@ impl From<gltf::material::NormalTexture<'_>> for NormalTexture {
 pub(crate) type TextureData = Data;
 pub(crate) type TextureFormat = Format;
 
-pub fn load_gltf(path: &str) -> Result<(Vec<Mesh>, Vec<TextureData>, Vec<Material>), Error> {
+pub struct Gltf {
+    pub meshes: Vec<Mesh>,
+    pub textures: Vec<TextureData>,
+    pub materials: Vec<Material>,
+}
+
+pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
     let mut start_time = Instant::now();
     let (doc, buffers, textures) = gltf::import(path)?;
     println!("Loaded gltf in {:?}", start_time.elapsed());
@@ -245,5 +251,9 @@ pub fn load_gltf(path: &str) -> Result<(Vec<Mesh>, Vec<TextureData>, Vec<Materia
         start_time.elapsed()
     );
 
-    Ok((meshes, textures, materials))
+    Ok(Gltf {
+        meshes,
+        textures,
+        materials,
+    })
 }
