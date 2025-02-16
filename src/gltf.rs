@@ -3,6 +3,7 @@ use cgmath::{Matrix4, SquareMatrix};
 use gltf::image::{Data, Format};
 use gltf::texture::Info;
 use gltf::Error;
+use rayon::prelude::*;
 use std::time::Instant;
 
 pub struct Primitive {
@@ -200,9 +201,13 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
 
     let meshes = doc
         .meshes()
+        .collect::<Vec<_>>()
+        .par_iter()
         .map(|mesh| {
             let primitives = mesh
                 .primitives()
+                .collect::<Vec<_>>()
+                .par_iter()
                 .map(|prim| {
                     let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
                     let positions = reader
@@ -246,9 +251,7 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
                         None => {
                             prim.tangents =
                                 vec![[0f32; 3]; num_verts].into_iter().flatten().collect();
-                            let start_time = Instant::now();
                             mikktspace::generate_tangents(&mut prim);
-                            println!("Generated tangents in {:?}", start_time.elapsed());
                         }
                     }
 

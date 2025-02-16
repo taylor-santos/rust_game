@@ -17,12 +17,15 @@ use crate::gltf::{load_gltf, Gltf, Object, TextureFormat};
 use crate::material::Material;
 use cgmath::{Matrix4, Rad};
 use image::{DynamicImage, ImageBuffer};
+use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::f32::consts::FRAC_PI_4;
 use std::time::Instant;
 use std::{error::Error, sync::Arc};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
-use vulkano::command_buffer::{CopyBufferInfo, CopyBufferToImageInfo, PrimaryCommandBufferAbstract};
+use vulkano::command_buffer::{
+    CopyBufferInfo, CopyBufferToImageInfo, PrimaryCommandBufferAbstract,
+};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
@@ -94,8 +97,8 @@ struct App {
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     uniform_buffer_allocator: SubbufferAllocator,
-    combined_vertex_buffer: Subbuffer<[CombinedVertex]>,
-    combined_index_buffer: Subbuffer<[u32]>,
+    vertex_buffer: Subbuffer<[CombinedVertex]>,
+    index_buffer: Subbuffer<[u32]>,
     draw_infos: Vec<Vec<PrimitiveDrawInfo>>,
     materials: Vec<Material>,
     objects: Vec<Object>,
@@ -318,62 +321,82 @@ impl App {
             objects,
         } = load_gltf("models/DamagedHelmet.glb").expect("Couldn't load gltf model");
 
+        let timer = Instant::now();
+
         let (vert_count, index_count) = meshes
-            .iter()
+            .par_iter()
             .flat_map(|mesh| &mesh.primitives)
             .map(|prim| (prim.positions.len(), prim.indices.len()))
-            .reduce(|(v1, i1), (v2, i2)| (v1 + v2, i1 + i2))
-            .unwrap_or((0, 0));
+            .reduce(|| (0, 0), |(v1, i1), (v2, i2)| (v1 + v2, i1 + i2));
 
-        let mut combined_verts = Vec::with_capacity(vert_count / 3);
-        let mut combined_indices = Vec::with_capacity(index_count);
-        let mut draw_infos = Vec::new();
-        for mesh in meshes {
-            let mut prim_infos = Vec::new();
-            for prim in mesh.primitives {
-                prim_infos.push(PrimitiveDrawInfo {
-                    index_offset: combined_indices.len() as u32,
-                    vertex_offset: combined_verts.len() as i32,
-                    index_count: prim.indices.len() as u32,
-                    mat_idx: prim.mat_idx,
-                });
+        let (vertex_buffer, index_buffer, draw_infos) = {
+            let combined_verts = std::sync::Mutex::new(Vec::with_capacity(vert_count / 3));
+            let combined_indices = std::sync::Mutex::new(Vec::with_capacity(index_count));
+            let draw_infos = std::sync::Mutex::new(Vec::new());
 
-                combined_indices.extend(prim.indices);
+            meshes.par_iter().for_each(|mesh| {
+                let mut prim_infos = Vec::new();
 
-                combined_verts.extend(
-                    prim.positions
-                        .chunks_exact(3)
-                        .zip(prim.normals.chunks_exact(3))
-                        .zip(prim.tangents.chunks_exact(3))
-                        .zip(prim.texcoords.chunks_exact(2))
+                for prim in &mesh.primitives {
+                    let vertex_batch: Vec<CombinedVertex> = prim
+                        .positions
+                        .par_chunks_exact(3)
+                        .zip(prim.normals.par_chunks_exact(3))
+                        .zip(prim.tangents.par_chunks_exact(3))
+                        .zip(prim.texcoords.par_chunks_exact(2))
                         .map(|(((position, normal), tangent), texcoord)| CombinedVertex {
                             position: position.try_into().unwrap(),
                             normal: normal.try_into().unwrap(),
                             tangent: tangent.try_into().unwrap(),
                             texcoord: texcoord.try_into().unwrap(),
-                        }),
-                );
-            }
-            draw_infos.push(prim_infos);
-        }
+                        })
+                        .collect();
 
-        let combined_vertex_buffer = create_buffer(
-            memory_allocator.clone(),
-            command_buffer_allocator.clone(),
-            queue.clone(),
-            BufferUsage::VERTEX_BUFFER,
-            combined_verts,
-        );
+                    let mut combined_verts_lock = combined_verts.lock().unwrap();
+                    let mut combined_indices_lock = combined_indices.lock().unwrap();
 
-        let combined_index_buffer = create_buffer(
-            memory_allocator.clone(),
-            command_buffer_allocator.clone(),
-            queue.clone(),
-            BufferUsage::INDEX_BUFFER,
-            combined_indices,
-        );
+                    prim_infos.push(PrimitiveDrawInfo {
+                        index_offset: combined_indices_lock.len() as u32,
+                        vertex_offset: combined_verts_lock.len() as i32,
+                        index_count: prim.indices.len() as u32,
+                        mat_idx: prim.mat_idx,
+                    });
+
+                    combined_indices_lock.extend(&prim.indices);
+                    combined_verts_lock.extend(vertex_batch);
+                }
+
+                let mut draw_infos_lock = draw_infos.lock().unwrap();
+                draw_infos_lock.push(prim_infos);
+            });
+
+            let combined_verts = combined_verts.into_inner().unwrap();
+            let combined_indices = combined_indices.into_inner().unwrap();
+            let draw_infos = draw_infos.into_inner().unwrap();
+
+            let vertex_buffer = create_buffer(
+                memory_allocator.clone(),
+                command_buffer_allocator.clone(),
+                queue.clone(),
+                BufferUsage::VERTEX_BUFFER,
+                combined_verts,
+            );
+
+            let index_buffer = create_buffer(
+                memory_allocator.clone(),
+                command_buffer_allocator.clone(),
+                queue.clone(),
+                BufferUsage::INDEX_BUFFER,
+                combined_indices,
+            );
+
+            println!("Combined vertex data in {:?}", timer.elapsed());
+
+            (vertex_buffer, index_buffer, draw_infos)
+        };
 
         let textures = {
+            let timer = Instant::now();
             let mut builder = AutoCommandBufferBuilder::primary(
                 command_buffer_allocator.clone(),
                 queue.queue_family_index(),
@@ -436,6 +459,12 @@ impl App {
                 .unwrap()
                 .wait(None)
                 .unwrap();
+
+            println!(
+                "Uploaded {} textures in {:?}",
+                textures.len(),
+                timer.elapsed()
+            );
 
             textures
         };
@@ -504,8 +533,8 @@ impl App {
             descriptor_set_allocator,
             command_buffer_allocator,
             uniform_buffer_allocator,
-            combined_vertex_buffer,
-            combined_index_buffer,
+            vertex_buffer,
+            index_buffer,
             draw_infos,
             materials,
             objects,
@@ -1096,9 +1125,9 @@ impl ApplicationHandler for App {
                 };
 
                 builder
-                    .bind_vertex_buffers(0, self.combined_vertex_buffer.clone())
+                    .bind_vertex_buffers(0, self.vertex_buffer.clone())
                     .unwrap()
-                    .bind_index_buffer(self.combined_index_buffer.clone())
+                    .bind_index_buffer(self.index_buffer.clone())
                     .unwrap();
 
                 for object in &self.objects {
@@ -1275,7 +1304,7 @@ fn create_buffer<T: BufferContents + Send + Sync, I: IntoIterator<Item=T>>(
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     queue: Arc<Queue>,
     usage: BufferUsage,
-    data: I
+    data: I,
 ) -> Subbuffer<[T]>
 where
     I::IntoIter: ExactSizeIterator,
@@ -1304,7 +1333,7 @@ where
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         },
-        staging_buffer.len() as u64,
+        staging_buffer.len(),
     )
         .unwrap();
     let mut builder = AutoCommandBufferBuilder::primary(
