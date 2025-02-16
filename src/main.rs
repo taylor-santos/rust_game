@@ -103,8 +103,6 @@ struct App {
     materials: Vec<Material>,
     objects: Vec<Object>,
     textures: Vec<Arc<ImageView>>,
-    material_sets: Vec<Arc<DescriptorSet>>,
-    object_sets: Vec<Arc<DescriptorSet>>,
     null_texture: Arc<ImageView>,
     sampler: Arc<Sampler>,
     camera: FirstPersonCamera,
@@ -132,6 +130,8 @@ struct RenderContext {
     recreate_swapchain: bool,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
     frame_times: VecDeque<Instant>,
+    material_sets: Vec<Arc<DescriptorSet>>,
+    object_sets: Vec<Arc<DescriptorSet>>,
 }
 
 impl App {
@@ -541,8 +541,6 @@ impl App {
             materials,
             objects,
             textures,
-            material_sets: Vec::new(),
-            object_sets: Vec::new(),
             null_texture,
             sampler,
             camera,
@@ -819,7 +817,7 @@ impl ApplicationHandler for App {
             v
         };
 
-        self.material_sets = {
+        let material_sets = {
             let layout = pipeline.layout().set_layouts().get(0).unwrap();
             self.materials
                 .iter()
@@ -880,7 +878,7 @@ impl ApplicationHandler for App {
                 .collect()
         };
 
-        self.object_sets = {
+        let object_sets = {
             let layout = pipeline.layout().set_layouts().get(1).unwrap();
             self.objects
                 .iter()
@@ -915,6 +913,8 @@ impl ApplicationHandler for App {
             recreate_swapchain,
             previous_frame_end,
             frame_times,
+            material_sets,
+            object_sets,
         });
     }
 
@@ -1194,7 +1194,7 @@ impl ApplicationHandler for App {
                     .unwrap();
 
                 for (object_idx, object) in self.objects.iter().enumerate() {
-                    let object_set = self.object_sets[object_idx].clone();
+                    let object_set = rcx.object_sets[object_idx].clone();
                     builder
                         .bind_descriptor_sets(
                             PipelineBindPoint::Graphics,
@@ -1204,7 +1204,7 @@ impl ApplicationHandler for App {
                         )
                         .unwrap();
                     for prim in &self.draw_infos[object.mesh_idx] {
-                        let mat_set = self.material_sets[prim.mat_idx].clone();
+                        let mat_set = rcx.material_sets[prim.mat_idx].clone();
 
                         builder
                             .bind_descriptor_sets(
@@ -1298,6 +1298,7 @@ pub struct CombinedVertex {
     texcoord: [f32; 2],
 }
 
+#[derive(Clone, Copy)]
 struct PrimitiveDrawInfo {
     index_offset: u32,
     vertex_offset: i32,
