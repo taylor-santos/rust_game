@@ -8,31 +8,26 @@ layout(location = 4) in vec3 v_worldPos;
 
 layout(location = 0) out vec4 f_color;
 
-layout(set = 1, binding = 0) uniform Object {
-    mat4 model;
+layout (push_constant) uniform PushConstants {
+    vec3 light_direction;
+    vec3 light_color;
+    vec3 light_ambient;
+    mat4 cam_viewproj;
+    vec3 cam_position;
+} push_constants;
+
+layout (set = 0, binding = 0) uniform Material {
     vec4 baseColorFactor;
     float metallicFactor;
     float roughnessFactor;
     vec3 emissiveFactor;
     float emissiveStrength;
-} object;
+} material;
 
-layout(set = 1, binding = 1) uniform sampler2D u_BaseColorTex;
-layout(set = 1, binding = 2) uniform sampler2D u_NormalTex;
-layout(set = 1, binding = 3) uniform sampler2D u_MetallicRoughnessTex;
-layout(set = 1, binding = 4) uniform sampler2D u_EmissiveTex;
-
-layout(set = 0, binding = 1) uniform Light {
-    vec3 direction;
-    vec3 color;
-    vec3 ambient;
-} light;
-
-layout(set = 0, binding = 0) uniform Camera {
-    mat4 viewproj;
-    vec3 position;
-} camera;
-
+layout (set = 0, binding = 1) uniform sampler2D u_BaseColorTex;
+layout (set = 0, binding = 2) uniform sampler2D u_NormalTex;
+layout (set = 0, binding = 3) uniform sampler2D u_MetallicRoughnessTex;
+layout (set = 0, binding = 4) uniform sampler2D u_EmissiveTex;
 
 // -----------------------------------------------------------------------------
 // Constants and helper functions for PBR
@@ -74,10 +69,10 @@ void main()
     // Base color
     vec4 baseColorTex = texture(u_BaseColorTex, v_texcoord);
     if (baseColorTex.a < 0.1) discard;
-    // Multiply texture’s RGB by object’s baseColorFactor RGB (and also handle alpha if needed)
-    vec3 baseColor = baseColorTex.rgb * object.baseColorFactor.rgb;
+    // Multiply texture’s RGB by material’s baseColorFactor RGB (and also handle alpha if needed)
+    vec3 baseColor = baseColorTex.rgb * material.baseColorFactor.rgb;
     // Optionally modulate alpha, if you have transparency:
-    // float alpha = baseColorTex.a * object.baseColorFactor.a;
+    // float alpha = baseColorTex.a * material.baseColorFactor.a;
 
     // -------------------------------------------------------------------------
     // 2. Derive the normal from normal map (in tangent space)
@@ -92,22 +87,22 @@ void main()
 
     // Metallic (B channel) and roughness (G channel)
     vec4 mrTex      = texture(u_MetallicRoughnessTex, v_texcoord);
-    float metallic  = mrTex.b * object.metallicFactor;
-    float roughness = mrTex.g * object.roughnessFactor;
+    float metallic = mrTex.b * material.metallicFactor;
+    float roughness = mrTex.g * material.roughnessFactor;
 
     // Emissive
     vec3 emissiveTex = texture(u_EmissiveTex, v_texcoord).rgb;
-    vec3 emissive    = emissiveTex * object.emissiveFactor * object.emissiveStrength;
+    vec3 emissive = emissiveTex * material.emissiveFactor * material.emissiveStrength;
 
     // -------------------------------------------------------------------------
     // 3. Compute the lighting terms
     // -------------------------------------------------------------------------
     // Camera/view direction (normalize worldPos -> camera vector)
-    vec3 V = normalize(camera.position - v_worldPos);
+    vec3 V = normalize(push_constants.cam_position - v_worldPos);
 
     // Light direction is given as 'light.direction' is "toward the fragment";
     // if it were "from the light," you might do `-light.direction`.
-    vec3 L = normalize(light.direction);
+    vec3 L = normalize(push_constants.light_direction);
 
     // Half vector
     vec3 H = normalize(V + L);
@@ -148,14 +143,14 @@ void main()
     vec3 diffuse = kD * baseColor / PI;
 
     // Final contribution from this directional light
-    vec3 directLight = (diffuse + specular) * light.color * NdotL;
+    vec3 directLight = (diffuse + specular) * push_constants.light_color * NdotL;
 
     // -------------------------------------------------------------------------
     // 5. Add ambient (simple constant ambient in this example) and emissive
     // -------------------------------------------------------------------------
     // Ambient is approximated as a simple constant color. In more advanced setups,
     // you would use image-based lighting (IBL) for more realism.
-    vec3 ambient = light.ambient * baseColor;
+    vec3 ambient = push_constants.light_ambient * baseColor;
 
     // Combine all terms
     vec3 color = ambient + directLight + emissive;

@@ -103,6 +103,8 @@ struct App {
     materials: Vec<Material>,
     objects: Vec<Object>,
     textures: Vec<Arc<ImageView>>,
+    material_sets: Vec<Arc<DescriptorSet>>,
+    object_sets: Vec<Arc<DescriptorSet>>,
     null_texture: Arc<ImageView>,
     sampler: Arc<Sampler>,
     camera: FirstPersonCamera,
@@ -539,6 +541,8 @@ impl App {
             materials,
             objects,
             textures,
+            material_sets: Vec::new(),
+            object_sets: Vec::new(),
             null_texture,
             sampler,
             camera,
@@ -815,6 +819,92 @@ impl ApplicationHandler for App {
             v
         };
 
+        self.material_sets = {
+            let layout = pipeline.layout().set_layouts().get(0).unwrap();
+            self.materials
+                .iter()
+                .map(|mat| {
+                    let descriptor_set = {
+                        let mat_uniform = fs::Material {
+                            baseColorFactor: mat.pbr_metallic_roughness.base_color_factor.into(),
+                            metallicFactor: mat.pbr_metallic_roughness.metallic_factor.into(),
+                            roughnessFactor: mat.pbr_metallic_roughness.roughness_factor.into(),
+                            emissiveFactor: mat.emissive_factor.into(),
+                            emissiveStrength: mat.emissive_strength.unwrap_or(1.0).into(),
+                        };
+                        let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+                        *subbuffer.write().unwrap() = mat_uniform;
+                        WriteDescriptorSet::buffer(0, subbuffer)
+                    };
+
+                    let textures = [
+                        mat.base_color_texture
+                            .as_ref()
+                            .map(|t| &self.textures[t.index]),
+                        mat.normal_texture
+                            .as_ref()
+                            .map(|t| &self.textures[t.texture.index]),
+                        mat.pbr_metallic_roughness
+                            .metallic_roughness_texture
+                            .as_ref()
+                            .map(|t| &self.textures[t.index]),
+                        mat.emissive_texture
+                            .as_ref()
+                            .map(|t| &self.textures[t.index]),
+                    ];
+
+                    DescriptorSet::new(
+                        self.descriptor_set_allocator.clone(),
+                        layout.clone(),
+                        std::iter::once(descriptor_set).chain(
+                            textures
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, texture)| match texture {
+                                    Some(texture) => WriteDescriptorSet::image_view_sampler(
+                                        1 + idx as u32,
+                                        texture.clone(),
+                                        self.sampler.clone(),
+                                    ),
+                                    None => WriteDescriptorSet::image_view_sampler(
+                                        1 + idx as u32,
+                                        self.null_texture.clone(),
+                                        self.sampler.clone(),
+                                    ),
+                                }),
+                        ),
+                        [],
+                    )
+                        .unwrap()
+                })
+                .collect()
+        };
+
+        self.object_sets = {
+            let layout = pipeline.layout().set_layouts().get(1).unwrap();
+            self.objects
+                .iter()
+                .map(|object| {
+                    let descriptor_set = {
+                        let obj_uniform = vs::Object {
+                            model: object.transform.into(),
+                        };
+                        let obj_subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+                        *obj_subbuffer.write().unwrap() = obj_uniform;
+                        WriteDescriptorSet::buffer(0, obj_subbuffer)
+                    };
+
+                    DescriptorSet::new(
+                        self.descriptor_set_allocator.clone(),
+                        layout.clone(),
+                        [descriptor_set],
+                        [],
+                    )
+                        .unwrap()
+                })
+                .collect()
+        };
+
         self.rcx = Some(RenderContext {
             window,
             swapchain,
@@ -1060,68 +1150,41 @@ impl ApplicationHandler for App {
                     .unwrap();
 
                 {
-                    let camera_subbuffer = {
-                        let proj = {
-                            let aspect_ratio = rcx.swapchain.image_extent()[0] as f32
-                                / rcx.swapchain.image_extent()[1] as f32;
-                            let near = 0.005;
-                            let far = 10000.0;
+                    let light_direction = [0.5, 1.0, 0.0].into();
+                    let light_color = [1.0, 1.0, 1.0].into();
+                    let light_ambient = [0.4, 0.4, 0.4].into();
 
-                            let proj = cgmath::perspective(Rad(FRAC_PI_4), aspect_ratio, near, far);
-                            // Vulkan clip space has inverted Y and half Z, compared with OpenGL.
-                            // A corrective transformation is needed to make an OpenGL perspective matrix
-                            // work properly. See here for more info:
-                            // https://matthewwellings.com/blog/the-new-vulkan-coordinate-system/
-                            let correction = Matrix4::<f32>::new(
-                                1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0,
-                                0.0, 0.5, 1.0,
-                            );
+                    let proj = {
+                        let aspect_ratio = rcx.swapchain.image_extent()[0] as f32
+                            / rcx.swapchain.image_extent()[1] as f32;
+                        let near = 0.005;
+                        let far = 10000.0;
 
-                            correction * proj
-                        };
-                        let view = self.camera.get_view_matrix();
+                        let proj = cgmath::perspective(Rad(FRAC_PI_4), aspect_ratio, near, far);
+                        // Vulkan clip space has inverted Y and half Z, compared with OpenGL.
+                        // A corrective transformation is needed to make an OpenGL perspective matrix
+                        // work properly. See here for more info:
+                        // https://matthewwellings.com/blog/the-new-vulkan-coordinate-system/
+                        let correction = Matrix4::<f32>::new(
+                            1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
+                            0.5, 1.0,
+                        );
 
-                        let camera_uniform = vs::Camera {
-                            viewproj: (proj * view).into(),
-                            position: self.camera.position.into(),
-                        };
-                        let camera_subbuffer =
-                            self.uniform_buffer_allocator.allocate_sized().unwrap();
-                        *camera_subbuffer.write().unwrap() = camera_uniform;
-                        camera_subbuffer
+                        correction * proj
+                    };
+                    let view = self.camera.get_view_matrix();
+
+                    let push_constants = fs::PushConstants {
+                        light_direction,
+                        light_color,
+                        light_ambient,
+                        cam_viewproj: (proj * view).into(),
+                        cam_position: self.camera.position.into(),
                     };
 
-                    let light_subbuffer = {
-                        let light = fs::Light {
-                            direction: [0.5, 1.0, 0.0].into(),
-                            color: [1.0, 1.0, 1.0].into(),
-                            ambient: [0.4, 0.4, 0.4].into(),
-                        };
-                        let light_subbuffer =
-                            self.uniform_buffer_allocator.allocate_sized().unwrap();
-                        *light_subbuffer.write().unwrap() = light;
-                        light_subbuffer
-                    };
-
-                    let layout = rcx.pipeline.layout().set_layouts().get(0).unwrap();
-                    let descriptor_set = DescriptorSet::new(
-                        self.descriptor_set_allocator.clone(),
-                        layout.clone(),
-                        [
-                            WriteDescriptorSet::buffer(0, camera_subbuffer),
-                            WriteDescriptorSet::buffer(1, light_subbuffer),
-                        ],
-                        [],
-                    )
-                    .unwrap();
                     builder
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Graphics,
-                            rcx.pipeline.layout().clone(),
-                            0,
-                            descriptor_set,
-                        )
-                        .unwrap()
+                        .push_constants(rcx.pipeline.layout().clone(), 0, push_constants)
+                        .unwrap();
                 };
 
                 builder
@@ -1130,77 +1193,28 @@ impl ApplicationHandler for App {
                     .bind_index_buffer(self.index_buffer.clone())
                     .unwrap();
 
-                for object in &self.objects {
-                    for prim in &self.draw_infos[object.mesh_idx] {
-                        let mat = &self.materials[prim.mat_idx];
-
-                        let layout1 = rcx.pipeline.layout().set_layouts().get(1).unwrap();
-                        let object_set = {
-                            let model = object.transform;
-                            let uniform_obj = fs::Object {
-                                model: model.into(),
-                                baseColorFactor: mat
-                                    .pbr_metallic_roughness
-                                    .base_color_factor
-                                    .into(),
-                                metallicFactor: mat.pbr_metallic_roughness.metallic_factor.into(),
-                                roughnessFactor: mat.pbr_metallic_roughness.roughness_factor.into(),
-                                emissiveFactor: mat.emissive_factor.into(),
-                                emissiveStrength: mat.emissive_strength.unwrap_or(1.0).into(),
-                            };
-                            let obj_subbuffer =
-                                self.uniform_buffer_allocator.allocate_sized().unwrap();
-                            *obj_subbuffer.write().unwrap() = uniform_obj;
-                            WriteDescriptorSet::buffer(0, obj_subbuffer)
-                        };
-
-                        let textures = [
-                            mat.base_color_texture
-                                .as_ref()
-                                .map(|t| &self.textures[t.index]),
-                            mat.normal_texture
-                                .as_ref()
-                                .map(|t| &self.textures[t.texture.index]),
-                            mat.pbr_metallic_roughness
-                                .metallic_roughness_texture
-                                .as_ref()
-                                .map(|t| &self.textures[t.index]),
-                            mat.emissive_texture
-                                .as_ref()
-                                .map(|t| &self.textures[t.index]),
-                        ];
-
-                        let descriptor_set = DescriptorSet::new(
-                            self.descriptor_set_allocator.clone(),
-                            layout1.clone(),
-                            std::iter::once(object_set).chain(
-                                textures.into_iter().enumerate().map(
-                                    |(idx, texture)| match texture {
-                                        Some(texture) => WriteDescriptorSet::image_view_sampler(
-                                            1 + idx as u32,
-                                            texture.clone(),
-                                            self.sampler.clone(),
-                                        ),
-                                        None => WriteDescriptorSet::image_view_sampler(
-                                            1 + idx as u32,
-                                            self.null_texture.clone(),
-                                            self.sampler.clone(),
-                                        ),
-                                    },
-                                ),
-                            ),
-                            [],
+                for (object_idx, object) in self.objects.iter().enumerate() {
+                    let object_set = self.object_sets[object_idx].clone();
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            rcx.pipeline.layout().clone(),
+                            1,
+                            object_set,
                         )
-                            .unwrap();
+                        .unwrap();
+                    for prim in &self.draw_infos[object.mesh_idx] {
+                        let mat_set = self.material_sets[prim.mat_idx].clone();
 
                         builder
                             .bind_descriptor_sets(
                                 PipelineBindPoint::Graphics,
                                 rcx.pipeline.layout().clone(),
-                                1,
-                                descriptor_set,
+                                0,
+                                mat_set,
                             )
                             .unwrap();
+
                         unsafe {
                             // We add a draw command.
                             builder.draw_indexed(
