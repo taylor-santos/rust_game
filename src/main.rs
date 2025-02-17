@@ -32,6 +32,7 @@ use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::{ImageCreateInfo, ImageType};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::rasterization::CullMode;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint};
 use vulkano::swapchain::PresentMode;
 use vulkano::{
@@ -758,7 +759,10 @@ impl ApplicationHandler for App {
                     viewport_state: Some(ViewportState::default()),
                     // How polygons are culled and converted into a raster of pixels. The default
                     // value does not perform any culling.
-                    rasterization_state: Some(RasterizationState::default()),
+                    rasterization_state: Some(RasterizationState {
+                        cull_mode: CullMode::Back,
+                        ..Default::default()
+                    }),
                     // How multiple fragment shader samples are converted to a single pixel value.
                     // The default value does not perform any multisampling.
                     multisample_state: Some(MultisampleState::default()),
