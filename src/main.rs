@@ -13,11 +13,10 @@
 // original triangle example.
 
 use crate::camera::FirstPersonCamera;
-use crate::gltf::{load_gltf, Gltf, Object, TextureFormat};
+use crate::gltf::{load_gltf, CombinedVertex, Gltf, Object, TextureFormat};
 use crate::material::Material;
 use cgmath::{Matrix4, Rad};
 use image::{DynamicImage, ImageBuffer};
-use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::f32::consts::FRAC_PI_4;
 use std::time::{Duration, Instant};
@@ -179,55 +178,32 @@ impl App {
         let timer = Instant::now();
 
         let (vert_count, index_count) = meshes
-            .par_iter()
+            .iter()
             .flat_map(|mesh| &mesh.primitives)
-            .map(|prim| (prim.positions.len(), prim.indices.len()))
-            .reduce(|| (0, 0), |(v1, i1), (v2, i2)| (v1 + v2, i1 + i2));
+            .map(|prim| (prim.vertices.len(), prim.indices.len()))
+            .reduce(|(v1, i1), (v2, i2)| (v1 + v2, i1 + i2))
+            .unwrap();
 
         let (vertex_buffer, index_buffer, draw_infos) = {
-            let combined_verts = std::sync::Mutex::new(Vec::with_capacity(vert_count / 3));
-            let combined_indices = std::sync::Mutex::new(Vec::with_capacity(index_count));
-            let draw_infos = std::sync::Mutex::new(Vec::new());
+            let mut combined_verts = Vec::with_capacity(vert_count / 3);
+            let mut combined_indices = Vec::with_capacity(index_count);
+            let mut draw_infos = Vec::new();
 
-            meshes.par_iter().for_each(|mesh| {
+            for mesh in meshes {
                 let mut prim_infos = Vec::new();
-
-                for prim in &mesh.primitives {
-                    let vertex_batch: Vec<CombinedVertex> = prim
-                        .positions
-                        .par_chunks_exact(3)
-                        .zip(prim.normals.par_chunks_exact(3))
-                        .zip(prim.tangents.par_chunks_exact(3))
-                        .zip(prim.texcoords.par_chunks_exact(2))
-                        .map(|(((position, normal), tangent), texcoord)| CombinedVertex {
-                            position: position.try_into().unwrap(),
-                            normal: normal.try_into().unwrap(),
-                            tangent: tangent.try_into().unwrap(),
-                            texcoord: texcoord.try_into().unwrap(),
-                        })
-                        .collect();
-
-                    let mut combined_verts_lock = combined_verts.lock().unwrap();
-                    let mut combined_indices_lock = combined_indices.lock().unwrap();
-
+                for prim in mesh.primitives {
                     prim_infos.push(PrimitiveDrawInfo {
-                        index_offset: combined_indices_lock.len() as u32,
-                        vertex_offset: combined_verts_lock.len() as i32,
+                        index_offset: combined_indices.len() as u32,
+                        vertex_offset: combined_verts.len() as i32,
                         index_count: prim.indices.len() as u32,
                         mat_idx: prim.mat_idx,
                     });
 
-                    combined_indices_lock.extend(&prim.indices);
-                    combined_verts_lock.extend(vertex_batch);
+                    combined_verts.extend(prim.vertices);
+                    combined_indices.extend(prim.indices);
                 }
-
-                let mut draw_infos_lock = draw_infos.lock().unwrap();
-                draw_infos_lock.push(prim_infos);
-            });
-
-            let combined_verts = combined_verts.into_inner().unwrap();
-            let combined_indices = combined_indices.into_inner().unwrap();
-            let draw_infos = draw_infos.into_inner().unwrap();
+                draw_infos.push(prim_infos);
+            }
 
             let vertex_buffer = create_buffer(
                 memory_allocator.clone(),
@@ -979,20 +955,7 @@ impl ApplicationHandler for App {
     }
 }
 
-#[derive(BufferContents, Vertex)]
-#[repr(C)]
-pub struct CombinedVertex {
-    #[format(R32G32B32_SFLOAT)]
-    position: [f32; 3],
-    #[format(R32G32B32_SFLOAT)]
-    normal: [f32; 3],
-    #[format(R32G32B32_SFLOAT)]
-    tangent: [f32; 3],
-    #[format(R32G32_SFLOAT)]
-    texcoord: [f32; 2],
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct PrimitiveDrawInfo {
     index_offset: u32,
     vertex_offset: i32,

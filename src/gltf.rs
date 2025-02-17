@@ -5,12 +5,24 @@ use gltf::texture::Info;
 use gltf::Error;
 use rayon::prelude::*;
 use std::time::Instant;
+use vulkano::buffer::BufferContents;
+use vulkano::pipeline::graphics::vertex_input::Vertex;
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+pub struct CombinedVertex {
+    #[format(R32G32B32_SFLOAT)]
+    position: [f32; 3],
+    #[format(R32G32B32_SFLOAT)]
+    normal: [f32; 3],
+    #[format(R32G32B32_SFLOAT)]
+    tangent: [f32; 3],
+    #[format(R32G32_SFLOAT)]
+    texcoord: [f32; 2],
+}
 
 pub struct Primitive {
-    pub positions: Vec<f32>,
-    pub normals: Vec<f32>,
-    pub tangents: Vec<f32>,
-    pub texcoords: Vec<f32>,
+    pub vertices: Vec<CombinedVertex>,
     pub indices: Vec<u32>,
     pub mat_idx: usize,
 }
@@ -45,25 +57,17 @@ impl mikktspace::Geometry for Primitive {
 
     fn position(&self, face: usize, vert: usize) -> [f32; 3] {
         let tri = self.indices[face * 3 + vert] as usize;
-        let v0 = self.positions[tri * 3];
-        let v1 = self.positions[tri * 3 + 1];
-        let v2 = self.positions[tri * 3 + 2];
-        [v0, v1, v2]
+        self.vertices[tri].position
     }
 
     fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
         let tri = self.indices[face * 3 + vert] as usize;
-        let n0 = self.normals[tri * 3];
-        let n1 = self.normals[tri * 3 + 1];
-        let n2 = self.normals[tri * 3 + 2];
-        [n0, n1, n2]
+        self.vertices[tri].normal
     }
 
     fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
         let tri = self.indices[face * 3 + vert] as usize;
-        let uv0 = self.texcoords[tri * 2];
-        let uv1 = self.texcoords[tri * 2 + 1];
-        [uv0, uv1]
+        self.vertices[tri].texcoord
     }
 
     fn set_tangent(
@@ -77,16 +81,12 @@ impl mikktspace::Geometry for Primitive {
         vert: usize,
     ) {
         let tri = self.indices[face * 3 + vert] as usize;
-        self.tangents[tri * 3] = tangent[0];
-        self.tangents[tri * 3 + 1] = tangent[1];
-        self.tangents[tri * 3 + 2] = tangent[2];
+        self.vertices[tri].tangent = tangent;
     }
 
     fn set_tangent_encoded(&mut self, _tangent: [f32; 4], _face: usize, _vert: usize) {
         let tri = self.indices[_face * 3 + _vert] as usize;
-        self.tangents[tri * 3] = _tangent[0];
-        self.tangents[tri * 3 + 1] = _tangent[1];
-        self.tangents[tri * 3 + 2] = _tangent[2];
+        self.vertices[tri].tangent = _tangent[..3].try_into().unwrap();
     }
 }
 
@@ -227,32 +227,41 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
                         .read_tangents()
                         .map(|t| t.flatten().collect::<Vec<_>>());
 
+                    let num_verts = positions.len();
+                    let need_tangents = opt_tangents.is_none();
+                    let tangents = opt_tangents.unwrap_or_else(|| vec![0f32; num_verts]);
+
                     let indices = reader
                         .read_indices()
                         .unwrap()
                         .into_u32()
                         .collect::<Vec<_>>();
+
+                    let vertices = positions
+                        .par_chunks_exact(3)
+                        .zip(normals.par_chunks_exact(3))
+                        .zip(tangents.par_chunks_exact(3))
+                        .zip(texcoords.par_chunks_exact(2))
+                        .map(|(((position, normal), tangent), texcoord)| CombinedVertex {
+                            position: position.try_into().unwrap(),
+                            normal: normal.try_into().unwrap(),
+                            tangent: tangent.try_into().unwrap(),
+                            texcoord: texcoord.try_into().unwrap(),
+                        })
+                        .collect();
+
                     let mat_idx = prim.material().index().unwrap();
 
-                    let num_verts = positions.len();
                     let mut prim = Primitive {
-                        positions,
-                        normals,
-                        tangents: Vec::new(),
-                        texcoords,
+                        vertices,
                         indices,
                         mat_idx,
                     };
 
-                    match opt_tangents {
-                        Some(tangents) => {
-                            prim.tangents = tangents;
-                        }
-                        None => {
-                            prim.tangents =
-                                vec![[0f32; 3]; num_verts].into_iter().flatten().collect();
-                            mikktspace::generate_tangents(&mut prim);
-                        }
+                    if need_tangents {
+                        let timer = Instant::now();
+                        mikktspace::generate_tangents(&mut prim);
+                        println!("Generated {} tangents in {:?}", num_verts, timer.elapsed());
                     }
 
                     prim
