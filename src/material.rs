@@ -1,7 +1,11 @@
+use gltf::material::AlphaMode;
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Material {
     pub name: Option<String>,
+    pub alpha_cutoff: Option<f32>,
+    pub alpha_mode: AlphaMode,
     pub base_color_texture: Option<Texture>,
     pub normal_texture: Option<NormalTexture>,
     pub pbr_metallic_roughness: PbrMetallicRoughness,

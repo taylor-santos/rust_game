@@ -15,6 +15,7 @@
 use crate::camera::FirstPersonCamera;
 use crate::gltf::{load_gltf, CombinedVertex, Gltf, Object, TextureFormat};
 use crate::material::Material;
+use ::gltf::material::AlphaMode;
 use cgmath::{Matrix4, Rad};
 use image::{DynamicImage, ImageBuffer};
 use std::collections::VecDeque;
@@ -573,7 +574,14 @@ impl ApplicationHandler for App {
                 .iter()
                 .map(|mat| {
                     let descriptor_set = {
+                        let alpha_mode = match mat.alpha_mode {
+                            AlphaMode::Blend => 0,
+                            AlphaMode::Opaque => 1,
+                            AlphaMode::Mask => 2,
+                        };
                         let mat_uniform = fs::Material {
+                            alphaCutoff: mat.alpha_cutoff.unwrap_or(0.5).into(),
+                            alphaMode: alpha_mode.into(),
                             baseColorFactor: mat.pbr_metallic_roughness.base_color_factor.into(),
                             metallicFactor: mat.pbr_metallic_roughness.metallic_factor.into(),
                             roughnessFactor: mat.pbr_metallic_roughness.roughness_factor.into(),

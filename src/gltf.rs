@@ -102,8 +102,13 @@ impl From<gltf::Material<'_>> for Material {
                 .map(|info| info.into()),
         };
 
+        let alpha_cutoff = mat.alpha_cutoff();
+        let alpha_mode = mat.alpha_mode();
+
         Material {
             name: mat.name().map(String::from),
+            alpha_cutoff,
+            alpha_mode,
             base_color_texture: pbr_metallic_roughness.base_color_texture().map(Into::into),
             normal_texture: mat.normal_texture().map(Into::into),
             pbr_metallic_roughness: pbr_metallic_roughness_data,
