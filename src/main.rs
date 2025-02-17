@@ -159,7 +159,7 @@ impl App {
                 ..Default::default()
             },
         )
-            .expect("Couldn't create Vulkan instance");
+        .expect("Couldn't create Vulkan instance");
 
         // Choose device extensions that we're going to use. In order to present images to a
         // surface, we need a `Swapchain`, which is provided by the `khr_swapchain` extension.
@@ -285,7 +285,7 @@ impl App {
                 ..Default::default()
             },
         )
-            .expect("Couldn't create Vulkan device and queues");
+        .expect("Couldn't create Vulkan device and queues");
 
         // Since we can request multiple queues, the `queues` variable is in fact an iterator. We
         // only use one queue in this example, so we just retrieve the first and only element of
@@ -405,7 +405,7 @@ impl App {
                 queue.queue_family_index(),
                 CommandBufferUsage::OneTimeSubmit,
             )
-                .expect("Couldn't create Vulkan command buffer");
+            .expect("Couldn't create Vulkan command buffer");
 
             let textures = textures
                 .into_iter()
@@ -416,8 +416,8 @@ impl App {
                             ImageBuffer::from_raw(texture.width, texture.height, texture.pixels)
                                 .unwrap(),
                         )
-                            .to_rgba8()
-                            .into_raw(),
+                        .to_rgba8()
+                        .into_raw(),
                         _ => panic!("unsupported texture format: {:?}", texture.format),
                     };
                     let extent: [u32; 3] = [texture.width, texture.height, 1];
@@ -440,7 +440,7 @@ impl App {
                         },
                         AllocationCreateInfo::default(),
                     )
-                        .unwrap();
+                    .unwrap();
 
                     builder
                         .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
@@ -494,14 +494,14 @@ impl App {
                 },
                 AllocationCreateInfo::default(),
             )
-                .unwrap();
+            .unwrap();
 
             let mut builder = AutoCommandBufferBuilder::primary(
                 command_buffer_allocator.clone(),
                 queue.queue_family_index(),
                 CommandBufferUsage::OneTimeSubmit,
             )
-                .unwrap();
+            .unwrap();
 
             builder
                 .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
@@ -655,7 +655,7 @@ impl ApplicationHandler for App {
                     ..Default::default()
                 },
             )
-                .unwrap()
+            .unwrap()
         };
 
         // When creating the swapchain, we only created plain images. To use them as an attachment
@@ -676,7 +676,7 @@ impl ApplicationHandler for App {
             },
             AllocationCreateInfo::default(),
         )
-            .expect("Failed to create depth image");
+        .expect("Failed to create depth image");
 
         let depth_image_view =
             ImageView::new_default(depth_image.clone()).expect("Failed to create depth image view");
@@ -729,7 +729,7 @@ impl ApplicationHandler for App {
                     .into_pipeline_layout_create_info(self.device.clone())
                     .unwrap(),
             )
-                .unwrap();
+            .unwrap();
 
             // We describe the formats of attachment images where the colors, depth and/or stencil
             // information will be written. The pipeline will only be usable with this particular
@@ -785,7 +785,7 @@ impl ApplicationHandler for App {
                     ..GraphicsPipelineCreateInfo::layout(layout)
                 },
             )
-                .unwrap()
+            .unwrap()
         };
 
         // Dynamic viewports allow us to recreate just the viewport when the window is resized.
@@ -877,7 +877,7 @@ impl ApplicationHandler for App {
                         ),
                         [],
                     )
-                        .unwrap()
+                    .unwrap()
                 })
                 .collect()
         };
@@ -902,7 +902,7 @@ impl ApplicationHandler for App {
                         [descriptor_set],
                         [],
                     )
-                        .unwrap()
+                    .unwrap()
                 })
                 .collect()
         };
@@ -1034,7 +1034,7 @@ impl ApplicationHandler for App {
                         },
                         AllocationCreateInfo::default(),
                     )
-                        .expect("Failed to create depth image");
+                    .expect("Failed to create depth image");
 
                     rcx.depth_image_view = ImageView::new_default(depth_image.clone())
                         .expect("Failed to create depth image view");
@@ -1055,7 +1055,7 @@ impl ApplicationHandler for App {
                     rcx.swapchain.clone(),
                     None,
                 )
-                    .map_err(Validated::unwrap)
+                .map_err(Validated::unwrap)
                 {
                     Ok(r) => r,
                     Err(VulkanError::OutOfDate) => {
@@ -1318,7 +1318,7 @@ fn window_size_dependent_setup(images: &[Arc<Image>]) -> Vec<Arc<ImageView>> {
         .collect::<Vec<_>>()
 }
 
-fn create_buffer<T: BufferContents + Send + Sync, I: IntoIterator<Item=T>>(
+fn create_buffer<T: BufferContents + Send + Sync, I: IntoIterator<Item = T>>(
     allocator: Arc<StandardMemoryAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     queue: Arc<Queue>,
@@ -1341,7 +1341,7 @@ where
         },
         data,
     )
-        .unwrap();
+    .unwrap();
     let device_local_buffer = Buffer::new_slice::<T>(
         allocator,
         BufferCreateInfo {
@@ -1354,13 +1354,13 @@ where
         },
         staging_buffer.len(),
     )
-        .unwrap();
+    .unwrap();
     let mut builder = AutoCommandBufferBuilder::primary(
         command_buffer_allocator,
         queue.queue_family_index(),
         CommandBufferUsage::OneTimeSubmit,
     )
-        .unwrap();
+    .unwrap();
     builder
         .copy_buffer(CopyBufferInfo::buffers(
             staging_buffer.clone(),
