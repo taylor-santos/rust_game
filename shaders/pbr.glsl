@@ -58,6 +58,7 @@ layout (set = 0, binding = 0) uniform Constants {
     float   u_Exposure;
 } c;
 
+#include <shared.glsl>
 #include <tonemapping.glsl>
 #include <textures.glsl>
 #include <functions.glsl>
@@ -65,12 +66,91 @@ layout (set = 0, binding = 0) uniform Constants {
 #include <punctual.glsl>
 #include <ibl.glsl>
 #include <material_info.glsl>
-
-#ifdef MATERIAL_IRIDESCENCE
 #include <iridescence.glsl>
-#endif
 
 layout (location = 0) out vec4 g_finalColor;
+
+vec2 getCubeUV(vec3 r, out int faceId) {
+    float absX = abs(r.x);
+    float absY = abs(r.y);
+    float absZ = abs(r.z);
+    vec2 uv;
+
+    if (absX >= absY && absX >= absZ) {
+        // X is dominant.
+        if (r.x > 0.0) {
+            // +X face.
+            uv = vec2(-r.z, -r.y) / absX;
+            faceId = 0;
+        } else {
+            // -X face.
+            uv = vec2(r.z, -r.y) / absX;
+            faceId = 1;
+        }
+    } else if (absY >= absX && absY >= absZ) {
+        // Y is dominant.
+        if (r.y > 0.0) {
+            // +Y face.
+            uv = vec2(r.x, r.z) / absY;
+            faceId = 2;
+        } else {
+            // -Y face.
+            uv = vec2(r.x, -r.z) / absY;
+            faceId = 3;
+        }
+    } else {
+        // Z is dominant.
+        if (r.z > 0.0) {
+            // +Z face.
+            uv = vec2(r.x, -r.y) / absZ;
+            faceId = 4;
+        } else {
+            // -Z face.
+            uv = vec2(-r.x, -r.y) / absZ;
+            faceId = 5;
+        }
+    }
+    // Remap from [-1, 1] to [0, 1]
+    uv = uv * 0.5 + 0.5;
+    return uv;
+}
+
+vec3 skyboxColor(vec3 r) {
+    int faceId;
+    vec2 uv = getCubeUV(r, faceId);
+
+    // Assign a unique base color per cube face.
+    vec3 faceColor;
+    if (faceId == 0)
+        faceColor = vec3(1.0, 0.0, 0.0); // +X: Red.
+    else if (faceId == 1)
+        faceColor = vec3(0.0, 1.0, 0.0); // -X: Green.
+    else if (faceId == 2)
+        faceColor = vec3(0.0, 0.0, 1.0); // +Y: Blue.
+    else if (faceId == 3)
+        faceColor = vec3(1.0, 1.0, 0.0); // -Y: Yellow.
+    else if (faceId == 4)
+        faceColor = vec3(1.0, 0.0, 1.0); // +Z: Magenta.
+    else // faceId == 5
+        faceColor = vec3(0.0, 1.0, 1.0); // -Z: Cyan.
+
+    // Grid settings.
+    float cells = 10.0;
+    float lineThickness = 0.03;
+
+    // Compute local grid UVs.
+    vec2 gridUV = fract(uv * cells);
+    // Determine distance to the nearest grid boundary.
+    float distToEdge = min(min(gridUV.x, 1.0 - gridUV.x),
+                           min(gridUV.y, 1.0 - gridUV.y));
+    // Smooth grid lines: near boundaries, 'line' approaches 1.
+    float line = smoothstep(0.0, lineThickness, lineThickness - distToEdge);
+
+    // Black grid lines.
+    vec3 lineColor = vec3(0.0);
+    // Mix the base face color and grid lines.
+    return mix(faceColor, lineColor, line);
+}
 
 
 void main()
@@ -104,49 +184,49 @@ void main()
     materialInfo.f90 = vec3(1.0);
     materialInfo.f90_dielectric = materialInfo.f90;
 
-#ifdef MATERIAL_IOR
-    materialInfo = getIorInfo(materialInfo);
-#endif
+    if (MATERIAL_IOR) {
+        materialInfo = getIorInfo(materialInfo);
+    }
 
-#ifdef MATERIAL_SPECULARGLOSSINESS
-    materialInfo = getSpecularGlossinessInfo(materialInfo);
-#endif
+    if (MATERIAL_SPECULARGLOSSINESS) {
+        materialInfo = getSpecularGlossinessInfo(materialInfo);
+    }
 
-#ifdef MATERIAL_METALLICROUGHNESS
-    materialInfo = getMetallicRoughnessInfo(materialInfo);
-#endif
+    if (MATERIAL_METALLICROUGHNESS) {
+        materialInfo = getMetallicRoughnessInfo(materialInfo);
+    }
 
-#ifdef MATERIAL_SHEEN
-    materialInfo = getSheenInfo(materialInfo);
-#endif
+    if (MATERIAL_SHEEN) {
+        materialInfo = getSheenInfo(materialInfo);
+    }
 
-#ifdef MATERIAL_CLEARCOAT
-    materialInfo = getClearCoatInfo(materialInfo, normalInfo);
-#endif
+    if (MATERIAL_CLEARCOAT) {
+        materialInfo = getClearCoatInfo(materialInfo, normalInfo);
+    }
 
-#ifdef MATERIAL_SPECULAR
-    materialInfo = getSpecularInfo(materialInfo);
-#endif
+    if (MATERIAL_SPECULAR) {
+        materialInfo = getSpecularInfo(materialInfo);
+    }
 
-#ifdef MATERIAL_TRANSMISSION
-    materialInfo = getTransmissionInfo(materialInfo);
-#endif
+    if (MATERIAL_TRANSMISSION) {
+        materialInfo = getTransmissionInfo(materialInfo);
+    }
 
-#ifdef MATERIAL_VOLUME
-    materialInfo = getVolumeInfo(materialInfo);
-#endif
+    if (MATERIAL_VOLUME) {
+        materialInfo = getVolumeInfo(materialInfo);
+    }
 
-#ifdef MATERIAL_IRIDESCENCE
-    materialInfo = getIridescenceInfo(materialInfo);
-#endif
+    if (MATERIAL_IRIDESCENCE) {
+        materialInfo = getIridescenceInfo(materialInfo);
+    }
 
-#ifdef MATERIAL_DIFFUSE_TRANSMISSION
-    materialInfo = getDiffuseTransmissionInfo(materialInfo);
-#endif
+    if (MATERIAL_DIFFUSE_TRANSMISSION) {
+        materialInfo = getDiffuseTransmissionInfo(materialInfo);
+    }
 
-#ifdef MATERIAL_ANISOTROPY
-    materialInfo = getAnisotropyInfo(materialInfo, normalInfo);
-#endif
+    if (MATERIAL_ANISOTROPY) {
+        materialInfo = getAnisotropyInfo(materialInfo, normalInfo);
+    }
 
     materialInfo.perceptualRoughness = clamp(materialInfo.perceptualRoughness, 0.0, 1.0);
     materialInfo.metallic = clamp(materialInfo.metallic, 0.0, 1.0);
@@ -174,94 +254,97 @@ void main()
     float albedoSheenScaling = 1.0;
     float diffuseTransmissionThickness = 1.0;
 
-#ifdef MATERIAL_IRIDESCENCE
-    vec3 iridescenceFresnel_dielectric = evalIridescence(1.0, materialInfo.iridescenceIor, NdotV, materialInfo.iridescenceThickness, materialInfo.f0_dielectric);
-    vec3 iridescenceFresnel_metallic = evalIridescence(1.0, materialInfo.iridescenceIor, NdotV, materialInfo.iridescenceThickness, baseColor.rgb);
+    vec3 iridescenceFresnel_dielectric;
+    vec3 iridescenceFresnel_metallic;
+    if (MATERIAL_IRIDESCENCE) {
+        iridescenceFresnel_dielectric = evalIridescence(1.0, materialInfo.iridescenceIor, NdotV, materialInfo.iridescenceThickness, materialInfo.f0_dielectric);
+        iridescenceFresnel_metallic = evalIridescence(1.0, materialInfo.iridescenceIor, NdotV, materialInfo.iridescenceThickness, baseColor.rgb);
 
-    if (materialInfo.iridescenceThickness == 0.0) {
-        materialInfo.iridescenceFactor = 0.0;
+        if (materialInfo.iridescenceThickness == 0.0) {
+            materialInfo.iridescenceFactor = 0.0;
+        }
     }
-#endif
 
-#ifdef MATERIAL_DIFFUSE_TRANSMISSION
-#ifdef MATERIAL_VOLUME
-    diffuseTransmissionThickness = materialInfo.thickness *
-        (length(vec3(object.u_ModelMatrix[0].xyz)) + length(vec3(object.u_ModelMatrix[1].xyz)) + length(vec3(object.u_ModelMatrix[2].xyz))) / 3.0;
-#endif
-#endif
+    if (MATERIAL_DIFFUSE_TRANSMISSION) {
+        if (MATERIAL_VOLUME) {
+            diffuseTransmissionThickness = materialInfo.thickness *
+                (length(vec3(object.u_ModelMatrix[0].xyz)) + length(vec3(object.u_ModelMatrix[1].xyz)) + length(vec3(object.u_ModelMatrix[2].xyz))) / 3.0;
+        }
+    }
 
-#ifdef MATERIAL_CLEARCOAT
-    clearcoatFactor = materialInfo.clearcoatFactor;
-    clearcoatFresnel = F_Schlick(materialInfo.clearcoatF0, materialInfo.clearcoatF90, clampedDot(materialInfo.clearcoatNormal, v));
-#endif
+    if (MATERIAL_CLEARCOAT) {
+        clearcoatFactor = materialInfo.clearcoatFactor;
+        clearcoatFresnel = F_Schlick(materialInfo.clearcoatF0, materialInfo.clearcoatF90, clampedDot(materialInfo.clearcoatNormal, v));
+    }
 
     // Calculate lighting contribution from image based lighting source (IBL)
 
-#if defined(USE_IBL) || defined(MATERIAL_TRANSMISSION)
-
-    f_diffuse = getDiffuseLight(n) * baseColor.rgb ;
-
-#ifdef MATERIAL_DIFFUSE_TRANSMISSION
-    vec3 diffuseTransmissionIBL = getDiffuseLight(-n) * materialInfo.diffuseTransmissionColorFactor;
-#ifdef MATERIAL_VOLUME
-        diffuseTransmissionIBL = applyVolumeAttenuation(diffuseTransmissionIBL, diffuseTransmissionThickness, materialInfo.attenuationColor, materialInfo.attenuationDistance);
-#endif
-    f_diffuse = mix(f_diffuse, diffuseTransmissionIBL, materialInfo.diffuseTransmissionFactor);
-#endif
-
-
-#if defined(MATERIAL_TRANSMISSION)
-    f_specular_transmission = getIBLVolumeRefraction(
-        n, v,
-        materialInfo.perceptualRoughness,
-        baseColor.rgb, materialInfo.f0_dielectric, materialInfo.f90,
-        v_Position, object.u_ModelMatrix, camera.u_ViewMatrix, camera.u_ProjectionMatrix,
-        materialInfo.ior, materialInfo.thickness, materialInfo.attenuationColor, materialInfo.attenuationDistance, materialInfo.dispersion);
-    f_diffuse = mix(f_diffuse, f_specular_transmission, materialInfo.transmissionFactor);
-#endif
-
-#ifdef MATERIAL_ANISOTROPY
-    f_specular_metal = getIBLRadianceAnisotropy(n, v, materialInfo.perceptualRoughness, materialInfo.anisotropyStrength, materialInfo.anisotropicB);
-    f_specular_dielectric = f_specular_metal;
+#ifdef USE_IBL
+    {
 #else
-    f_specular_metal = getIBLRadianceGGX(n, v, materialInfo.perceptualRoughness);
-    f_specular_dielectric = f_specular_metal;
+    if (MATERIAL_TRANSMISSION) {
 #endif
+        f_diffuse = getDiffuseLight(n) * baseColor.rgb ;
 
-    // Calculate fresnel mix for IBL
+        if (MATERIAL_DIFFUSE_TRANSMISSION) {
+            vec3 diffuseTransmissionIBL = getDiffuseLight(-n) * materialInfo.diffuseTransmissionColorFactor;
+            if (MATERIAL_VOLUME) {
+                diffuseTransmissionIBL = applyVolumeAttenuation(diffuseTransmissionIBL, diffuseTransmissionThickness, materialInfo.attenuationColor, materialInfo.attenuationDistance);
+            }
+            f_diffuse = mix(f_diffuse, diffuseTransmissionIBL, materialInfo.diffuseTransmissionFactor);
+        }
 
-    vec3 f_metal_fresnel_ibl = getIBLGGXFresnel(n, v, materialInfo.perceptualRoughness, baseColor.rgb, 1.0);
-    f_metal_brdf_ibl = f_metal_fresnel_ibl * f_specular_metal;
+        if (MATERIAL_TRANSMISSION) {
+            f_specular_transmission = getIBLVolumeRefraction(
+                n, v,
+                materialInfo.perceptualRoughness,
+                baseColor.rgb, materialInfo.f0_dielectric, materialInfo.f90,
+                v_Position, object.u_ModelMatrix, camera.u_ViewMatrix, camera.u_ProjectionMatrix,
+                materialInfo.ior, materialInfo.thickness, materialInfo.attenuationColor, materialInfo.attenuationDistance, materialInfo.dispersion);
+            f_diffuse = mix(f_diffuse, f_specular_transmission, materialInfo.transmissionFactor);
+        }
 
-    vec3 f_dielectric_fresnel_ibl = getIBLGGXFresnel(n, v, materialInfo.perceptualRoughness, materialInfo.f0_dielectric, materialInfo.specularWeight);
-    f_dielectric_brdf_ibl = mix(f_diffuse, f_specular_dielectric,  f_dielectric_fresnel_ibl);
+        if (MATERIAL_ANISOTROPY) {
+            f_specular_metal = getIBLRadianceAnisotropy(n, v, materialInfo.perceptualRoughness, materialInfo.anisotropyStrength, materialInfo.anisotropicB);
+            f_specular_dielectric = f_specular_metal;
+        } else {
+            f_specular_metal = getIBLRadianceGGX(n, v, materialInfo.perceptualRoughness);
+            f_specular_dielectric = f_specular_metal;
+        }
 
-#ifdef MATERIAL_IRIDESCENCE
-    f_metal_brdf_ibl = mix(f_metal_brdf_ibl, f_specular_metal * iridescenceFresnel_metallic, materialInfo.iridescenceFactor);
-    f_dielectric_brdf_ibl = mix(f_dielectric_brdf_ibl, rgb_mix(f_diffuse, f_specular_dielectric, iridescenceFresnel_dielectric), materialInfo.iridescenceFactor);
-#endif
+        // Calculate fresnel mix for IBL
 
+        vec3 f_metal_fresnel_ibl = getIBLGGXFresnel(n, v, materialInfo.perceptualRoughness, baseColor.rgb, 1.0);
+        f_metal_brdf_ibl = f_metal_fresnel_ibl * f_specular_metal;
 
-#ifdef MATERIAL_CLEARCOAT
-    clearcoat_brdf = getIBLRadianceGGX(materialInfo.clearcoatNormal, v, materialInfo.clearcoatRoughness);
-#endif
+        vec3 f_dielectric_fresnel_ibl = getIBLGGXFresnel(n, v, materialInfo.perceptualRoughness, materialInfo.f0_dielectric, materialInfo.specularWeight);
+        f_dielectric_brdf_ibl = mix(f_diffuse, f_specular_dielectric,  f_dielectric_fresnel_ibl);
 
-#ifdef MATERIAL_SHEEN
-    f_sheen = getIBLRadianceCharlie(n, v, materialInfo.sheenRoughnessFactor, materialInfo.sheenColorFactor);
-    albedoSheenScaling = 1.0 - max3(materialInfo.sheenColorFactor) * albedoSheenScalingLUT(NdotV, materialInfo.sheenRoughnessFactor);
-#endif
+        if (MATERIAL_IRIDESCENCE) {
+            f_metal_brdf_ibl = mix(f_metal_brdf_ibl, f_specular_metal * iridescenceFresnel_metallic, materialInfo.iridescenceFactor);
+            f_dielectric_brdf_ibl = mix(f_dielectric_brdf_ibl, rgb_mix(f_diffuse, f_specular_dielectric, iridescenceFresnel_dielectric), materialInfo.iridescenceFactor);
+        }
 
-    color = mix(f_dielectric_brdf_ibl, f_metal_brdf_ibl, materialInfo.metallic);
-    color = f_sheen + color * albedoSheenScaling;
-    color = mix(color, clearcoat_brdf, clearcoatFactor * clearcoatFresnel);
+        if (MATERIAL_CLEARCOAT) {
+            clearcoat_brdf = getIBLRadianceGGX(materialInfo.clearcoatNormal, v, materialInfo.clearcoatRoughness);
+        }
+
+        if (MATERIAL_SHEEN) {
+            f_sheen = getIBLRadianceCharlie(n, v, materialInfo.sheenRoughnessFactor, materialInfo.sheenColorFactor);
+            albedoSheenScaling = 1.0 - max3(materialInfo.sheenColorFactor) * albedoSheenScalingLUT(NdotV, materialInfo.sheenRoughnessFactor);
+        }
+
+        color = mix(f_dielectric_brdf_ibl, f_metal_brdf_ibl, materialInfo.metallic);
+        color = f_sheen + color * albedoSheenScaling;
+        color = mix(color, clearcoat_brdf, clearcoatFactor * clearcoatFresnel);
 
 #ifdef HAS_OCCLUSION_MAP
-    float ao = 1.0;
-    ao = texture(u_OcclusionSampler,  getOcclusionUV()).r;
-    color = color * (1.0 + mat_samplers.u_OcclusionStrength * (ao - 1.0));
+        float ao = 1.0;
+        ao = texture(u_OcclusionSampler,  getOcclusionUV()).r;
+        color = color * (1.0 + s.u_OcclusionStrength * (ao - 1.0));
 #endif
 
-#endif //end USE_IBL
+    }
 
     f_diffuse = vec3(0.0);
     f_specular_dielectric = vec3(0.0);
@@ -308,63 +391,62 @@ void main()
         float l_albedoSheenScaling = 1.0;
 
 
+        if (MATERIAL_DIFFUSE_TRANSMISSION) {
+            vec3 diffuse_btdf = lightIntensity * clampedDot(-n, l) * BRDF_lambertian(materialInfo.diffuseTransmissionColorFactor);
 
-
-#ifdef MATERIAL_DIFFUSE_TRANSMISSION
-        vec3 diffuse_btdf = lightIntensity * clampedDot(-n, l) * BRDF_lambertian(materialInfo.diffuseTransmissionColorFactor);
-
-#ifdef MATERIAL_VOLUME
-        diffuse_btdf = applyVolumeAttenuation(diffuse_btdf, diffuseTransmissionThickness, materialInfo.attenuationColor, materialInfo.attenuationDistance);
-#endif
-        l_diffuse = mix(l_diffuse, diffuse_btdf, materialInfo.diffuseTransmissionFactor);
-#endif // MATERIAL_DIFFUSE_TRANSMISSION
+            if (MATERIAL_VOLUME) {
+                diffuse_btdf = applyVolumeAttenuation(diffuse_btdf, diffuseTransmissionThickness, materialInfo.attenuationColor, materialInfo.attenuationDistance);
+            }
+            l_diffuse = mix(l_diffuse, diffuse_btdf, materialInfo.diffuseTransmissionFactor);
+        }
 
         // BTDF (Bidirectional Transmittance Distribution Function)
-#ifdef MATERIAL_TRANSMISSION
-        // If the light ray travels through the geometry, use the point it exits the geometry again.
-        // That will change the angle to the light source, if the material refracts the light ray.
-        vec3 transmissionRay = getVolumeTransmissionRay(n, v, materialInfo.thickness, materialInfo.ior, object.u_ModelMatrix);
-        pointToLight -= transmissionRay;
-        l = normalize(pointToLight);
 
-        vec3 transmittedLight = lightIntensity * getPunctualRadianceTransmission(n, v, l, materialInfo.alphaRoughness, materialInfo.f0_dielectric, materialInfo.f90, baseColor.rgb, materialInfo.ior);
+        if (MATERIAL_TRANSMISSION) {
+            // If the light ray travels through the geometry, use the point it exits the geometry again.
+            // That will change the angle to the light source, if the material refracts the light ray.
+            vec3 transmissionRay = getVolumeTransmissionRay(n, v, materialInfo.thickness, materialInfo.ior, object.u_ModelMatrix);
+            pointToLight -= transmissionRay;
+            l = normalize(pointToLight);
 
-#ifdef MATERIAL_VOLUME
-        transmittedLight = applyVolumeAttenuation(transmittedLight, length(transmissionRay), materialInfo.attenuationColor, materialInfo.attenuationDistance);
-#endif
-        l_diffuse = mix(l_diffuse, transmittedLight, materialInfo.transmissionFactor);
-#endif
+            vec3 transmittedLight = lightIntensity * getPunctualRadianceTransmission(n, v, l, materialInfo.alphaRoughness, materialInfo.f0_dielectric, materialInfo.f90, baseColor.rgb, materialInfo.ior);
+
+            if (MATERIAL_VOLUME) {
+                transmittedLight = applyVolumeAttenuation(transmittedLight, length(transmissionRay), materialInfo.attenuationColor, materialInfo.attenuationDistance);
+            }
+            l_diffuse = mix(l_diffuse, transmittedLight, materialInfo.transmissionFactor);
+        }
 
         // Calculation of analytical light
         // https://github.com/KhronosGroup/glTF/tree/master/specification/2.0#acknowledgments AppendixB
         vec3 intensity = getLighIntensity(light, pointToLight);
 
-#ifdef MATERIAL_ANISOTROPY
-        l_specular_metal = intensity * NdotL * BRDF_specularGGXAnisotropy(materialInfo.alphaRoughness, materialInfo.anisotropyStrength, n, v, l, h, materialInfo.anisotropicT, materialInfo.anisotropicB);
-        l_specular_dielectric = l_specular_metal;
-#else
-        l_specular_metal = intensity * NdotL * BRDF_specularGGX(materialInfo.alphaRoughness, NdotL, NdotV, NdotH);
-        l_specular_dielectric = l_specular_metal;
-#endif
+        if (MATERIAL_ANISOTROPY) {
+            l_specular_metal = intensity * NdotL * BRDF_specularGGXAnisotropy(materialInfo.alphaRoughness, materialInfo.anisotropyStrength, n, v, l, h, materialInfo.anisotropicT, materialInfo.anisotropicB);
+            l_specular_dielectric = l_specular_metal;
+        } else {
+            l_specular_metal = intensity * NdotL * BRDF_specularGGX(materialInfo.alphaRoughness, NdotL, NdotV, NdotH);
+            l_specular_dielectric = l_specular_metal;
+        }
 
         l_metal_brdf = metal_fresnel * l_specular_metal;
         l_dielectric_brdf = mix(l_diffuse, l_specular_dielectric, dielectric_fresnel); // Do we need to handle vec3 fresnel here?
 
-#ifdef MATERIAL_IRIDESCENCE
-        l_metal_brdf = mix(l_metal_brdf, l_specular_metal * iridescenceFresnel_metallic, materialInfo.iridescenceFactor);
-        l_dielectric_brdf = mix(l_dielectric_brdf, rgb_mix(l_diffuse, l_specular_dielectric, iridescenceFresnel_dielectric), materialInfo.iridescenceFactor);
-#endif
+        if (MATERIAL_IRIDESCENCE) {
+            l_metal_brdf = mix(l_metal_brdf, l_specular_metal * iridescenceFresnel_metallic, materialInfo.iridescenceFactor);
+            l_dielectric_brdf = mix(l_dielectric_brdf, rgb_mix(l_diffuse, l_specular_dielectric, iridescenceFresnel_dielectric), materialInfo.iridescenceFactor);
+        }
 
-#ifdef MATERIAL_CLEARCOAT
-        l_clearcoat_brdf = intensity * getPunctualRadianceClearCoat(materialInfo.clearcoatNormal, v, l, h, VdotH,
-            materialInfo.clearcoatF0, materialInfo.clearcoatF90, materialInfo.clearcoatRoughness);
-#endif
+        if (MATERIAL_CLEARCOAT) {
+            l_clearcoat_brdf = intensity * getPunctualRadianceClearCoat(materialInfo.clearcoatNormal, v, l, h, VdotH,
+                materialInfo.clearcoatF0, materialInfo.clearcoatF90, materialInfo.clearcoatRoughness);
+        }
 
-#ifdef MATERIAL_SHEEN
-        l_sheen = intensity * getPunctualRadianceSheen(materialInfo.sheenColorFactor, materialInfo.sheenRoughnessFactor, NdotL, NdotV, NdotH);
-        l_albedoSheenScaling = min(1.0 - max3(materialInfo.sheenColorFactor) * albedoSheenScalingLUT(NdotV, materialInfo.sheenRoughnessFactor),
-            1.0 - max3(materialInfo.sheenColorFactor) * albedoSheenScalingLUT(NdotL, materialInfo.sheenRoughnessFactor));
-#endif
+        if (MATERIAL_SHEEN) {
+            l_sheen = intensity * getPunctualRadianceSheen(materialInfo.sheenColorFactor, materialInfo.sheenRoughnessFactor, NdotL, NdotV, NdotH);
+            l_albedoSheenScaling = min(1.0 - max3(materialInfo.sheenColorFactor) * albedoSheenScalingLUT(NdotV, materialInfo.sheenRoughnessFactor),
+                1.0 - max3(materialInfo.sheenColorFactor) * albedoSheenScalingLUT(NdotL, materialInfo.sheenRoughnessFactor));
+        }
 
         vec3 l_color = mix(l_dielectric_brdf, l_metal_brdf, materialInfo.metallic);
         l_color = l_sheen + l_color * l_albedoSheenScaling;
@@ -373,23 +455,29 @@ void main()
     }
 #endif // USE_PUNCTUAL
 
-    f_emissive = mat_samplers.u_EmissiveFactor;
-#ifdef MATERIAL_EMISSIVE_STRENGTH
-    f_emissive *= material.u_EmissiveStrength;
-#endif
+    f_emissive = s.u_EmissiveFactor;
+    if (MATERIAL_EMISSIVE_STRENGTH) {
+        f_emissive *= material.u_EmissiveStrength;
+    }
 #ifdef HAS_EMISSIVE_MAP
     f_emissive *= texture(u_EmissiveSampler, getEmissiveUV()).rgb;
 #endif
 
 
-#ifdef MATERIAL_UNLIT
-    color = baseColor.rgb;
-#elif defined(NOT_TRIANGLE) && !defined(HAS_NORMAL_VEC3)
-    //Points or Lines with no NORMAL attribute SHOULD be rendered without lighting and instead use the sum of the base color value and the emissive value.
-    color = f_emissive + baseColor.rgb;
+    if (MATERIAL_UNLIT) {
+        color = baseColor.rgb;
+    } else {
+#if defined(NOT_TRIANGLE)
+        if (!HAS_NORMAL_VEC3) {
+            //Points or Lines with no NORMAL attribute SHOULD be rendered without lighting and instead use the sum of the base color value and the emissive value.
+            color = f_emissive + baseColor.rgb;
+        } else {
+            color = f_emissive * (1.0 - clearcoatFactor * clearcoatFresnel) + color;
+        }
 #else
-    color = f_emissive * (1.0 - clearcoatFactor * clearcoatFresnel) + color;
+        color = f_emissive * (1.0 - clearcoatFactor * clearcoatFresnel) + color;
 #endif
+    }
 
 #if DEBUG == DEBUG_NONE
 
@@ -456,104 +544,104 @@ void main()
 #endif
 
     // MR:
-#ifdef MATERIAL_METALLICROUGHNESS
+    if (MATERIAL_METALLICROUGHNESS) {
 #if DEBUG == DEBUG_METALLIC
-    g_finalColor.rgb = vec3(materialInfo.metallic);
+        g_finalColor.rgb = vec3(materialInfo.metallic);
 #endif
 #if DEBUG == DEBUG_ROUGHNESS
-    g_finalColor.rgb = vec3(materialInfo.perceptualRoughness);
+        g_finalColor.rgb = vec3(materialInfo.perceptualRoughness);
 #endif
 #if DEBUG == DEBUG_BASE_COLOR
-    g_finalColor.rgb = linearTosRGB(materialInfo.baseColor);
+        g_finalColor.rgb = linearTosRGB(materialInfo.baseColor);
 #endif
-#endif
+    }
 
     // Clearcoat:
-#ifdef MATERIAL_CLEARCOAT
+    if (MATERIAL_CLEARCOAT) {
 #if DEBUG == DEBUG_CLEARCOAT_FACTOR
-    g_finalColor.rgb = vec3(materialInfo.clearcoatFactor);
+        g_finalColor.rgb = vec3(materialInfo.clearcoatFactor);
 #endif
 #if DEBUG == DEBUG_CLEARCOAT_ROUGHNESS
-    g_finalColor.rgb = vec3(materialInfo.clearcoatRoughness);
+        g_finalColor.rgb = vec3(materialInfo.clearcoatRoughness);
 #endif
 #if DEBUG == DEBUG_CLEARCOAT_NORMAL
-    g_finalColor.rgb = (materialInfo.clearcoatNormal + vec3(1)) / 2.0;
+        g_finalColor.rgb = (materialInfo.clearcoatNormal + vec3(1)) / 2.0;
 #endif
-#endif
+    }
 
     // Sheen:
-#ifdef MATERIAL_SHEEN
+    if (MATERIAL_SHEEN) {
 #if DEBUG == DEBUG_SHEEN_COLOR
-    g_finalColor.rgb = materialInfo.sheenColorFactor;
+        g_finalColor.rgb = materialInfo.sheenColorFactor;
 #endif
 #if DEBUG == DEBUG_SHEEN_ROUGHNESS
-    g_finalColor.rgb = vec3(materialInfo.sheenRoughnessFactor);
+        g_finalColor.rgb = vec3(materialInfo.sheenRoughnessFactor);
 #endif
-#endif
+    }
 
     // Specular:
-#ifdef MATERIAL_SPECULAR
+    if (MATERIAL_SPECULAR) {
 #if DEBUG == DEBUG_SPECULAR_FACTOR
-    g_finalColor.rgb = vec3(materialInfo.specularWeight);
+        g_finalColor.rgb = vec3(materialInfo.specularWeight);
 #endif
 
 #if DEBUG == DEBUG_SPECULAR_COLOR
-vec3 specularTexture = vec3(1.0);
+        vec3 specularTexture = vec3(1.0);
 #ifdef HAS_SPECULAR_COLOR_MAP
-    specularTexture.rgb = texture(u_SpecularColorSampler, getSpecularColorUV()).rgb;
+        specularTexture.rgb = texture(u_SpecularColorSampler, getSpecularColorUV()).rgb;
 #endif
-    g_finalColor.rgb = material.u_KHR_materials_specular_specularColorFactor * specularTexture.rgb;
+        g_finalColor.rgb = material.u_KHR_materials_specular_specularColorFactor * specularTexture.rgb;
 #endif
-#endif
+    }
 
     // Transmission, Volume:
-#ifdef MATERIAL_TRANSMISSION
+    if (MATERIAL_TRANSMISSION) {
 #if DEBUG == DEBUG_TRANSMISSION_FACTOR
-    g_finalColor.rgb = vec3(materialInfo.transmissionFactor);
+        g_finalColor.rgb = vec3(materialInfo.transmissionFactor);
 #endif
-#endif
-#ifdef MATERIAL_VOLUME
+    }
+    if (MATERIAL_VOLUME) {
 #if DEBUG == DEBUG_VOLUME_THICKNESS
-    g_finalColor.rgb = vec3(materialInfo.thickness / u_ThicknessFactor);
+        g_finalColor.rgb = vec3(materialInfo.thickness / u_ThicknessFactor);
 #endif
-#endif
+    }
 
     // Iridescence:
-#ifdef MATERIAL_IRIDESCENCE
+    if (MATERIAL_IRIDESCENCE) {
 #if DEBUG == DEBUG_IRIDESCENCE_FACTOR
-    g_finalColor.rgb = vec3(materialInfo.iridescenceFactor);
+        g_finalColor.rgb = vec3(materialInfo.iridescenceFactor);
 #endif
 #if DEBUG == DEBUG_IRIDESCENCE_THICKNESS
-    g_finalColor.rgb = vec3(materialInfo.iridescenceThickness / 1200.0);
+        g_finalColor.rgb = vec3(materialInfo.iridescenceThickness / 1200.0);
 #endif
-#endif
+    }
 
     // Anisotropy:
-#ifdef MATERIAL_ANISOTROPY
+    if (MATERIAL_ANISOTROPY) {
 #if DEBUG == DEBUG_ANISOTROPIC_STRENGTH
-    g_finalColor.rgb = vec3(materialInfo.anisotropyStrength);
+        g_finalColor.rgb = vec3(materialInfo.anisotropyStrength);
 #endif
 #if DEBUG == DEBUG_ANISOTROPIC_DIRECTION
-    vec2 direction = vec2(1.0, 0.0);
+        vec2 direction = vec2(1.0, 0.0);
 #ifdef HAS_ANISOTROPY_MAP
-    direction = texture(u_AnisotropySampler, getAnisotropyUV()).xy;
-    direction = direction * 2.0 - vec2(1.0); // [0, 1] -> [-1, 1]
+        direction = texture(u_AnisotropySampler, getAnisotropyUV()).xy;
+        direction = direction * 2.0 - vec2(1.0); // [0, 1] -> [-1, 1]
 #endif
-    vec2 directionRotation = material.u_Anisotropy.xy; // cos(theta), sin(theta)
-    mat2 rotationMatrix = mat2(directionRotation.x, directionRotation.y, -directionRotation.y, directionRotation.x);
-    direction = (direction + vec2(1.0)) * 0.5; // [-1, 1] -> [0, 1]
+        vec2 directionRotation = material.u_Anisotropy.xy; // cos(theta), sin(theta)
+        mat2 rotationMatrix = mat2(directionRotation.x, directionRotation.y, -directionRotation.y, directionRotation.x);
+        direction = (direction + vec2(1.0)) * 0.5; // [-1, 1] -> [0, 1]
 
-    g_finalColor.rgb = vec3(direction, 0.0);
+        g_finalColor.rgb = vec3(direction, 0.0);
 #endif
-#endif
+    }
 
     // Diffuse Transmission:
-#ifdef MATERIAL_DIFFUSE_TRANSMISSION
+    if (MATERIAL_DIFFUSE_TRANSMISSION) {
 #if DEBUG == DEBUG_DIFFUSE_TRANSMISSION_FACTOR
-    g_finalColor.rgb = linearTosRGB(vec3(materialInfo.diffuseTransmissionFactor));
+        g_finalColor.rgb = linearTosRGB(vec3(materialInfo.diffuseTransmissionFactor));
 #endif
 #if DEBUG == DEBUG_DIFFUSE_TRANSMISSION_COLOR_FACTOR
-    g_finalColor.rgb = linearTosRGB(materialInfo.diffuseTransmissionColorFactor);
+        g_finalColor.rgb = linearTosRGB(materialInfo.diffuseTransmissionColorFactor);
 #endif
-#endif
+    }
 }

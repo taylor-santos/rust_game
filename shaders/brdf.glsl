@@ -164,8 +164,6 @@ vec3 BRDF_specularGGX(float alphaRoughness, float NdotL, float NdotV, float Ndot
     return vec3(Vis * D);
 }
 
-
-#ifdef MATERIAL_ANISOTROPY
 // GGX Distribution Anisotropic (Same as Babylon.js)
 // https://blog.selfshadow.com/publications/s2012-shading-course/burley/s2012_pbs_disney_brdf_notes_v3.pdf Addenda
 float D_GGX_anisotropic(float NdotH, float TdotH, float BdotH, float anisotropy, float at, float ab)
@@ -201,8 +199,6 @@ vec3 BRDF_specularGGXAnisotropy(float alphaRoughness, float anisotropy, vec3 n, 
 
     return vec3(V * D);
 }
-#endif
-
 
 // f_sheen
 vec3 BRDF_specularSheen(vec3 sheenColor, float sheenRoughness, float NdotL, float NdotV, float NdotH)

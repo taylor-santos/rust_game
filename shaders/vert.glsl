@@ -3,31 +3,18 @@
 #include "shared.glsl"
 
 layout (location = 0) in vec3 a_position;
-layout (location = 0) out vec3 v_Position;
-
-#ifdef HAS_NORMAL_VEC3
 layout (location = 1) in vec3 a_normal;
-#endif
-
-#ifdef HAS_NORMAL_VEC3
-#ifdef HAS_TANGENT_VEC4
 layout (location = 2) in vec4 a_tangent;
-layout (location = 5) out mat3 v_TBN;
-#else
-layout (location = 5) out vec3 v_Normal;
-#endif
-#endif
-
-#ifdef HAS_TEXCOORD_0_VEC2
 layout (location = 3) in vec2 a_texcoord_0;
-#endif
-
-#ifdef HAS_TEXCOORD_1_VEC2
 layout (location = 4) in vec2 a_texcoord_1;
-#endif
 
+layout (location = 0) out vec3 v_Position;
 layout (location = 1) out vec2 v_texcoord_0;
 layout (location = 2) out vec2 v_texcoord_1;
+layout (location = 3) out vec3 v_Normal;
+layout (location = 4) out mat3 v_TBN;
+
+
 
 #ifdef HAS_COLOR_0_VEC3
 in vec3 a_color_0;
@@ -59,7 +46,6 @@ vec4 getPosition()
 }
 
 
-#ifdef HAS_NORMAL_VEC3
 vec3 getNormal()
 {
     vec3 normal = a_normal;
@@ -74,10 +60,7 @@ vec3 getNormal()
 
     return normalize(normal);
 }
-#endif
 
-#ifdef HAS_NORMAL_VEC3
-#ifdef HAS_TANGENT_VEC4
 vec3 getTangent()
 {
     vec3 tangent = a_tangent.xyz;
@@ -92,8 +75,6 @@ vec3 getTangent()
 
     return normalize(tangent);
 }
-#endif
-#endif
 
 
 void main()
@@ -109,26 +90,26 @@ void main()
     vec4 pos = modelMatrix * getPosition();
     v_Position = vec3(pos.xyz) / pos.w;
 
-#ifdef HAS_NORMAL_VEC3
-#ifdef HAS_TANGENT_VEC4
-    vec3 tangent = getTangent();
-    vec3 normalW = normalize(vec3(normalMatrix * vec4(getNormal(), 0.0)));
-    vec3 tangentW = vec3(modelMatrix * vec4(tangent, 0.0));
-    vec3 bitangentW = cross(normalW, tangentW) * a_tangent.w;
+    if (HAS_NORMAL_VEC3) {
+        if (HAS_TANGENT_VEC4) {
+            vec3 tangent = getTangent();
+            vec3 normalW = normalize(vec3(normalMatrix * vec4(getNormal(), 0.0)));
+            vec3 tangentW = vec3(modelMatrix * vec4(tangent, 0.0));
+            vec3 bitangentW = cross(normalW, tangentW) * a_tangent.w;
 
 #ifdef HAS_VERT_NORMAL_UV_TRANSFORM
-    tangentW = material.u_vertNormalUVTransform * tangentW;
-    bitangentW = material.u_vertNormalUVTransform * bitangentW;
+            tangentW = material.u_vertNormalUVTransform * tangentW;
+            bitangentW = material.u_vertNormalUVTransform * bitangentW;
 #endif
 
-    bitangentW = normalize(bitangentW);
-    tangentW = normalize(tangentW);
+            bitangentW = normalize(bitangentW);
+            tangentW = normalize(tangentW);
 
-    v_TBN = mat3(tangentW, bitangentW, normalW);
-#else
-    v_Normal = normalize(vec3(normalMatrix * vec4(getNormal(), 0.0)));
-#endif
-#endif
+            v_TBN = mat3(tangentW, bitangentW, normalW);
+        } else {
+            v_Normal = normalize(vec3(normalMatrix * vec4(getNormal(), 0.0)));
+        }
+    }
 
     v_texcoord_0 = vec2(0.0, 0.0);
     v_texcoord_1 = vec2(0.0, 0.0);

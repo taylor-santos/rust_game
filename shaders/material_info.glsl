@@ -1,9 +1,3 @@
-#include "shared.glsl"
-
-#ifdef MATERIAL_TRANSMISSION
-uniform ivec2 u_ScreenSize;
-#endif
-
 struct MaterialInfo
 {
     float ior;
@@ -55,7 +49,6 @@ struct MaterialInfo
     float dispersion;
 };
 
-
 // Get normal, tangent and bitangent vectors.
 NormalInfo getNormalInfo(vec3 v)
 {
@@ -77,24 +70,24 @@ NormalInfo getNormalInfo(vec3 v)
     vec3 n, t, b, ng;
 
     // Compute geometrical TBN:
-#ifdef HAS_NORMAL_VEC3
-#ifdef HAS_TANGENT_VEC4
-    // Trivial TBN computation, present as vertex attribute.
-    // Normalize eigenvectors as matrix is linearly interpolated.
-    t = normalize(v_TBN[0]);
-    b = normalize(v_TBN[1]);
-    ng = normalize(v_TBN[2]);
-#else
-    // Normals are either present as vertex attributes or approximated.
-    ng = normalize(v_Normal);
-    t = normalize(t_ - ng * dot(ng, t_));
-    b = cross(ng, t);
-#endif
-#else
-    ng = normalize(cross(dFdx(v_Position), dFdy(v_Position)));
-    t = normalize(t_ - ng * dot(ng, t_));
-    b = cross(ng, t);
-#endif
+    if (HAS_NORMAL_VEC3) {
+        if (HAS_TANGENT_VEC4) {
+            // Trivial TBN computation, present as vertex attribute.
+            // Normalize eigenvectors as matrix is linearly interpolated.
+            t = normalize(v_TBN[0]);
+            b = normalize(v_TBN[1]);
+            ng = normalize(v_TBN[2]);
+        } else {
+            // Normals are either present as vertex attributes or approximated.
+            ng = normalize(v_Normal);
+            t = normalize(t_ - ng * dot(ng, t_));
+            b = cross(ng, t);
+        }
+    } else {
+        ng = normalize(cross(dFdx(v_Position), dFdy(v_Position)));
+        t = normalize(t_ - ng * dot(ng, t_));
+        b = cross(ng, t);
+    }
 
 #ifndef NOT_TRIANGLE
     // For a back-facing surface, the tangential basis vectors are negated.
@@ -111,7 +104,7 @@ NormalInfo getNormalInfo(vec3 v)
     info.ng = ng;
 #ifdef HAS_NORMAL_MAP
     info.ntex = texture(u_NormalSampler, UV).rgb * 2.0 - vec3(1.0);
-    info.ntex *= vec3(mat_samplers.u_NormalScale, mat_samplers.u_NormalScale, 1.0);
+    info.ntex *= vec3(s.u_NormalScale, s.u_NormalScale, 1.0);
     info.ntex = normalize(info.ntex);
     info.n = normalize(mat3(t, b, ng) * info.ntex);
 #else
@@ -122,8 +115,6 @@ NormalInfo getNormalInfo(vec3 v)
     return info;
 }
 
-
-#ifdef MATERIAL_CLEARCOAT
 vec3 getClearcoatNormal(NormalInfo normalInfo)
 {
 #ifdef HAS_CLEARCOAT_NORMAL_MAP
@@ -135,30 +126,30 @@ vec3 getClearcoatNormal(NormalInfo normalInfo)
     return normalInfo.ng;
 #endif
 }
-#endif
-
 
 vec4 getBaseColor()
 {
     vec4 baseColor = vec4(1);
 
-#if defined(MATERIAL_SPECULARGLOSSINESS)
-    baseColor = material.u_DiffuseFactor;
-#elif defined(MATERIAL_METALLICROUGHNESS)
-    baseColor = material.u_BaseColorFactor;
-#endif
+    if (MATERIAL_SPECULARGLOSSINESS) {
+        baseColor = material.u_DiffuseFactor;
+    } else if (MATERIAL_METALLICROUGHNESS) {
+        baseColor = material.u_BaseColorFactor;
+    }
 
-#if defined(MATERIAL_SPECULARGLOSSINESS) && defined(HAS_DIFFUSE_MAP)
-    baseColor *= texture(u_DiffuseSampler, getDiffuseUV());
-#elif defined(MATERIAL_METALLICROUGHNESS) && defined(HAS_BASE_COLOR_MAP)
-    baseColor *= texture(u_BaseColorSampler, getBaseColorUV());
+#if defined(HAS_DIFFUSE_MAP)
+    if (MATERIAL_SPECULARGLOSSINESS) {
+        baseColor *= texture(u_DiffuseSampler, getDiffuseUV());
+    }
+#elif defined(HAS_BASE_COLOR_MAP)
+    if (MATERIAL_METALLICROUGHNESS) {
+        baseColor *= texture(u_BaseColorSampler, getBaseColorUV());
+    }
 #endif
 
     return baseColor * getVertexColor();
 }
 
-
-#ifdef MATERIAL_SPECULARGLOSSINESS
 MaterialInfo getSpecularGlossinessInfo(MaterialInfo info)
 {
     info.f0_dielectric = material.u_SpecularFactor;
@@ -173,10 +164,7 @@ MaterialInfo getSpecularGlossinessInfo(MaterialInfo info)
     info.perceptualRoughness = 1.0 - info.perceptualRoughness; // 1 - glossiness
     return info;
 }
-#endif
 
-
-#ifdef MATERIAL_METALLICROUGHNESS
 MaterialInfo getMetallicRoughnessInfo(MaterialInfo info)
 {
     info.metallic = material.u_MetallicFactor;
@@ -192,10 +180,7 @@ MaterialInfo getMetallicRoughnessInfo(MaterialInfo info)
 
     return info;
 }
-#endif
 
-
-#ifdef MATERIAL_SHEEN
 MaterialInfo getSheenInfo(MaterialInfo info)
 {
     info.sheenColorFactor = material.u_SheenColorFactor;
@@ -212,10 +197,7 @@ MaterialInfo getSheenInfo(MaterialInfo info)
 #endif
     return info;
 }
-#endif
 
-
-#ifdef MATERIAL_SPECULAR
 MaterialInfo getSpecularInfo(MaterialInfo info)
 {   
     vec4 specularTexture = vec4(1.0);
@@ -231,10 +213,7 @@ MaterialInfo getSpecularInfo(MaterialInfo info)
     info.f90_dielectric = vec3(info.specularWeight);
     return info;
 }
-#endif
 
-
-#ifdef MATERIAL_TRANSMISSION
 MaterialInfo getTransmissionInfo(MaterialInfo info)
 {
     info.transmissionFactor = material.u_TransmissionFactor;
@@ -244,16 +223,14 @@ MaterialInfo getTransmissionInfo(MaterialInfo info)
     info.transmissionFactor *= transmissionSample.r;
 #endif
 
-#ifdef MATERIAL_DISPERSION
-    info.dispersion = material.u_Dispersion;
-#else
-    info.dispersion = 0.0;
-#endif
+    if (MATERIAL_DISPERSION) {
+        info.dispersion = material.u_Dispersion;
+    } else {
+        info.dispersion = 0.0;
+    }
     return info;
 }
-#endif
 
-#ifdef MATERIAL_VOLUME
 MaterialInfo getVolumeInfo(MaterialInfo info)
 {
     info.thickness = material.u_ThicknessFactor;
@@ -266,10 +243,7 @@ MaterialInfo getVolumeInfo(MaterialInfo info)
 #endif
     return info;
 }
-#endif
 
-
-#ifdef MATERIAL_IRIDESCENCE
 MaterialInfo getIridescenceInfo(MaterialInfo info)
 {
     info.iridescenceFactor = material.u_IridescenceFactor;
@@ -288,10 +262,7 @@ MaterialInfo getIridescenceInfo(MaterialInfo info)
 
     return info;
 }
-#endif
 
-
-#ifdef MATERIAL_DIFFUSE_TRANSMISSION
 MaterialInfo getDiffuseTransmissionInfo(MaterialInfo info)
 {
     info.diffuseTransmissionFactor = material.u_DiffuseTransmissionFactor;
@@ -307,10 +278,7 @@ MaterialInfo getDiffuseTransmissionInfo(MaterialInfo info)
 
     return info;
 }
-#endif
 
-
-#ifdef MATERIAL_CLEARCOAT
 MaterialInfo getClearCoatInfo(MaterialInfo info, NormalInfo normalInfo)
 {
     info.clearcoatFactor = material.u_ClearcoatFactor;
@@ -332,19 +300,16 @@ MaterialInfo getClearCoatInfo(MaterialInfo info, NormalInfo normalInfo)
     info.clearcoatRoughness = clamp(info.clearcoatRoughness, 0.0, 1.0);
     return info;
 }
-#endif
 
 
-#ifdef MATERIAL_IOR
 MaterialInfo getIorInfo(MaterialInfo info)
 {
     info.f0_dielectric = vec3(pow(( material.u_Ior - 1.0) /  (material.u_Ior + 1.0), 2.0));
     info.ior = material.u_Ior;
     return info;
 }
-#endif
 
-#ifdef MATERIAL_ANISOTROPY
+
 MaterialInfo getAnisotropyInfo(MaterialInfo info, NormalInfo normalInfo)
 {
     vec2 direction = vec2(1.0, 0.0);
@@ -363,7 +328,6 @@ MaterialInfo getAnisotropyInfo(MaterialInfo info, NormalInfo normalInfo)
     info.anisotropyStrength = clamp(material.u_Anisotropy.z * strengthFactor, 0.0, 1.0);
     return info;
 }
-#endif
 
 
 float albedoSheenScalingLUT(float NdotV, float sheenRoughnessFactor)

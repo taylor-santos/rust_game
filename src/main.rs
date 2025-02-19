@@ -18,7 +18,7 @@ use crate::material::Material;
 use cgmath::{Matrix, Matrix4, Point3, Rad, SquareMatrix, Vector3};
 use image::{DynamicImage, ImageBuffer, ImageReader};
 use ktx2::SupercompressionScheme;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::f32::consts::FRAC_PI_4;
 use std::time::{Duration, Instant};
 use std::{error::Error, sync::Arc};
@@ -44,7 +44,7 @@ use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::CullMode;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
 use vulkano::pipeline::{Pipeline, PipelineBindPoint};
-use vulkano::shader::{DescriptorBindingRequirements, ShaderStages};
+use vulkano::shader::{DescriptorBindingRequirements, ShaderStages, SpecializationConstant};
 use vulkano::swapchain::PresentMode;
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -141,8 +141,9 @@ struct RenderContext {
     pipeline: Arc<GraphicsPipeline>,
     viewport: Viewport,
     frame_times: VecDeque<Instant>,
-    material_sets: Vec<Arc<DescriptorSet>>,
+    material_sets: Vec<(Arc<DescriptorSet>, Arc<DescriptorSet>)>,
     const_set: Arc<DescriptorSet>,
+    skybox_set: Arc<DescriptorSet>,
 }
 
 fn upload_image<T: BufferContents + Send + Sync, I: IntoIterator<Item = T>>(
@@ -672,11 +673,47 @@ impl ApplicationHandler for App {
             //
             // A Vulkan shader can in theory contain multiple entry points, so we have to specify
             // which one.
+
+            let specialization_constants = [
+                true.into(),  // HAS_NORMAL_VEC3
+                true.into(),  // HAS_TANGENT_VEC4
+                true.into(),  // MATERIAL_METALLICROUGHNESS
+                false.into(), // MATERIAL_SPECULARGLOSSINESS
+                false.into(), // MATERIAL_CLEARCOAT
+                false.into(), // MATERIAL_SHEEN
+                false.into(), // MATERIAL_SPECULAR
+                false.into(), // MATERIAL_TRANSMISSION
+                false.into(), // MATERIAL_VOLUME
+                false.into(), // MATERIAL_IRIDESCENCE
+                false.into(), // MATERIAL_DIFFUSE_TRANSMISSION
+                false.into(), // MATERIAL_ANISOTROPY
+                false.into(), // MATERIAL_IOR
+                false.into(), // MATERIAL_DISPERSION
+                false.into(), // MATERIAL_EMISSIVE_STRENGTH
+                false.into(), // MATERIAL_UNLIT
+            ];
+
             let vs = vs::load(self.context.device().clone())
+                .unwrap()
+                .specialize(
+                    specialization_constants
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| (i as u32, v))
+                        .collect(),
+                )
                 .unwrap()
                 .entry_point("main")
                 .unwrap();
             let fs = fs::load(self.context.device().clone())
+                .unwrap()
+                .specialize(
+                    specialization_constants
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| (i as u32, v))
+                        .collect(),
+                )
                 .unwrap()
                 .entry_point("main")
                 .unwrap();
@@ -701,46 +738,23 @@ impl ApplicationHandler for App {
             // layout. Thus, it is a good idea to design shaders so that many pipelines have common
             // resource locations, which allows them to share pipeline layouts.
             let bindings = [
+                // set = 0
                 vec![
-                    // layout (set = 0, binding = 0) uniform Constants
-                    DescriptorType::UniformBuffer,
-                    // layout (set = 0, binding = 1) uniform samplerCube u_LambertianEnvSampler
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 0, binding = 2) uniform samplerCube u_GGXEnvSampler
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 0, binding = 3) uniform sampler2D u_GGXLUT
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 0, binding = 4) uniform samplerCube u_CharlieEnvSampler
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 0, binding = 5) uniform sampler2D u_CharlieLUT
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 0, binding = 6) uniform sampler2D u_SheenELUT
-                    DescriptorType::CombinedImageSampler,
+                    DescriptorType::UniformBuffer, // binding = 0 uniform Constants
                 ],
+                // set = 1
                 vec![
-                    // layout (set = 1, binding = 0) uniform Material
-                    DescriptorType::UniformBuffer,
-                    // layout (set = 1, binding = 1) uniform MatSamplers
-                    DescriptorType::UniformBuffer,
-                    // layout (set = 1, binding = 2) uniform sampler2D u_NormalSampler
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 1, binding = 3) uniform sampler2D u_EmissiveSampler
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 1, binding = 4) uniform sampler2D u_OcclusionSampler
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 1, binding = 5) uniform sampler2D u_BaseColorSampler
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 1, binding = 6) uniform sampler2D u_MetallicRoughnessSampler
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 1, binding = 7) uniform sampler2D u_SheenColorSampler
-                    DescriptorType::CombinedImageSampler,
-                    // layout (set = 1, binding = 8) uniform sampler2D u_SheenRoughnessSampler
-                    DescriptorType::CombinedImageSampler,
+                    DescriptorType::UniformBuffer, // binding = 0 uniform Camera
                 ],
+                // set = 2
+                vec![DescriptorType::CombinedImageSampler; 6], // IBL Samplers
+                // set = 3
                 vec![
-                    // layout (set = 2, binding = 0) uniform Camera
-                    DescriptorType::UniformBuffer,
+                    DescriptorType::UniformBuffer, // binding = 0 uniform Material
+                    DescriptorType::UniformBuffer, // binding = 1 uniform MatSamplers
                 ],
+                // set = 4
+                vec![DescriptorType::CombinedImageSampler; 22], // Texture Samplers
             ];
 
             let push_constant_ranges = vec![PushConstantRange {
@@ -857,13 +871,12 @@ impl ApplicationHandler for App {
             v
         };
 
-        let material_sets = {
+        let material_sets: Vec<_> = {
             let identity3 = [
                 Padded([1f32, 0., 0.]),
                 Padded([0., 1., 0.]),
                 Padded([0., 0., 1.]),
             ];
-            let set1 = pipeline.layout().set_layouts().get(1).unwrap();
             self.materials
                 .iter()
                 .map(|mat| {
@@ -884,8 +897,8 @@ impl ApplicationHandler for App {
                             u_ClearcoatRoughnessFactor: Default::default(),
                             u_KHR_materials_specular_specularColorFactor: Default::default(),
                             u_KHR_materials_specular_specularFactor: 0.0,
-                            u_TransmissionFactor: 0.0,
-                            u_ThicknessFactor: Default::default(),
+                            u_TransmissionFactor: 1.0,
+                            u_ThicknessFactor: 0.0.into(),
                             u_AttenuationColor: Default::default(),
                             u_AttenuationDistance: 0.0,
                             u_IridescenceFactor: 0.0,
@@ -895,7 +908,7 @@ impl ApplicationHandler for App {
                             u_DiffuseTransmissionFactor: Default::default(),
                             u_DiffuseTransmissionColorFactor: Default::default(),
                             u_EmissiveStrength: 0.0,
-                            u_Ior: Default::default(),
+                            u_Ior: 1.0.into(),
                             u_Anisotropy: Default::default(),
                             u_Dispersion: 0.0,
                             u_AlphaCutoff: mat.alpha_cutoff.unwrap_or(0.5).into(),
@@ -991,6 +1004,41 @@ impl ApplicationHandler for App {
                             u_SheenRoughnessUVTransform: identity3, // TODO
                             u_SheenColorUVSet: 0.into(),     // TODO
                             u_SheenColorUVTransform: identity3, // TODO
+                            u_DiffuseUVSet: 0.into(),        // TODO
+                            u_DiffuseUVTransform: identity3, // TODO
+                            u_SpecularGlossinessUVSet: 0.into(), // TODO
+                            u_SpecularGlossinessUVTransform: identity3, // TODO
+                            u_ClearcoatUVSet: 0.into(),      // TODO
+                            u_ClearcoatUVTransform: identity3, // TODO
+                            u_ClearcoatRoughnessUVSet: 0.into(), // TODO
+                            u_ClearcoatRoughnessUVTransform: identity3, // TODO
+                            u_ClearcoatNormalUVSet: 0.into(), // TODO
+                            u_ClearcoatNormalUVTransform: identity3, // TODO
+                            u_ClearcoatNormalScale: 1.0.into(), // TODO
+                            u_SpecularUVSet: 0.into(),       // TODO
+                            u_SpecularUVTransform: identity3, // TODO
+                            u_SpecularColorUVSet: 0.into(),  // TODO
+                            u_SpecularColorUVTransform: identity3, // TODO
+                            u_TransmissionUVSet: 0.into(),   // TODO
+                            u_TransmissionUVTransform: identity3, // TODO
+                            u_TransmissionFramebufferSize: self
+                                .windows
+                                .get_primary_window()
+                                .unwrap()
+                                .inner_size()
+                                .into(), // TODO
+                            u_ThicknessUVSet: 0.into(),      // TODO
+                            u_ThicknessUVTransform: identity3, // TODO
+                            u_IridescenceUVSet: 0.into(),    // TODO
+                            u_IridescenceUVTransform: identity3, // TODO
+                            u_IridescenceThicknessUVSet: 0.into(), // TODO
+                            u_IridescenceThicknessUVTransform: identity3, // TODO
+                            u_DiffuseTransmissionUVSet: 0.into(), // TODO
+                            u_DiffuseTransmissionUVTransform: identity3, // TODO
+                            u_DiffuseTransmissionColorUVSet: 0.into(), // TODO
+                            u_DiffuseTransmissionColorUVTransform: identity3, // TODO
+                            u_AnisotropyUVSet: 0.into(),     // TODO
+                            u_AnisotropyUVTransform: identity3, // TODO
                         };
                         let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
                         *subbuffer.write().unwrap() = mat_samplers;
@@ -998,54 +1046,90 @@ impl ApplicationHandler for App {
                     };
 
                     let textures = [
-                        // u_NormalSampler
+                        // (set = 4, binding = 0) u_NormalSampler
                         mat.normal_texture.as_ref().map(|t| &t.info.texture),
-                        // u_EmissiveSampler
+                        // (set = 4, binding = 1) u_EmissiveSampler
                         mat.emissive_texture.as_ref().map(|t| &t.texture),
-                        // u_OcclusionSampler
+                        // (set = 4, binding = 2) u_OcclusionSampler
                         mat.occlusion_texture.as_ref().map(|t| &t.info.texture),
-                        // u_BaseColorSampler
+                        // (set = 4, binding = 3) u_BaseColorSampler
                         mat.base_color_texture.as_ref().map(|t| &t.texture),
-                        // u_MetallicRoughnessSampler
+                        // (set = 4, binding = 4) u_MetallicRoughnessSampler
                         mat.pbr_metallic_roughness
                             .metallic_roughness_texture
                             .as_ref()
                             .map(|t| &t.texture),
-                        // u_SheenColorSampler
+                        // (set = 4, binding = 5) u_DiffuseSampler
                         None, // TODO
-                        // u_SheenRoughnessSampler
+                        // (set = 4, binding = 6) u_SpecularGlossinessSampler
+                        None, // TODO
+                        // (set = 4, binding = 7) u_ClearcoatSampler
+                        None, // TODO
+                        // (set = 4, binding = 8) u_ClearcoatRoughnessSampler
+                        None, // TODO
+                        // (set = 4, binding = 9) u_ClearcoatNormalSampler
+                        None, // TODO
+                        // (set = 4, binding = 10) u_SheenColorSampler
+                        None, // TODO
+                        // (set = 4, binding = 11) u_SheenRoughnessSampler
+                        None, // TODO
+                        // (set = 4, binding = 12) u_SpecularSampler
+                        None, // TODO
+                        // (set = 4, binding = 13) u_SpecularColorSampler
+                        None, // TODO
+                        // (set = 4, binding = 14) u_TransmissionSampler
+                        None, // TODO
+                        // (set = 4, binding = 15) u_TransmissionFramebufferSampler
+                        None, // TODO
+                        // (set = 4, binding = 16) u_ThicknessSampler
+                        None, // TODO
+                        // (set = 4, binding = 17) u_IridescenceSampler
+                        None, // TODO
+                        // (set = 4, binding = 18) u_IridescenceThicknessSampler
+                        None, // TODO
+                        // (set = 4, binding = 19) u_DiffuseTransmissionSampler
+                        None, // TODO
+                        // (set = 4, binding = 20) u_DiffuseTransmissionColorSampler
+                        None, // TODO
+                        // (set = 4, binding = 21) u_AnisotropySampler
                         None, // TODO
                     ]
                     .map(|t| t.map(|t| &self.textures[t.index]));
 
-                    DescriptorSet::new(
+                    let material_set = DescriptorSet::new(
                         self.descriptor_set_allocator.clone(),
-                        set1.clone(),
-                        [material_set, mat_sampler_set].into_iter().chain(
-                            textures
-                                .into_iter()
-                                .enumerate()
-                                .map(|(idx, texture)| match texture {
-                                    Some(texture) => WriteDescriptorSet::image_view_sampler(
-                                        2 + idx as u32,
-                                        texture.clone(),
-                                        self.sampler.clone(),
-                                    ),
-                                    None => WriteDescriptorSet::image_view_sampler(
-                                        2 + idx as u32,
-                                        self.null_texture.clone(),
-                                        self.sampler.clone(),
-                                    ),
-                                }),
-                        ),
+                        pipeline.layout().set_layouts().get(3).unwrap().clone(),
+                        [material_set, mat_sampler_set].into_iter(),
                         [],
                     )
-                    .unwrap()
+                    .unwrap();
+
+                    let texture_set = DescriptorSet::new(
+                        self.descriptor_set_allocator.clone(),
+                        pipeline.layout().set_layouts().get(4).unwrap().clone(),
+                        textures
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, texture)| match texture {
+                                Some(texture) => WriteDescriptorSet::image_view_sampler(
+                                    idx as u32,
+                                    texture.clone(),
+                                    self.sampler.clone(),
+                                ),
+                                None => WriteDescriptorSet::image_view_sampler(
+                                    idx as u32,
+                                    self.null_texture.clone(),
+                                    self.sampler.clone(),
+                                ),
+                            }),
+                        [],
+                    )
+                    .unwrap();
+
+                    (material_set, texture_set)
                 })
                 .collect()
         };
-
-        let set0 = pipeline.layout().set_layouts().get(0).unwrap();
 
         let const_set = {
             let const_set = {
@@ -1064,6 +1148,17 @@ impl ApplicationHandler for App {
                 *subbuffer.write().unwrap() = uniform;
                 WriteDescriptorSet::buffer(0, subbuffer)
             };
+
+            DescriptorSet::new(
+                self.descriptor_set_allocator.clone(),
+                pipeline.layout().set_layouts().get(0).unwrap().clone(),
+                [const_set],
+                [],
+            )
+            .unwrap()
+        };
+
+        let skybox_set = {
             let skybox_set = {
                 [
                     &self.skyboxes.lambertian,
@@ -1077,7 +1172,7 @@ impl ApplicationHandler for App {
                 .enumerate()
                 .map(|(idx, texture)| {
                     WriteDescriptorSet::image_view_sampler(
-                        1 + idx as u32,
+                        idx as u32,
                         texture.clone(),
                         self.sampler.clone(),
                     )
@@ -1086,8 +1181,8 @@ impl ApplicationHandler for App {
 
             DescriptorSet::new(
                 self.descriptor_set_allocator.clone(),
-                set0.clone(),
-                std::iter::once(const_set).chain(skybox_set),
+                pipeline.layout().set_layouts().get(2).unwrap().clone(),
+                skybox_set,
                 [],
             )
             .unwrap()
@@ -1101,6 +1196,7 @@ impl ApplicationHandler for App {
             frame_times,
             material_sets,
             const_set,
+            skybox_set,
         });
     }
 
@@ -1306,6 +1402,15 @@ impl ApplicationHandler for App {
                     )
                     .unwrap();
 
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        rcx.pipeline.layout().clone(),
+                        2,
+                        rcx.skybox_set.clone(),
+                    )
+                    .unwrap();
+
                 {
                     let proj = {
                         let aspect_ratio = window_size.width as f32 / window_size.height as f32;
@@ -1329,8 +1434,10 @@ impl ApplicationHandler for App {
                     let view_proj = proj * view;
 
                     let cam_uniform = fs::Camera {
-                        u_Camera: self.camera.position.into(),
+                        u_ViewMatrix: view.into(),
+                        u_ProjectionMatrix: proj.into(),
                         u_ViewProjectionMatrix: view_proj.into(),
+                        u_Camera: self.camera.position.into(),
                     };
 
                     /*
@@ -1382,10 +1489,9 @@ impl ApplicationHandler for App {
                     *subbuffer.write().unwrap() = cam_uniform;
                     let write_set = WriteDescriptorSet::buffer(0, subbuffer);
 
-                    let set2 = rcx.pipeline.layout().set_layouts().get(2).unwrap();
                     let set = DescriptorSet::new(
                         self.descriptor_set_allocator.clone(),
-                        set2.clone(),
+                        rcx.pipeline.layout().set_layouts().get(1).unwrap().clone(),
                         [write_set],
                         [],
                     )
@@ -1395,7 +1501,7 @@ impl ApplicationHandler for App {
                         .bind_descriptor_sets(
                             PipelineBindPoint::Graphics,
                             rcx.pipeline.layout().clone(),
-                            2,
+                            1,
                             set,
                         )
                         .unwrap();
@@ -1415,14 +1521,23 @@ impl ApplicationHandler for App {
                     }
 
                     for prim in &self.draw_infos[object.mesh_idx] {
-                        let mat_set = rcx.material_sets[prim.mat_idx].clone();
+                        let (mat_set, tex_set) = rcx.material_sets[prim.mat_idx].clone();
 
                         builder
                             .bind_descriptor_sets(
                                 PipelineBindPoint::Graphics,
                                 rcx.pipeline.layout().clone(),
-                                1,
+                                3,
                                 mat_set,
+                            )
+                            .unwrap();
+
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                rcx.pipeline.layout().clone(),
+                                4,
+                                tex_set,
                             )
                             .unwrap();
 
@@ -1557,13 +1672,9 @@ mod vs {
         path: "shaders/vert.glsl",
         include: ["shaders"],
         define: [
-            ("HAS_NORMAL_VEC3", "1"),
             ("HAS_POSITION_VEC3", "1"),
             ("HAS_TEXCOORD_0_VEC2", "1"),
-            ("HAS_TANGENT_VEC4", "1"),
             // Keep synced with fragment shader
-            // ("HAS_NORMAL_VEC3", "1"),
-            // ("HAS_TANGENT_VEC4", "1"),
             // ("HAS_TEXCOORD_0_VEC2", "1"),
             // ("HAS_TEXCOORD_1_VEC2", "1"),
             // ("HAS_VERT_NORMAL_UV_TRANSFORM", "1"),
@@ -1590,11 +1701,8 @@ mod fs {
             ("HAS_BASE_COLOR_MAP", "1"),
             ("HAS_METALLIC_ROUGHNESS_MAP", "1"),
             ("ALPHAMODE", "ALPHAMODE_OPAQUE"),
-            ("MATERIAL_METALLICROUGHNESS", "1"),
-            ("HAS_NORMAL_VEC3", "1"),
             ("HAS_POSITION_VEC3", "1"),
             ("HAS_TEXCOORD_0_VEC2", "1"),
-            ("HAS_TANGENT_VEC4", "1"),
             ("USE_IBL", "1"),
             ("TONEMAP_KHR_PBR_NEUTRAL", "1"),
             ("DEBUG", "DEBUG_NONE"),
@@ -1605,21 +1713,15 @@ mod fs {
             // ("HAS_BASECOLOR_UV_TRANSFORM", "1"),
             // ("HAS_BASE_COLOR_MAP", "1"),
             // ("ALPHAMODE", "ALPHAMODE_OPAQUE"),
-            // ("MATERIAL_METALLICROUGHNESS", "1"),
-            // ("MATERIAL_SHEEN", "1"),
             // ("HAS_POSITION_VEC3", "1"),
-            // ("HAS_NORMAL_VEC3", "1"),
             // ("HAS_TEXCOORD_0_VEC2", "1"),
             // ("HAS_TEXCOORD_1_VEC2", "1"),
-            // ("HAS_TANGENT_VEC4", "1"),
             // //("HAS_VERT_NORMAL_UV_TRANSFORM", "1"),
             // ("USE_IBL", "1"),
             // ("TONEMAP_KHR_PBR_NEUTRAL", "1"),
             // ("DEBUG", "DEBUG_NORMAL_SHADING"),
 
         //    // Keep synced with vertex shader
-        //    ("HAS_NORMAL_VEC3", "1"),
-        //    ("HAS_TANGENT_VEC4", "1"),
         //    ("HAS_TEXCOORD_0_VEC2", "1"),
         //    ("HAS_TEXCOORD_1_VEC2", "1"),
         //    // ("HAS_COLOR_0_VEC3", "1"),
@@ -1629,14 +1731,12 @@ mod fs {
         //    ("DEBUG", "DEBUG_NONE"),
         //    ("ALPHAMODE", "ALPHAMODE_OPAQUE"),
         //    ("HAS_NORMAL_MAP", "1"),
-        //    ("MATERIAL_METALLICROUGHNESS", "1"),
         //    ("HAS_BASE_COLOR_MAP", "1"),
         //    ("HAS_EMISSIVE_MAP", "1"),
         //    ("USE_IBL", "1"),
         //    ("HAS_OCCLUSION_MAP", "1"),
         //    ("HAS_METALLIC_ROUGHNESS_MAP", "1"),
         //    ("TONEMAP_KHR_PBR_NEUTRAL", "1"),
-        //    ("MATERIAL_SHEEN", "1"),
             // ("HAS_ANISOTROPY_MAP", "1"),
             // ("HAS_ANISOTROPY_UV_TRANSFORM", "1"),
             // ("HAS_BASECOLOR_UV_TRANSFORM", "1"),
@@ -1675,18 +1775,6 @@ mod fs {
             // ("HAS_TRANSMISSION_MAP", "1"),
             // ("HAS_TRANSMISSION_UV_TRANSFORM", "1"),
             // ("LINEAR_OUTPUT", "1"),
-            // ("MATERIAL_ANISOTROPY", "1"),
-            // ("MATERIAL_CLEARCOAT", "1"),
-            // ("MATERIAL_DIFFUSE_TRANSMISSION", "1"),
-            // ("MATERIAL_DISPERSION", "1"),
-            // ("MATERIAL_EMISSIVE_STRENGTH", "1"),
-            // ("MATERIAL_IOR", "1"),
-            // ("MATERIAL_IRIDESCENCE", "1"),
-            // ("MATERIAL_SPECULAR", "1"),
-            // ("MATERIAL_SPECULARGLOSSINESS", "1"),
-            // ("MATERIAL_TRANSMISSION", "1"),
-            // ("MATERIAL_UNLIT", "1"),
-            // ("MATERIAL_VOLUME", "1"),
             // ("NOT_TRIANGLE", "1"),
             // ("TONEMAP_ACES_HILL", "1"),
             // ("TONEMAP_ACES_HILL_EXPOSURE_BOOST", "1"),
