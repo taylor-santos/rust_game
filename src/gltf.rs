@@ -1,9 +1,14 @@
-use crate::material::{Material, NormalTexture, PbrMetallicRoughness, Texture};
-use cgmath::{Matrix4, SquareMatrix};
+use crate::material::{
+    Material, PbrMetallicRoughness, ScaledTexture, Texture, TextureInfo, TextureTransform,
+};
+use cgmath::{Matrix3, Matrix4, Point2, SquareMatrix, Vector2};
 use gltf::image::{Data, Format};
+use gltf::json::Value;
+use gltf::scene::Transform;
 use gltf::texture::Info;
-use gltf::Error;
+use gltf::{texture, Error};
 use rayon::prelude::*;
+use std::iter::Map;
 use std::time::Instant;
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex;
@@ -12,13 +17,15 @@ use vulkano::pipeline::graphics::vertex_input::Vertex;
 #[repr(C)]
 pub struct CombinedVertex {
     #[format(R32G32B32_SFLOAT)]
-    position: [f32; 3],
+    a_position: [f32; 3],
     #[format(R32G32B32_SFLOAT)]
-    normal: [f32; 3],
-    #[format(R32G32B32_SFLOAT)]
-    tangent: [f32; 3],
+    a_normal: [f32; 3],
+    #[format(R32G32B32A32_SFLOAT)]
+    a_tangent: [f32; 4],
     #[format(R32G32_SFLOAT)]
-    texcoord: [f32; 2],
+    a_texcoord_0: [f32; 2],
+    #[format(R32G32_SFLOAT)]
+    a_texcoord_1: [f32; 2],
 }
 
 pub struct Primitive {
@@ -57,36 +64,23 @@ impl mikktspace::Geometry for Primitive {
 
     fn position(&self, face: usize, vert: usize) -> [f32; 3] {
         let tri = self.indices[face * 3 + vert] as usize;
-        self.vertices[tri].position
+        self.vertices[tri].a_position
     }
 
     fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
         let tri = self.indices[face * 3 + vert] as usize;
-        self.vertices[tri].normal
+        self.vertices[tri].a_normal
     }
 
     fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
         let tri = self.indices[face * 3 + vert] as usize;
-        self.vertices[tri].texcoord
+        self.vertices[tri].a_texcoord_0
     }
 
-    fn set_tangent(
-        &mut self,
-        tangent: [f32; 3],
-        _bi_tangent: [f32; 3],
-        _f_mag_s: f32,
-        _f_mag_t: f32,
-        _bi_tangent_preserves_orientation: bool,
-        face: usize,
-        vert: usize,
-    ) {
-        let tri = self.indices[face * 3 + vert] as usize;
-        self.vertices[tri].tangent = tangent;
-    }
-
-    fn set_tangent_encoded(&mut self, _tangent: [f32; 4], _face: usize, _vert: usize) {
+    fn set_tangent_encoded(&mut self, mut _tangent: [f32; 4], _face: usize, _vert: usize) {
         let tri = self.indices[_face * 3 + _vert] as usize;
-        self.vertices[tri].tangent = _tangent[..3].try_into().unwrap();
+        _tangent[3] = -_tangent[3];
+        self.vertices[tri].a_tangent = _tangent;
     }
 }
 
@@ -105,45 +99,175 @@ impl From<gltf::Material<'_>> for Material {
         let alpha_cutoff = mat.alpha_cutoff();
         let alpha_mode = mat.alpha_mode();
 
+        let mut sheen_roughness_factor = None;
+        let mut sheen_color_factor = None;
+
+        mat.extensions()
+            .into_iter()
+            .flatten()
+            .for_each(|(key, value)| match key.as_str() {
+                "KHR_materials_sheen" => {
+                    use gltf::json::Value;
+                    if let Value::Object(items) = value {
+                        for (key, value) in items {
+                            match (key.as_str(), value) {
+                                ("sheenRoughnessFactor", Value::Number(n)) => {
+                                    sheen_roughness_factor = Some(n.as_f64().unwrap() as f32);
+                                }
+                                ("sheenColorFactor", v) => {
+                                    sheen_color_factor = Some(unwrap_vec(v).unwrap())
+                                }
+                                _ => panic!("Unrecognized key {}: {:?}", key, value),
+                            }
+                        }
+                    } else {
+                        panic!("Unrecognized value type for {}: {:?}", key, value);
+                    }
+                }
+                _ => panic!("Unsupported KHR extension: {}", key),
+            });
+
+        // mat.normal_texture().map(|norm| {
+        //     norm.
+        // })
+
+        let normal_texture = mat.normal_texture().map(Into::into);
+
         Material {
             name: mat.name().map(String::from),
             alpha_cutoff,
             alpha_mode,
             base_color_texture: pbr_metallic_roughness.base_color_texture().map(Into::into),
-            normal_texture: mat.normal_texture().map(Into::into),
+            normal_texture,
             pbr_metallic_roughness: pbr_metallic_roughness_data,
             pbr_specular_glossiness: None, // Handle this when the extension is supported
             unlit: mat.unlit(),
-            texture_transform: None, // Handle this when the extension is supported
-            variants: vec![],        // Handle this when the extension is supported
-            volume: None,            // Handle this when the extension is supported
-            specular: None,          // Handle this when the extension is supported
-            transmission: None,      // Handle this when the extension is supported
+            variants: vec![],   // Handle this when the extension is supported
+            volume: None,       // Handle this when the extension is supported
+            specular: None,     // Handle this when the extension is supported
+            transmission: None, // Handle this when the extension is supported
             ior: mat.ior(),
             emissive_strength: mat.emissive_strength(),
-            emissive_texture: mat.emissive_texture().map(|info| info.into()),
+            emissive_texture: mat.emissive_texture().map(Into::into),
             emissive_factor: mat.emissive_factor(),
+            occlusion_texture: mat.occlusion_texture().map(Into::into),
+            sheen_roughness_factor,
+            sheen_color_factor,
         }
     }
 }
 
-impl From<Info<'_>> for Texture {
+impl From<Info<'_>> for TextureInfo {
     fn from(info: Info<'_>) -> Self {
         Self {
-            index: info.texture().source().index(),
-            tex_coord: info.tex_coord(),
+            texture: Texture {
+                index: info.texture().source().index(),
+                tex_coord: info.tex_coord(),
+            },
+            transform: info.texture_transform().map(|t| TextureTransform {
+                scale: t.scale(),
+                offset: t.offset(),
+                rotation: t.rotation(),
+            }),
         }
     }
 }
 
-impl From<gltf::material::NormalTexture<'_>> for NormalTexture {
-    fn from(normal_texture: gltf::material::NormalTexture<'_>) -> Self {
-        Self {
+fn unwrap_vec<const N: usize>(value: &gltf::json::Value) -> Option<[f32; N]> {
+    value
+        .as_array()?
+        .into_iter()
+        .map(|v| v.as_f64().map(|f| f as f32))
+        .collect::<Option<Vec<_>>>()?
+        .try_into()
+        .ok()
+}
+
+trait ScalableTexture {
+    fn tex_coord(&self) -> u32;
+    fn extensions(&self) -> Option<&serde_json::map::Map<String, Value>>;
+    fn texture(&self) -> texture::Texture<'_>;
+    fn scale(&self) -> f32;
+}
+
+impl ScalableTexture for gltf::material::NormalTexture<'_> {
+    fn tex_coord(&self) -> u32 {
+        self.tex_coord()
+    }
+
+    fn extensions(&self) -> Option<&serde_json::map::Map<String, Value>> {
+        self.extensions()
+    }
+
+    fn texture(&self) -> gltf::Texture<'_> {
+        self.texture()
+    }
+
+    fn scale(&self) -> f32 {
+        self.scale()
+    }
+}
+
+impl ScalableTexture for gltf::material::OcclusionTexture<'_> {
+    fn tex_coord(&self) -> u32 {
+        self.tex_coord()
+    }
+
+    fn extensions(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.extensions()
+    }
+
+    fn texture(&self) -> gltf::Texture<'_> {
+        self.texture()
+    }
+
+    fn scale(&self) -> f32 {
+        self.strength()
+    }
+}
+
+impl<T: ScalableTexture> From<T> for ScaledTexture {
+    fn from(texture: T) -> Self {
+        let mut transform = None;
+        let mut tex_coord = texture.tex_coord();
+        texture
+            .extensions()
+            .into_iter()
+            .flatten()
+            .for_each(|(key, value)| match key.as_str() {
+                "KHR_texture_transform" => {
+                    use gltf::json::Value;
+                    let mut trs = TextureTransform::default();
+                    if let Value::Object(items) = value {
+                        for (key, value) in items {
+                            match key.as_str() {
+                                "offset" => trs.offset = unwrap_vec(value).unwrap(),
+                                "scale" => trs.scale = unwrap_vec(value).unwrap(),
+                                "rotation" => trs.rotation = value.as_f64().unwrap() as f32,
+                                "texCoord" => tex_coord = value.as_i64().unwrap() as u32,
+                                _ => panic!(
+                                    "Unexpected KHR_texture_transform key: {}: {:?}",
+                                    key, value
+                                ),
+                            }
+                        }
+                    }
+                    transform = Some(trs);
+                }
+                _ => panic!("Unsupported KHR extension: {}", key),
+            });
+
+        let texture_info = TextureInfo {
             texture: Texture {
-                index: normal_texture.texture().source().index(),
-                tex_coord: normal_texture.tex_coord(),
+                index: texture.texture().index(),
+                tex_coord,
             },
-            scale: normal_texture.scale(),
+            transform,
+        };
+
+        Self {
+            info: texture_info,
+            scale: texture.scale(),
         }
     }
 }
@@ -220,21 +344,25 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
                         .unwrap()
                         .flatten()
                         .collect::<Vec<_>>();
+
+                    let num_verts = positions.len();
+
                     let normals = reader.read_normals().unwrap().flatten().collect::<Vec<_>>();
-                    let texcoords = reader
+                    let texcoords0 = reader
                         .read_tex_coords(0) // TODO: support multiple TEXCOORDs
-                        .unwrap()
-                        .into_f32()
-                        .flatten()
-                        .collect::<Vec<_>>();
+                        .map(|t| t.into_f32().flatten().collect::<Vec<_>>())
+                        .unwrap_or_else(|| vec![0.; num_verts * 2]);
+                    let texcoords1 = reader
+                        .read_tex_coords(1) // TODO: support multiple TEXCOORDs
+                        .map(|t| t.into_f32().flatten().collect::<Vec<_>>())
+                        .unwrap_or_else(|| vec![0.; num_verts * 2]);
 
                     let opt_tangents = reader
                         .read_tangents()
                         .map(|t| t.flatten().collect::<Vec<_>>());
 
-                    let num_verts = positions.len();
                     let need_tangents = opt_tangents.is_none();
-                    let tangents = opt_tangents.unwrap_or_else(|| vec![0f32; num_verts]);
+                    let tangents = opt_tangents.unwrap_or_else(|| vec![0.; num_verts * 4]);
 
                     let indices = reader
                         .read_indices()
@@ -245,13 +373,17 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
                     let vertices = positions
                         .par_chunks_exact(3)
                         .zip(normals.par_chunks_exact(3))
-                        .zip(tangents.par_chunks_exact(3))
-                        .zip(texcoords.par_chunks_exact(2))
-                        .map(|(((position, normal), tangent), texcoord)| CombinedVertex {
-                            position: position.try_into().unwrap(),
-                            normal: normal.try_into().unwrap(),
-                            tangent: tangent.try_into().unwrap(),
-                            texcoord: texcoord.try_into().unwrap(),
+                        .zip(tangents.par_chunks_exact(4))
+                        .zip(texcoords0.par_chunks_exact(2))
+                        .zip(texcoords1.par_chunks_exact(2))
+                        .map(|((((position, normal), tangent), texcoord0), texcoord1)| {
+                            CombinedVertex {
+                                a_position: position.try_into().unwrap(),
+                                a_normal: normal.try_into().unwrap(),
+                                a_tangent: tangent.try_into().unwrap(),
+                                a_texcoord_0: texcoord0.try_into().unwrap(),
+                                a_texcoord_1: texcoord1.try_into().unwrap(),
+                            }
                         })
                         .collect();
 

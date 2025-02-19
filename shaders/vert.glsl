@@ -1,37 +1,33 @@
-#include <animation.glsl>
+#version 450
 
+#include "shared.glsl"
 
-uniform mat4 u_ViewProjectionMatrix;
-uniform mat4 u_ModelMatrix;
-uniform mat4 u_NormalMatrix;
-
-
-in vec3 a_position;
-out vec3 v_Position;
+layout (location = 0) in vec3 a_position;
+layout (location = 0) out vec3 v_Position;
 
 #ifdef HAS_NORMAL_VEC3
-in vec3 a_normal;
+layout (location = 1) in vec3 a_normal;
 #endif
 
 #ifdef HAS_NORMAL_VEC3
 #ifdef HAS_TANGENT_VEC4
-in vec4 a_tangent;
-out mat3 v_TBN;
+layout (location = 2) in vec4 a_tangent;
+layout (location = 5) out mat3 v_TBN;
 #else
-out vec3 v_Normal;
+layout (location = 5) out vec3 v_Normal;
 #endif
 #endif
 
 #ifdef HAS_TEXCOORD_0_VEC2
-in vec2 a_texcoord_0;
+layout (location = 3) in vec2 a_texcoord_0;
 #endif
 
 #ifdef HAS_TEXCOORD_1_VEC2
-in vec2 a_texcoord_1;
+layout (location = 4) in vec2 a_texcoord_1;
 #endif
 
-out vec2 v_texcoord_0;
-out vec2 v_texcoord_1;
+layout (location = 1) out vec2 v_texcoord_0;
+layout (location = 2) out vec2 v_texcoord_1;
 
 #ifdef HAS_COLOR_0_VEC3
 in vec3 a_color_0;
@@ -45,10 +41,6 @@ out vec4 v_Color;
 
 #ifdef USE_INSTANCING
 in mat4 a_instance_model_matrix;
-#endif
-
-#ifdef HAS_VERT_NORMAL_UV_TRANSFORM
-uniform mat3 u_vertNormalUVTransform;
 #endif
 
 vec4 getPosition()
@@ -111,8 +103,8 @@ void main()
     mat4 modelMatrix = a_instance_model_matrix;
     mat4 normalMatrix = transpose(inverse(modelMatrix));
 #else
-    mat4 modelMatrix = u_ModelMatrix;
-    mat4 normalMatrix = u_NormalMatrix;
+    mat4 modelMatrix = object.u_ModelMatrix;
+    mat4 normalMatrix = object.u_NormalMatrix;
 #endif
     vec4 pos = modelMatrix * getPosition();
     v_Position = vec3(pos.xyz) / pos.w;
@@ -125,8 +117,8 @@ void main()
     vec3 bitangentW = cross(normalW, tangentW) * a_tangent.w;
 
 #ifdef HAS_VERT_NORMAL_UV_TRANSFORM
-    tangentW = u_vertNormalUVTransform * tangentW;
-    bitangentW = u_vertNormalUVTransform * bitangentW;
+    tangentW = material.u_vertNormalUVTransform * tangentW;
+    bitangentW = material.u_vertNormalUVTransform * bitangentW;
 #endif
 
     bitangentW = normalize(bitangentW);
@@ -169,5 +161,5 @@ void main()
 #endif
 #endif
 
-    gl_Position = u_ViewProjectionMatrix * pos;
+    gl_Position = camera.u_ViewProjectionMatrix * pos;
 }

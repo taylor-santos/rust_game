@@ -5,25 +5,17 @@ edition = "2021"
 
 [dependencies]
 cgmath = "0.18.0"
-gltf = { version = "1.4.1", features = [
-    "KHR_lights_punctual",
-    "KHR_materials_pbrSpecularGlossiness",
-    "KHR_materials_unlit",
-    "KHR_texture_transform",
-    "KHR_materials_variants",
-    "KHR_materials_volume",
-    "KHR_materials_specular",
-    "KHR_materials_transmission",
-    "KHR_materials_ior",
-    "KHR_materials_emissive_strength",
-] }
+gltf = { version = "1.4.1", features = ["KHR_lights_punctual", "KHR_materials_pbrSpecularGlossiness", "KHR_materials_unlit", "KHR_texture_transform", "KHR_materials_variants", "KHR_materials_volume", "KHR_materials_specular", "KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_emissive_strength", "extensions"] }
 image = "0.25.5"
+ktx2 = "0.3.0"
 mikktspace = "0.3.0"
 rayon = "1.10.0"
 vulkano = "0.35.1"
 vulkano-shaders = "0.35"
 vulkano-util = "0.35.0"
 winit = "0.30"
+zstd = "0.13.2"
+serde_json = "1.0.135"
 
 [profile.dev]
 opt-level = 0

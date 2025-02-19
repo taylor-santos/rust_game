@@ -14,8 +14,49 @@
 // [5] "KHR_materials_clearcoat"
 //     https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_materials_clearcoat
 
+#version 450
+
+#define ALPHAMODE_OPAQUE 0
+#define ALPHAMODE_MASK 1
+#define ALPHAMODE_BLEND 2
+#define DEBUG_NONE 0
+#define DEBUG_NORMAL_SHADING 1
+#define DEBUG_NORMAL_TEXTURE 2
+#define DEBUG_NORMAL_GEOMETRY 3
+#define DEBUG_TANGENT 4
+#define DEBUG_BITANGENT 5
+#define DEBUG_ALPHA 6
+#define DEBUG_UV_0 7
+#define DEBUG_UV_1 8
+#define DEBUG_OCCLUSION 9
+#define DEBUG_EMISSIVE 10
+#define DEBUG_BASE_COLOR 11
+#define DEBUG_ROUGHNESS 12
+#define DEBUG_METALLIC 13
+#define DEBUG_CLEARCOAT_FACTOR 14
+#define DEBUG_CLEARCOAT_ROUGHNESS 15
+#define DEBUG_CLEARCOAT_NORMAL 16
+#define DEBUG_SHEEN_COLOR 17
+#define DEBUG_SHEEN_ROUGHNESS 18
+#define DEBUG_SPECULAR_FACTOR 19
+#define DEBUG_SPECULAR_COLOR 20
+#define DEBUG_TRANSMISSION_FACTOR 21
+#define DEBUG_VOLUME_THICKNESS 22
+#define DEBUG_DIFFUSE_TRANSMISSION_FACTOR 23
+#define DEBUG_DIFFUSE_TRANSMISSION_COLOR_FACTOR 24
+#define DEBUG_IRIDESCENCE_FACTOR 25
+#define DEBUG_IRIDESCENCE_THICKNESS 26
+#define DEBUG_ANISOTROPIC_STRENGTH 27
+#define DEBUG_ANISOTROPIC_DIRECTION 28
+
 precision highp float;
 
+layout (set = 0, binding = 0) uniform Constants {
+    int     u_MipCount;
+    mat3    u_EnvRotation;
+    float   u_EnvIntensity;
+    float   u_Exposure;
+} c;
 
 #include <tonemapping.glsl>
 #include <textures.glsl>
@@ -29,8 +70,7 @@ precision highp float;
 #include <iridescence.glsl>
 #endif
 
-
-out vec4 g_finalColor;
+layout (location = 0) out vec4 g_finalColor;
 
 
 void main()
@@ -42,7 +82,7 @@ void main()
 #endif
     vec3 color = vec3(0);
 
-    vec3 v = normalize(u_Camera - v_Position);
+    vec3 v = normalize(camera.u_Camera - v_Position);
     NormalInfo normalInfo = getNormalInfo(v);
     vec3 n = normalInfo.n;
     vec3 t = normalInfo.t;
@@ -146,7 +186,7 @@ void main()
 #ifdef MATERIAL_DIFFUSE_TRANSMISSION
 #ifdef MATERIAL_VOLUME
     diffuseTransmissionThickness = materialInfo.thickness *
-        (length(vec3(u_ModelMatrix[0].xyz)) + length(vec3(u_ModelMatrix[1].xyz)) + length(vec3(u_ModelMatrix[2].xyz))) / 3.0;
+        (length(vec3(object.u_ModelMatrix[0].xyz)) + length(vec3(object.u_ModelMatrix[1].xyz)) + length(vec3(object.u_ModelMatrix[2].xyz))) / 3.0;
 #endif
 #endif
 
@@ -175,7 +215,7 @@ void main()
         n, v,
         materialInfo.perceptualRoughness,
         baseColor.rgb, materialInfo.f0_dielectric, materialInfo.f90,
-        v_Position, u_ModelMatrix, u_ViewMatrix, u_ProjectionMatrix,
+        v_Position, object.u_ModelMatrix, camera.u_ViewMatrix, camera.u_ProjectionMatrix,
         materialInfo.ior, materialInfo.thickness, materialInfo.attenuationColor, materialInfo.attenuationDistance, materialInfo.dispersion);
     f_diffuse = mix(f_diffuse, f_specular_transmission, materialInfo.transmissionFactor);
 #endif
@@ -218,7 +258,7 @@ void main()
 #ifdef HAS_OCCLUSION_MAP
     float ao = 1.0;
     ao = texture(u_OcclusionSampler,  getOcclusionUV()).r;
-    color = color * (1.0 + u_OcclusionStrength * (ao - 1.0));
+    color = color * (1.0 + mat_samplers.u_OcclusionStrength * (ao - 1.0));
 #endif
 
 #endif //end USE_IBL
@@ -283,7 +323,7 @@ void main()
 #ifdef MATERIAL_TRANSMISSION
         // If the light ray travels through the geometry, use the point it exits the geometry again.
         // That will change the angle to the light source, if the material refracts the light ray.
-        vec3 transmissionRay = getVolumeTransmissionRay(n, v, materialInfo.thickness, materialInfo.ior, u_ModelMatrix);
+        vec3 transmissionRay = getVolumeTransmissionRay(n, v, materialInfo.thickness, materialInfo.ior, object.u_ModelMatrix);
         pointToLight -= transmissionRay;
         l = normalize(pointToLight);
 
@@ -333,9 +373,9 @@ void main()
     }
 #endif // USE_PUNCTUAL
 
-    f_emissive = u_EmissiveFactor;
+    f_emissive = mat_samplers.u_EmissiveFactor;
 #ifdef MATERIAL_EMISSIVE_STRENGTH
-    f_emissive *= u_EmissiveStrength;
+    f_emissive *= material.u_EmissiveStrength;
 #endif
 #ifdef HAS_EMISSIVE_MAP
     f_emissive *= texture(u_EmissiveSampler, getEmissiveUV()).rgb;
@@ -355,7 +395,7 @@ void main()
 
 #if ALPHAMODE == ALPHAMODE_MASK
     // Late discard to avoid sampling artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
-    if (baseColor.a < u_AlphaCutoff)
+    if (baseColor.a < material.u_AlphaCutoff)
     {
         discard;
     }
@@ -462,7 +502,7 @@ vec3 specularTexture = vec3(1.0);
 #ifdef HAS_SPECULAR_COLOR_MAP
     specularTexture.rgb = texture(u_SpecularColorSampler, getSpecularColorUV()).rgb;
 #endif
-    g_finalColor.rgb = u_KHR_materials_specular_specularColorFactor * specularTexture.rgb;
+    g_finalColor.rgb = material.u_KHR_materials_specular_specularColorFactor * specularTexture.rgb;
 #endif
 #endif
 
@@ -499,7 +539,7 @@ vec3 specularTexture = vec3(1.0);
     direction = texture(u_AnisotropySampler, getAnisotropyUV()).xy;
     direction = direction * 2.0 - vec2(1.0); // [0, 1] -> [-1, 1]
 #endif
-    vec2 directionRotation = u_Anisotropy.xy; // cos(theta), sin(theta)
+    vec2 directionRotation = material.u_Anisotropy.xy; // cos(theta), sin(theta)
     mat2 rotationMatrix = mat2(directionRotation.x, directionRotation.y, -directionRotation.y, directionRotation.x);
     direction = (direction + vec2(1.0)) * 0.5; // [-1, 1] -> [0, 1]
 

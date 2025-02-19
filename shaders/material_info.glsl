@@ -1,68 +1,8 @@
-// Metallic Roughness
-uniform float u_MetallicFactor;
-uniform float u_RoughnessFactor;
-uniform vec4 u_BaseColorFactor;
-
-// Specular Glossiness
-uniform vec3 u_SpecularFactor;
-uniform vec4 u_DiffuseFactor;
-uniform float u_GlossinessFactor;
-
-// Sheen
-uniform float u_SheenRoughnessFactor;
-uniform vec3 u_SheenColorFactor;
-
-// Clearcoat
-uniform float u_ClearcoatFactor;
-uniform float u_ClearcoatRoughnessFactor;
-
-// Specular
-uniform vec3 u_KHR_materials_specular_specularColorFactor;
-uniform float u_KHR_materials_specular_specularFactor;
-
-// Transmission
-uniform float u_TransmissionFactor;
-
-// Volume
-uniform float u_ThicknessFactor;
-uniform vec3 u_AttenuationColor;
-uniform float u_AttenuationDistance;
-
-// Iridescence
-uniform float u_IridescenceFactor;
-uniform float u_IridescenceIor;
-uniform float u_IridescenceThicknessMinimum;
-uniform float u_IridescenceThicknessMaximum;
-
-// Diffuse Transmission
-uniform float u_DiffuseTransmissionFactor;
-uniform vec3 u_DiffuseTransmissionColorFactor;
-
-// Emissive Strength
-uniform float u_EmissiveStrength;
-
-// IOR
-uniform float u_Ior;
-
-// Anisotropy
-uniform vec3 u_Anisotropy;
-
-// Dispersion
-uniform float u_Dispersion;
-
-// Alpha mode
-uniform float u_AlphaCutoff;
-
-uniform vec3 u_Camera;
+#include "shared.glsl"
 
 #ifdef MATERIAL_TRANSMISSION
 uniform ivec2 u_ScreenSize;
 #endif
-
-uniform mat4 u_ModelMatrix;
-uniform mat4 u_ViewMatrix;
-uniform mat4 u_ProjectionMatrix;
-
 
 struct MaterialInfo
 {
@@ -171,7 +111,7 @@ NormalInfo getNormalInfo(vec3 v)
     info.ng = ng;
 #ifdef HAS_NORMAL_MAP
     info.ntex = texture(u_NormalSampler, UV).rgb * 2.0 - vec3(1.0);
-    info.ntex *= vec3(u_NormalScale, u_NormalScale, 1.0);
+    info.ntex *= vec3(mat_samplers.u_NormalScale, mat_samplers.u_NormalScale, 1.0);
     info.ntex = normalize(info.ntex);
     info.n = normalize(mat3(t, b, ng) * info.ntex);
 #else
@@ -203,9 +143,9 @@ vec4 getBaseColor()
     vec4 baseColor = vec4(1);
 
 #if defined(MATERIAL_SPECULARGLOSSINESS)
-    baseColor = u_DiffuseFactor;
+    baseColor = material.u_DiffuseFactor;
 #elif defined(MATERIAL_METALLICROUGHNESS)
-    baseColor = u_BaseColorFactor;
+    baseColor = material.u_BaseColorFactor;
 #endif
 
 #if defined(MATERIAL_SPECULARGLOSSINESS) && defined(HAS_DIFFUSE_MAP)
@@ -221,8 +161,8 @@ vec4 getBaseColor()
 #ifdef MATERIAL_SPECULARGLOSSINESS
 MaterialInfo getSpecularGlossinessInfo(MaterialInfo info)
 {
-    info.f0_dielectric = u_SpecularFactor;
-    info.perceptualRoughness = u_GlossinessFactor;
+    info.f0_dielectric = material.u_SpecularFactor;
+    info.perceptualRoughness = material.u_GlossinessFactor;
 
 #ifdef HAS_SPECULAR_GLOSSINESS_MAP
     vec4 sgSample = texture(u_SpecularGlossinessSampler, getSpecularGlossinessUV());
@@ -239,8 +179,8 @@ MaterialInfo getSpecularGlossinessInfo(MaterialInfo info)
 #ifdef MATERIAL_METALLICROUGHNESS
 MaterialInfo getMetallicRoughnessInfo(MaterialInfo info)
 {
-    info.metallic = u_MetallicFactor;
-    info.perceptualRoughness = u_RoughnessFactor;
+    info.metallic = material.u_MetallicFactor;
+    info.perceptualRoughness = material.u_RoughnessFactor;
 
 #ifdef HAS_METALLIC_ROUGHNESS_MAP
     // Roughness is stored in the 'g' channel, metallic is stored in the 'b' channel.
@@ -258,8 +198,8 @@ MaterialInfo getMetallicRoughnessInfo(MaterialInfo info)
 #ifdef MATERIAL_SHEEN
 MaterialInfo getSheenInfo(MaterialInfo info)
 {
-    info.sheenColorFactor = u_SheenColorFactor;
-    info.sheenRoughnessFactor = u_SheenRoughnessFactor;
+    info.sheenColorFactor = material.u_SheenColorFactor;
+    info.sheenRoughnessFactor = material.u_SheenRoughnessFactor;
 
 #ifdef HAS_SHEEN_COLOR_MAP
     vec4 sheenColorSample = texture(u_SheenColorSampler, getSheenColorUV());
@@ -286,8 +226,8 @@ MaterialInfo getSpecularInfo(MaterialInfo info)
     specularTexture.rgb = texture(u_SpecularColorSampler, getSpecularColorUV()).rgb;
 #endif
 
-    info.f0_dielectric = min(info.f0_dielectric * u_KHR_materials_specular_specularColorFactor * specularTexture.rgb, vec3(1.0));
-    info.specularWeight = u_KHR_materials_specular_specularFactor * specularTexture.a;
+    info.f0_dielectric = min(info.f0_dielectric * material.u_KHR_materials_specular_specularColorFactor * specularTexture.rgb, vec3(1.0));
+    info.specularWeight = material.u_KHR_materials_specular_specularFactor * specularTexture.a;
     info.f90_dielectric = vec3(info.specularWeight);
     return info;
 }
@@ -297,7 +237,7 @@ MaterialInfo getSpecularInfo(MaterialInfo info)
 #ifdef MATERIAL_TRANSMISSION
 MaterialInfo getTransmissionInfo(MaterialInfo info)
 {
-    info.transmissionFactor = u_TransmissionFactor;
+    info.transmissionFactor = material.u_TransmissionFactor;
 
 #ifdef HAS_TRANSMISSION_MAP
     vec4 transmissionSample = texture(u_TransmissionSampler, getTransmissionUV());
@@ -305,7 +245,7 @@ MaterialInfo getTransmissionInfo(MaterialInfo info)
 #endif
 
 #ifdef MATERIAL_DISPERSION
-    info.dispersion = u_Dispersion;
+    info.dispersion = material.u_Dispersion;
 #else
     info.dispersion = 0.0;
 #endif
@@ -316,9 +256,9 @@ MaterialInfo getTransmissionInfo(MaterialInfo info)
 #ifdef MATERIAL_VOLUME
 MaterialInfo getVolumeInfo(MaterialInfo info)
 {
-    info.thickness = u_ThicknessFactor;
-    info.attenuationColor = u_AttenuationColor;
-    info.attenuationDistance = u_AttenuationDistance;
+    info.thickness = material.u_ThicknessFactor;
+    info.attenuationColor = material.u_AttenuationColor;
+    info.attenuationDistance = material.u_AttenuationDistance;
 
 #ifdef HAS_THICKNESS_MAP
     vec4 thicknessSample = texture(u_ThicknessSampler, getThicknessUV());
@@ -332,9 +272,9 @@ MaterialInfo getVolumeInfo(MaterialInfo info)
 #ifdef MATERIAL_IRIDESCENCE
 MaterialInfo getIridescenceInfo(MaterialInfo info)
 {
-    info.iridescenceFactor = u_IridescenceFactor;
-    info.iridescenceIor = u_IridescenceIor;
-    info.iridescenceThickness = u_IridescenceThicknessMaximum;
+    info.iridescenceFactor = material.u_IridescenceFactor;
+    info.iridescenceIor = material.u_IridescenceIor;
+    info.iridescenceThickness = material.u_IridescenceThicknessMaximum;
 
     #ifdef HAS_IRIDESCENCE_MAP
         info.iridescenceFactor *= texture(u_IridescenceSampler, getIridescenceUV()).r;
@@ -342,7 +282,7 @@ MaterialInfo getIridescenceInfo(MaterialInfo info)
 
     #ifdef HAS_IRIDESCENCE_THICKNESS_MAP
         float thicknessSampled = texture(u_IridescenceThicknessSampler, getIridescenceThicknessUV()).g;
-        float thickness = mix(u_IridescenceThicknessMinimum, u_IridescenceThicknessMaximum, thicknessSampled);
+        float thickness = mix(material.u_IridescenceThicknessMinimum, material.u_IridescenceThicknessMaximum, thicknessSampled);
         info.iridescenceThickness = thickness;
     #endif
 
@@ -354,8 +294,8 @@ MaterialInfo getIridescenceInfo(MaterialInfo info)
 #ifdef MATERIAL_DIFFUSE_TRANSMISSION
 MaterialInfo getDiffuseTransmissionInfo(MaterialInfo info)
 {
-    info.diffuseTransmissionFactor = u_DiffuseTransmissionFactor;
-    info.diffuseTransmissionColorFactor = u_DiffuseTransmissionColorFactor;
+    info.diffuseTransmissionFactor = material.u_DiffuseTransmissionFactor;
+    info.diffuseTransmissionColorFactor = material.u_DiffuseTransmissionColorFactor;
 
     #ifdef HAS_DIFFUSE_TRANSMISSION_MAP
         info.diffuseTransmissionFactor *= texture(u_DiffuseTransmissionSampler, getDiffuseTransmissionUV()).a;
@@ -373,8 +313,8 @@ MaterialInfo getDiffuseTransmissionInfo(MaterialInfo info)
 #ifdef MATERIAL_CLEARCOAT
 MaterialInfo getClearCoatInfo(MaterialInfo info, NormalInfo normalInfo)
 {
-    info.clearcoatFactor = u_ClearcoatFactor;
-    info.clearcoatRoughness = u_ClearcoatRoughnessFactor;
+    info.clearcoatFactor = material.u_ClearcoatFactor;
+    info.clearcoatRoughness = material.u_ClearcoatRoughnessFactor;
     info.clearcoatF0 = vec3(pow((info.ior - 1.0) / (info.ior + 1.0), 2.0));
     info.clearcoatF90 = vec3(1.0);
 
@@ -398,8 +338,8 @@ MaterialInfo getClearCoatInfo(MaterialInfo info, NormalInfo normalInfo)
 #ifdef MATERIAL_IOR
 MaterialInfo getIorInfo(MaterialInfo info)
 {
-    info.f0_dielectric = vec3(pow(( u_Ior - 1.0) /  (u_Ior + 1.0), 2.0));
-    info.ior = u_Ior;
+    info.f0_dielectric = vec3(pow(( material.u_Ior - 1.0) /  (material.u_Ior + 1.0), 2.0));
+    info.ior = material.u_Ior;
     return info;
 }
 #endif
@@ -414,13 +354,13 @@ MaterialInfo getAnisotropyInfo(MaterialInfo info, NormalInfo normalInfo)
     direction = anisotropySample.xy * 2.0 - vec2(1.0);
     strengthFactor = anisotropySample.z;
 #endif
-    vec2 directionRotation = u_Anisotropy.xy; // cos(theta), sin(theta)
+    vec2 directionRotation = material.u_Anisotropy.xy; // cos(theta), sin(theta)
     mat2 rotationMatrix = mat2(directionRotation.x, directionRotation.y, -directionRotation.y, directionRotation.x);
     direction = rotationMatrix * direction.xy;
 
     info.anisotropicT = mat3(normalInfo.t, normalInfo.b, normalInfo.n) * normalize(vec3(direction, 0.0));
     info.anisotropicB = cross(normalInfo.ng, info.anisotropicT);
-    info.anisotropyStrength = clamp(u_Anisotropy.z * strengthFactor, 0.0, 1.0);
+    info.anisotropyStrength = clamp(material.u_Anisotropy.z * strengthFactor, 0.0, 1.0);
     return info;
 }
 #endif

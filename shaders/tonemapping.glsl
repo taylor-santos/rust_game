@@ -1,6 +1,3 @@
-uniform float u_Exposure;
-
-
 const float GAMMA = 2.2;
 const float INV_GAMMA = 1.0 / GAMMA;
 
@@ -109,7 +106,7 @@ vec3 toneMap_KhronosPbrNeutral( vec3 color )
 
 vec3 toneMap(vec3 color)
 {
-    color *= u_Exposure;
+    color *= c.u_Exposure;
 
 #ifdef TONEMAP_ACES_NARKOWICZ
     color = toneMapACES_Narkowicz(color);
