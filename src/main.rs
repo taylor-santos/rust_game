@@ -16,13 +16,12 @@ use crate::camera::FirstPersonCamera;
 use crate::gltf::{load_gltf, CombinedVertex, Gltf, Object, TextureFormat};
 use crate::material::Material;
 use crate::shader::*;
-use cgmath::{Matrix, Matrix4, Rad, SquareMatrix};
+use cgmath::{Matrix, SquareMatrix};
 use image::{ColorType, DynamicImage, ImageBuffer, ImageReader};
 use ktx2::SupercompressionScheme;
 use rayon::iter::Either;
 use std::cmp::min;
 use std::collections::{HashMap, VecDeque};
-use std::f32::consts::FRAC_PI_4;
 use std::time::{Duration, Instant};
 use std::{error::Error, sync::Arc};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
@@ -48,7 +47,7 @@ use vulkano::padded::Padded;
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::CullMode;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
-use vulkano::pipeline::{Pipeline, PipelineBindPoint};
+use vulkano::pipeline::PipelineBindPoint;
 use vulkano::shader::{DescriptorBindingRequirements, ShaderModule, ShaderStages};
 use vulkano::swapchain::PresentMode;
 use vulkano::{
@@ -609,7 +608,7 @@ impl App {
             //     command_buffer_allocator.clone(),
             //     context.graphics_queue().clone(),
             // )
-            //    .unwrap();
+            // .unwrap();
 
             // let lut_ggx = load_png(
             //     "textures/lut_ggx.png",
@@ -620,43 +619,49 @@ impl App {
             // )
             // .unwrap();
 
-            let lut_charlie = upload_image(
-                &mut image_builder,
-                include_bytes!("../textures/lut_charlie.bin")
+            let lut_charlie = {
+                let bytes: Vec<_> = include_bytes!("../textures/lut_charlie.bin")
                     .chunks_exact(2)
                     .map(|chunk| {
                         let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                         f16::from_bits(bits)
                     })
-                    .collect::<Vec<_>>(),
-                [1024, 1024, 1],
-                1,
-                1,
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                context.graphics_queue().clone(),
-                Format::R16G16B16A16_SFLOAT,
-            )
-            .unwrap();
+                    .collect();
+                upload_image(
+                    &mut image_builder,
+                    bytes,
+                    [1024, 1024, 1],
+                    1,
+                    1,
+                    memory_allocator.clone(),
+                    command_buffer_allocator.clone(),
+                    context.graphics_queue().clone(),
+                    Format::R16G16B16A16_SFLOAT,
+                )
+                .unwrap()
+            };
 
-            let lut_ggx = upload_image(
-                &mut image_builder,
-                include_bytes!("../textures/lut_ggx.bin")
+            let lut_ggx = {
+                let bytes: Vec<_> = include_bytes!("../textures/lut_ggx.bin")
                     .chunks_exact(2)
                     .map(|chunk| {
                         let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                         f16::from_bits(bits)
                     })
-                    .collect::<Vec<_>>(),
-                [1024, 1024, 1],
-                1,
-                1,
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                context.graphics_queue().clone(),
-                Format::R16G16B16A16_SFLOAT,
-            )
-            .unwrap();
+                    .collect();
+                upload_image(
+                    &mut image_builder,
+                    bytes,
+                    [1024, 1024, 1],
+                    1,
+                    1,
+                    memory_allocator.clone(),
+                    command_buffer_allocator.clone(),
+                    context.graphics_queue().clone(),
+                    Format::R16G16B16A16_SFLOAT,
+                )
+                .unwrap()
+            };
 
             let lut_sheen_e = load_png(
                 "textures/lut_sheen_E.png",
@@ -866,6 +871,82 @@ struct PipelineContext {
     draw_infos: Vec<PrimitiveDrawInfo>,
 }
 
+impl PipelineContext {
+    pub fn render(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        pipeline_layout: Arc<PipelineLayout>,
+        objects: &Vec<Object>,
+    ) {
+        builder
+            .bind_pipeline_graphics(self.pipeline.clone())
+            .unwrap();
+
+        builder
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                pipeline_layout.clone(),
+                0,
+                self.const_set.clone(),
+            )
+            .unwrap();
+        builder
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                pipeline_layout.clone(),
+                2,
+                self.skybox_set.clone(),
+            )
+            .unwrap();
+
+        for prim in &self.draw_infos {
+            let (mat_set, tex_set) = self.material_sets[&prim.mat_idx].clone();
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipeline_layout.clone(),
+                    3,
+                    mat_set,
+                )
+                .unwrap();
+
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipeline_layout.clone(),
+                    4,
+                    tex_set,
+                )
+                .unwrap();
+
+            for obj_idx in &prim.object_ids {
+                let object = &objects[*obj_idx];
+                let model = object.transform;
+                let normal = model.transpose().invert().unwrap();
+                let data = fs::Object {
+                    u_ModelMatrix: model.into(),
+                    u_NormalMatrix: normal.into(),
+                };
+                builder
+                    .push_constants(pipeline_layout.clone(), 0, data)
+                    .unwrap();
+
+                unsafe {
+                    // We add a draw command.
+                    builder.draw_indexed(
+                        prim.index_count,
+                        1,
+                        prim.index_offset,
+                        prim.vertex_offset,
+                        0,
+                    )
+                }
+                .unwrap();
+            }
+        }
+    }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(primary_window_id) = self.windows.primary_window_id() {
@@ -936,7 +1017,10 @@ impl ApplicationHandler for App {
                     DescriptorType::UniformBuffer, // binding = 1 uniform MatSamplers
                 ],
                 // set = 4
-                vec![DescriptorType::CombinedImageSampler; 22], // Texture Samplers
+                vec![DescriptorType::CombinedImageSampler; 21], // Texture Samplers
+                                                                // set = 5
+                                                                // TODO: re-enable when transmission works
+                                                                // vec![DescriptorType::CombinedImageSampler], // Framebuffer Sampler
             ];
 
             let push_constant_ranges = vec![PushConstantRange {
@@ -1115,27 +1199,25 @@ impl ApplicationHandler for App {
                         mat.specular.as_ref().and_then(|s| s.color_texture.as_ref()),
                         // (set = 4, binding = 14) u_TransmissionSampler
                         mat.transmission.as_ref().and_then(|t| t.texture.as_ref()),
-                        // (set = 4, binding = 15) u_TransmissionFramebufferSampler
-                        None, // TODO
-                        // (set = 4, binding = 16) u_ThicknessSampler
+                        // (set = 4, binding = 15) u_ThicknessSampler
                         mat.volume
                             .as_ref()
                             .and_then(|v| v.thickness_texture.as_ref()),
-                        // (set = 4, binding = 17) u_IridescenceSampler
+                        // (set = 4, binding = 16) u_IridescenceSampler
                         mat.iridescence.as_ref().and_then(|i| i.texture.as_ref()),
-                        // (set = 4, binding = 18) u_IridescenceThicknessSampler
+                        // (set = 4, binding = 17) u_IridescenceThicknessSampler
                         mat.iridescence
                             .as_ref()
                             .and_then(|i| i.thickness_texture.as_ref()),
-                        // (set = 4, binding = 19) u_DiffuseTransmissionSampler
+                        // (set = 4, binding = 18) u_DiffuseTransmissionSampler
                         mat.diffuse_transmission
                             .as_ref()
                             .and_then(|d| d.texture.as_ref()),
-                        // (set = 4, binding = 20) u_DiffuseTransmissionColorSampler
+                        // (set = 4, binding = 19) u_DiffuseTransmissionColorSampler
                         mat.diffuse_transmission
                             .as_ref()
                             .and_then(|d| d.color_texture.as_ref()),
-                        // (set = 4, binding = 21) u_AnisotropySampler
+                        // (set = 4, binding = 20) u_AnisotropySampler
                         mat.anisotropy.as_ref().and_then(|a| a.texture.as_ref()),
                     ]
                     .map(|opt_t| opt_t.map(|t| &self.textures[t.texture.index]));
@@ -1226,6 +1308,15 @@ impl ApplicationHandler for App {
             pipelines
         };
 
+        println!("Rendering {} material variants:", pipelines.len());
+        for (idx, (k, v)) in pipelines.iter().enumerate() {
+            println!(" {}) {}", idx + 1, k);
+            println!("\tWith {} object variants:", v.keys().len());
+            for (idx, k) in v.keys().enumerate() {
+                println!("\t {}) {}", idx + 1, k);
+            }
+        }
+
         self.rcx = Some(RenderContext {
             attachment_image_views,
             depth_image_view,
@@ -1305,8 +1396,6 @@ impl ApplicationHandler for App {
                     let frame_time = total_time / rcx.frame_times.len() as u32;
                     let fps = rcx.frame_times.len() as f64 / total_time.as_secs_f64();
                     println!("{} fps ({:.2?})", fps as u32, frame_time);
-                    // dbg!(self.camera.position);
-                    // dbg!(self.camera.get_view_matrix());
                     rcx.frame_times.clear();
                 }
                 rcx.frame_times.push_back(frame_start);
@@ -1431,24 +1520,9 @@ impl ApplicationHandler for App {
                     .unwrap();
 
                 {
-                    let proj = {
-                        let aspect_ratio = window_size.width as f32 / window_size.height as f32;
-                        let near = 0.005;
-                        let far = 10000.0;
-
-                        let proj = cgmath::perspective(Rad(FRAC_PI_4), aspect_ratio, near, far);
-                        // Vulkan clip space has inverted Y and half Z, compared with OpenGL.
-                        // A corrective transformation is needed to make an OpenGL perspective matrix
-                        // work properly. See here for more info:
-                        // https://matthewwellings.com/blog/the-new-vulkan-coordinate-system/
-                        let correction = Matrix4::<f32>::new(
-                            1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
-                            0.5, 1.0,
-                        );
-
-                        correction * proj
-                    };
-                    let view = self.camera.get_view_matrix();
+                    let aspect_ratio = window_size.width as f32 / window_size.height as f32;
+                    let proj = self.camera.projection_matrix(aspect_ratio);
+                    let view = self.camera.view_matrix();
                     let position = self.camera.position;
                     let view_proj = proj * view;
 
@@ -1481,74 +1555,12 @@ impl ApplicationHandler for App {
                         .unwrap();
                 }
 
-                for obj_pipelines in rcx.pipelines.values() {
+                for (mat_specs, obj_pipelines) in &rcx.pipelines {
+                    if !mat_specs.is_opaque() {
+                        continue;
+                    }
                     for pcx in obj_pipelines.values() {
-                        builder
-                            .bind_pipeline_graphics(pcx.pipeline.clone())
-                            .unwrap();
-
-                        builder
-                            .bind_descriptor_sets(
-                                PipelineBindPoint::Graphics,
-                                rcx.pipeline_layout.clone(),
-                                0,
-                                pcx.const_set.clone(),
-                            )
-                            .unwrap();
-                        builder
-                            .bind_descriptor_sets(
-                                PipelineBindPoint::Graphics,
-                                rcx.pipeline_layout.clone(),
-                                2,
-                                pcx.skybox_set.clone(),
-                            )
-                            .unwrap();
-
-                        for prim in &pcx.draw_infos {
-                            let (mat_set, tex_set) = pcx.material_sets[&prim.mat_idx].clone();
-                            builder
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Graphics,
-                                    rcx.pipeline_layout.clone(),
-                                    3,
-                                    mat_set,
-                                )
-                                .unwrap();
-
-                            builder
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Graphics,
-                                    rcx.pipeline_layout.clone(),
-                                    4,
-                                    tex_set,
-                                )
-                                .unwrap();
-
-                            for obj_idx in &prim.object_ids {
-                                let object = &self.objects[*obj_idx];
-                                let model = object.transform;
-                                let normal = model.transpose().invert().unwrap();
-                                let data = fs::Object {
-                                    u_ModelMatrix: model.into(),
-                                    u_NormalMatrix: normal.into(),
-                                };
-                                builder
-                                    .push_constants(rcx.pipeline_layout.clone(), 0, data)
-                                    .unwrap();
-
-                                unsafe {
-                                    // We add a draw command.
-                                    builder.draw_indexed(
-                                        prim.index_count,
-                                        1,
-                                        prim.index_offset,
-                                        prim.vertex_offset,
-                                        0,
-                                    )
-                                }
-                                .unwrap();
-                            }
-                        }
+                        pcx.render(&mut builder, rcx.pipeline_layout.clone(), &self.objects);
                     }
                 }
 

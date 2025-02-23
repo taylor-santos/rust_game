@@ -8,6 +8,10 @@ layout (set = 2, binding = 4) uniform sampler2D     u_CharlieLUT;
 layout (set = 2, binding = 5) uniform sampler2D     u_SheenELUT;
 
 
+// TODO: re-enable when transmission works
+// layout (set = 5, binding = 0) uniform sampler2D u_TransmissionFramebufferSampler;
+
+
 // General Material
 
 layout (set = 3, binding = 1) uniform MatSamplers {
@@ -254,7 +258,6 @@ vec2 getSpecularColorUV()
 // Transmission Material
 
 layout (set = 4, binding = 14) uniform sampler2D u_TransmissionSampler;
-layout (set = 4, binding = 15) uniform sampler2D u_TransmissionFramebufferSampler;
 
 vec2 getTransmissionUV()
 {
@@ -268,7 +271,7 @@ vec2 getTransmissionUV()
 
 // Volume Material
 
-layout (set = 4, binding = 16) uniform sampler2D u_ThicknessSampler;
+layout (set = 4, binding = 15) uniform sampler2D u_ThicknessSampler;
 
 vec2 getThicknessUV()
 {
@@ -282,8 +285,8 @@ vec2 getThicknessUV()
 
 // Iridescence
 
-layout (set = 4, binding = 17) uniform sampler2D u_IridescenceSampler;
-layout (set = 4, binding = 18) uniform sampler2D u_IridescenceThicknessSampler;
+layout (set = 4, binding = 16) uniform sampler2D u_IridescenceSampler;
+layout (set = 4, binding = 17) uniform sampler2D u_IridescenceThicknessSampler;
 
 vec2 getIridescenceUV()
 {
@@ -306,8 +309,8 @@ vec2 getIridescenceThicknessUV()
 
 // Diffuse Transmission
 
-layout (set = 4, binding = 19) uniform sampler2D u_DiffuseTransmissionSampler;
-layout (set = 4, binding = 20) uniform sampler2D u_DiffuseTransmissionColorSampler;
+layout (set = 4, binding = 18) uniform sampler2D u_DiffuseTransmissionSampler;
+layout (set = 4, binding = 19) uniform sampler2D u_DiffuseTransmissionColorSampler;
 
 vec2 getDiffuseTransmissionUV()
 {
@@ -329,7 +332,7 @@ vec2 getDiffuseTransmissionColorUV()
 
 // Anisotropy
 
-layout (set = 4, binding = 21) uniform sampler2D u_AnisotropySampler;
+layout (set = 4, binding = 20) uniform sampler2D u_AnisotropySampler;
 
 vec2 getAnisotropyUV()
 {

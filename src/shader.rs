@@ -1,4 +1,5 @@
 use crate::material::{AlphaMode, Material, TextureTransform};
+use std::fmt::Formatter;
 use vulkano::shader::SpecializationConstant;
 
 pub mod vs {
@@ -162,7 +163,7 @@ impl From<&Material> for fs::MatSamplers {
 
             u_TransmissionUVSet: 0.into(), // TODO
             u_TransmissionUVTransform: TextureTransform::default().into(), // TODO
-            u_TransmissionFramebufferSize: [0; 2].into(),
+            u_TransmissionFramebufferSize: [0; 2].into(), // TODO
 
             u_ThicknessUVSet: unwrap!(mat.volume?.thickness_texture?.tex_coord()),
             u_ThicknessUVTransform: unwrap!(mat.volume?.thickness_texture?.transform?),
@@ -312,6 +313,19 @@ pub struct MaterialSpecializationConstants {
     pub MATERIAL_EMISSIVE_STRENGTH: bool,
 }
 
+impl MaterialSpecializationConstants {
+    pub fn is_opaque(&self) -> bool {
+        !self.ALPHAMODE_BLEND && !self.MATERIAL_TRANSMISSION
+    }
+    pub fn is_transparent(&self) -> bool {
+        self.ALPHAMODE_BLEND && !self.MATERIAL_TRANSMISSION
+    }
+
+    pub fn is_transmission(&self) -> bool {
+        self.MATERIAL_TRANSMISSION
+    }
+}
+
 impl From<SpecializationConstants> for Vec<(u32, SpecializationConstant)> {
     fn from(constants: SpecializationConstants) -> Vec<(u32, SpecializationConstant)> {
         [
@@ -403,6 +417,288 @@ impl From<SpecializationConstants> for Vec<(u32, SpecializationConstant)> {
         .enumerate()
         .map(|(i, v)| (i as u32, v.into()))
         .collect()
+    }
+}
+
+impl std::fmt::Display for ObjectSpecializationConstants {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut sep = "";
+        let delim = " ";
+        if self.HAS_NORMAL_VEC3 {
+            write!(f, "{}HAS_NORMAL_VEC3", sep)?;
+            sep = delim;
+        }
+        if self.HAS_TANGENT_VEC4 {
+            write!(f, "{}HAS_TANGENT_VEC4", sep)?;
+            sep = delim;
+        }
+        if self.HAS_TEXCOORD_0_VEC2 {
+            write!(f, "{}HAS_TEXCOORD_0_VEC2", sep)?;
+            sep = delim;
+        }
+        if self.HAS_TEXCOORD_1_VEC2 {
+            write!(f, "{}HAS_TEXCOORD_1_VEC2", sep)?;
+            sep = delim;
+        }
+        if self.HAS_COLOR_0_VEC3 {
+            write!(f, "{}HAS_COLOR_0_VEC3", sep)?;
+            sep = delim;
+        }
+        if self.HAS_COLOR_0_VEC4 {
+            write!(f, "{}HAS_COLOR_0_VEC4", sep)?;
+            sep = delim;
+        }
+        if self.NOT_TRIANGLE {
+            write!(f, "{}NOT_TRIANGLE", sep)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for MaterialSpecializationConstants {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut sep = "";
+        let delim = " ";
+        if self.ALPHAMODE_OPAQUE {
+            write!(f, "{}ALPHAMODE_OPAQUE", sep)?;
+            sep = delim;
+        }
+        if self.ALPHAMODE_MASK {
+            write!(f, "{}ALPHAMODE_MASK", sep)?;
+            sep = delim;
+        }
+        if self.ALPHAMODE_BLEND {
+            write!(f, "{}ALPHAMODE_BLEND", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_UNLIT {
+            write!(f, "{}MATERIAL_UNLIT", sep)?;
+            sep = delim;
+        }
+        if self.HAS_NORMAL_MAP {
+            write!(f, "{}HAS_NORMAL_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_NORMAL_UV_TRANSFORM {
+            write!(f, "{}HAS_NORMAL_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_VERT_NORMAL_UV_TRANSFORM {
+            write!(f, "{}HAS_VERT_NORMAL_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_EMISSIVE_MAP {
+            write!(f, "{}HAS_EMISSIVE_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_EMISSIVE_UV_TRANSFORM {
+            write!(f, "{}HAS_EMISSIVE_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_OCCLUSION_MAP {
+            write!(f, "{}HAS_OCCLUSION_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_OCCLUSION_UV_TRANSFORM {
+            write!(f, "{}HAS_OCCLUSION_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_BASE_COLOR_MAP {
+            write!(f, "{}HAS_BASE_COLOR_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_BASECOLOR_UV_TRANSFORM {
+            write!(f, "{}HAS_BASECOLOR_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_METALLICROUGHNESS {
+            write!(f, "{}MATERIAL_METALLICROUGHNESS", sep)?;
+            sep = delim;
+        }
+        if self.HAS_METALLIC_ROUGHNESS_MAP {
+            write!(f, "{}HAS_METALLIC_ROUGHNESS_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_METALLICROUGHNESS_UV_TRANSFORM {
+            write!(f, "{}HAS_METALLICROUGHNESS_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_SHEEN {
+            write!(f, "{}MATERIAL_SHEEN", sep)?;
+            sep = delim;
+        }
+        if self.HAS_SHEEN_COLOR_MAP {
+            write!(f, "{}HAS_SHEEN_COLOR_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_SHEENCOLOR_UV_TRANSFORM {
+            write!(f, "{}HAS_SHEENCOLOR_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_SHEEN_ROUGHNESS_MAP {
+            write!(f, "{}HAS_SHEEN_ROUGHNESS_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_SHEENROUGHNESS_UV_TRANSFORM {
+            write!(f, "{}HAS_SHEENROUGHNESS_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_SPECULARGLOSSINESS {
+            write!(f, "{}MATERIAL_SPECULARGLOSSINESS", sep)?;
+            sep = delim;
+        }
+        if self.HAS_DIFFUSE_MAP {
+            write!(f, "{}HAS_DIFFUSE_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_DIFFUSE_UV_TRANSFORM {
+            write!(f, "{}HAS_DIFFUSE_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_SPECULAR_GLOSSINESS_MAP {
+            write!(f, "{}HAS_SPECULAR_GLOSSINESS_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_SPECULARGLOSSINESS_UV_TRANSFORM {
+            write!(f, "{}HAS_SPECULARGLOSSINESS_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_CLEARCOAT {
+            write!(f, "{}MATERIAL_CLEARCOAT", sep)?;
+            sep = delim;
+        }
+        if self.HAS_CLEARCOAT_MAP {
+            write!(f, "{}HAS_CLEARCOAT_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_CLEARCOAT_UV_TRANSFORM {
+            write!(f, "{}HAS_CLEARCOAT_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_CLEARCOAT_ROUGHNESS_MAP {
+            write!(f, "{}HAS_CLEARCOAT_ROUGHNESS_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_CLEARCOATROUGHNESS_UV_TRANSFORM {
+            write!(f, "{}HAS_CLEARCOATROUGHNESS_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_CLEARCOAT_NORMAL_MAP {
+            write!(f, "{}HAS_CLEARCOAT_NORMAL_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_CLEARCOATNORMAL_UV_TRANSFORM {
+            write!(f, "{}HAS_CLEARCOATNORMAL_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_SPECULAR {
+            write!(f, "{}MATERIAL_SPECULAR", sep)?;
+            sep = delim;
+        }
+        if self.HAS_SPECULAR_MAP {
+            write!(f, "{}HAS_SPECULAR_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_SPECULAR_UV_TRANSFORM {
+            write!(f, "{}HAS_SPECULAR_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_SPECULAR_COLOR_MAP {
+            write!(f, "{}HAS_SPECULAR_COLOR_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_SPECULARCOLOR_UV_TRANSFORM {
+            write!(f, "{}HAS_SPECULARCOLOR_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_TRANSMISSION {
+            write!(f, "{}MATERIAL_TRANSMISSION", sep)?;
+            sep = delim;
+        }
+        if self.HAS_TRANSMISSION_MAP {
+            write!(f, "{}HAS_TRANSMISSION_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_TRANSMISSION_UV_TRANSFORM {
+            write!(f, "{}HAS_TRANSMISSION_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_VOLUME {
+            write!(f, "{}MATERIAL_VOLUME", sep)?;
+            sep = delim;
+        }
+        if self.HAS_THICKNESS_MAP {
+            write!(f, "{}HAS_THICKNESS_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_THICKNESS_UV_TRANSFORM {
+            write!(f, "{}HAS_THICKNESS_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_IRIDESCENCE {
+            write!(f, "{}MATERIAL_IRIDESCENCE", sep)?;
+            sep = delim;
+        }
+        if self.HAS_IRIDESCENCE_MAP {
+            write!(f, "{}HAS_IRIDESCENCE_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_IRIDESCENCE_UV_TRANSFORM {
+            write!(f, "{}HAS_IRIDESCENCE_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_IRIDESCENCE_THICKNESS_MAP {
+            write!(f, "{}HAS_IRIDESCENCE_THICKNESS_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_IRIDESCENCETHICKNESS_UV_TRANSFORM {
+            write!(f, "{}HAS_IRIDESCENCETHICKNESS_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_DIFFUSE_TRANSMISSION {
+            write!(f, "{}MATERIAL_DIFFUSE_TRANSMISSION", sep)?;
+            sep = delim;
+        }
+        if self.HAS_DIFFUSE_TRANSMISSION_MAP {
+            write!(f, "{}HAS_DIFFUSE_TRANSMISSION_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_DIFFUSETRANSMISSION_UV_TRANSFORM {
+            write!(f, "{}HAS_DIFFUSETRANSMISSION_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.HAS_DIFFUSE_TRANSMISSION_COLOR_MAP {
+            write!(f, "{}HAS_DIFFUSE_TRANSMISSION_COLOR_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_DIFFUSETRANSMISSIONCOLOR_UV_TRANSFORM {
+            write!(f, "{}HAS_DIFFUSETRANSMISSIONCOLOR_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_ANISOTROPY {
+            write!(f, "{}MATERIAL_ANISOTROPY", sep)?;
+            sep = delim;
+        }
+        if self.HAS_ANISOTROPY_MAP {
+            write!(f, "{}HAS_ANISOTROPY_MAP", sep)?;
+            sep = delim;
+        }
+        if self.HAS_ANISOTROPY_UV_TRANSFORM {
+            write!(f, "{}HAS_ANISOTROPY_UV_TRANSFORM", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_IOR {
+            write!(f, "{}MATERIAL_IOR", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_DISPERSION {
+            write!(f, "{}MATERIAL_DISPERSION", sep)?;
+            sep = delim;
+        }
+        if self.MATERIAL_EMISSIVE_STRENGTH {
+            write!(f, "{}MATERIAL_EMISSIVE_STRENGTH", sep)?;
+        }
+        Ok(())
     }
 }
 

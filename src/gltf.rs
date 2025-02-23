@@ -8,6 +8,9 @@ use gltf::texture::Info;
 use gltf::Error;
 use rayon::iter::Either;
 use rayon::prelude::*;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
 use std::time::Instant;
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex;
@@ -615,13 +618,20 @@ pub struct TextureMap {
     pub usage: Option<TextureUsage>,
 }
 
-pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
+pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
     let mut start_time = Instant::now();
-    let (doc, buffers, textures) = gltf::import(path)?;
+    let f = File::open(&path)?;
+    let reader = BufReader::new(f);
+    let gltf::Gltf { document, blob } = gltf::Gltf::from_reader_without_validation(reader)?;
+    let base = path.as_ref().parent().unwrap_or_else(|| Path::new("./"));
+    let buffers = gltf::import_buffers(&document, Some(base), blob)?;
+
+    let textures = gltf::import_images(&document, Some(base), &buffers)?;
+
     println!("Loaded gltf in {:?}", start_time.elapsed());
     start_time = Instant::now();
 
-    let mut texture_maps: Vec<_> = doc
+    let mut texture_maps: Vec<_> = document
         .textures()
         .map(|tex| TextureMap {
             index: tex.source().unwrap().index(),
@@ -629,7 +639,7 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
         })
         .collect();
 
-    let materials: Vec<Material> = doc.materials().map(Into::into).collect();
+    let materials: Vec<Material> = document.materials().map(Into::into).collect();
     println!(
         "Loaded {} materials in {:?}",
         materials.len(),
@@ -739,7 +749,7 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
 
     start_time = Instant::now();
 
-    let nodes = doc
+    let nodes = document
         .nodes()
         .map(|node| {
             (
@@ -754,7 +764,7 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
 
     let mut objects = Vec::new();
     {
-        let mut stack = doc
+        let mut stack = document
             .scenes()
             .flat_map(|scene| {
                 scene
@@ -781,7 +791,7 @@ pub fn load_gltf(path: &str) -> Result<Gltf, Error> {
         }
     }
 
-    let meshes = doc
+    let meshes = document
         .meshes()
         .collect::<Vec<_>>()
         .par_iter()
