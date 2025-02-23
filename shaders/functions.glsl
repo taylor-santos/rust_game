@@ -1,31 +1,18 @@
 const float M_PI = 3.141592653589793;
 
 
-layout (location = 0) in vec3 v_Position;
-layout (location = 3) in vec3 v_Normal;
-layout (location = 4) in mat3 v_TBN;
-
-
-#ifdef HAS_COLOR_0_VEC3
-in vec3 v_Color;
-#endif
-#ifdef HAS_COLOR_0_VEC4
-in vec4 v_Color;
-#endif
-
-
 vec4 getVertexColor()
 {
-   vec4 color = vec4(1.0);
+    vec4 color = vec4(1.0);
 
-#ifdef HAS_COLOR_0_VEC3
-    color.rgb = v_Color.rgb;
-#endif
-#ifdef HAS_COLOR_0_VEC4
-    color = v_Color;
-#endif
+    if (HAS_COLOR_0_VEC3) {
+        color.rgb = v_Color.rgb;
+    }
+    if (HAS_COLOR_0_VEC4) {
+        color = v_Color;
+    }
 
-   return color;
+    return color;
 }
 
 

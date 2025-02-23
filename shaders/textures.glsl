@@ -2,8 +2,8 @@
 
 layout (set = 2, binding = 0) uniform samplerCube   u_LambertianEnvSampler;
 layout (set = 2, binding = 1) uniform samplerCube   u_GGXEnvSampler;
-layout (set = 2, binding = 2) uniform sampler2D     u_GGXLUT;
-layout (set = 2, binding = 3) uniform samplerCube   u_CharlieEnvSampler;
+layout (set = 2, binding = 2) uniform samplerCube   u_CharlieEnvSampler;
+layout (set = 2, binding = 3) uniform sampler2D     u_GGXLUT;
 layout (set = 2, binding = 4) uniform sampler2D     u_CharlieLUT;
 layout (set = 2, binding = 5) uniform sampler2D     u_SheenELUT;
 
@@ -19,8 +19,8 @@ layout (set = 3, binding = 1) uniform MatSamplers {
     int         u_EmissiveUVSet;
     mat3        u_EmissiveUVTransform;
 
-    int         u_OcclusionUVSet;
     float       u_OcclusionStrength;
+    int         u_OcclusionUVSet;
     mat3        u_OcclusionUVTransform;
 
     int         u_BaseColorUVSet;
@@ -60,10 +60,10 @@ layout (set = 3, binding = 1) uniform MatSamplers {
     int         u_ThicknessUVSet;
     mat3        u_ThicknessUVTransform;
 
-    int          u_IridescenceUVSet;
-    mat3         u_IridescenceUVTransform;
-    int          u_IridescenceThicknessUVSet;
-    mat3         u_IridescenceThicknessUVTransform;
+    int         u_IridescenceUVSet;
+    mat3        u_IridescenceUVTransform;
+    int         u_IridescenceThicknessUVSet;
+    mat3        u_IridescenceThicknessUVTransform;
 
     int         u_DiffuseTransmissionUVSet;
     mat3        u_DiffuseTransmissionUVTransform;
@@ -78,18 +78,13 @@ layout (set = 4, binding = 0) uniform sampler2D u_NormalSampler;
 layout (set = 4, binding = 1) uniform sampler2D u_EmissiveSampler;
 layout (set = 4, binding = 2) uniform sampler2D u_OcclusionSampler;
 
-
-layout (location = 1) in vec2 v_texcoord_0;
-layout (location = 2) in vec2 v_texcoord_1;
-
-
 vec2 getNormalUV()
 {
     vec3 uv = vec3(s.u_NormalUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
 
-#ifdef HAS_NORMAL_UV_TRANSFORM
-    uv = s.u_NormalUVTransform * uv;
-#endif
+    if (HAS_NORMAL_UV_TRANSFORM) {
+        uv = s.u_NormalUVTransform * uv;
+    }
 
     return uv.xy;
 }
@@ -99,9 +94,9 @@ vec2 getEmissiveUV()
 {
     vec3 uv = vec3(s.u_EmissiveUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
 
-#ifdef HAS_EMISSIVE_UV_TRANSFORM
-    uv = s.u_EmissiveUVTransform * uv;
-#endif
+    if (HAS_EMISSIVE_UV_TRANSFORM) {
+        uv = s.u_EmissiveUVTransform * uv;
+    }
 
     return uv.xy;
 }
@@ -111,9 +106,9 @@ vec2 getOcclusionUV()
 {
     vec3 uv = vec3(s.u_OcclusionUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
 
-#ifdef HAS_OCCLUSION_UV_TRANSFORM
-    uv = s.u_OcclusionUVTransform * uv;
-#endif
+    if (HAS_OCCLUSION_UV_TRANSFORM) {
+        uv = s.u_OcclusionUVTransform * uv;
+    }
 
     return uv.xy;
 }
@@ -128,9 +123,9 @@ vec2 getBaseColorUV()
 {
     vec3 uv = vec3(s.u_BaseColorUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
 
-#ifdef HAS_BASECOLOR_UV_TRANSFORM
-    uv = s.u_BaseColorUVTransform * uv;
-#endif
+    if (HAS_BASECOLOR_UV_TRANSFORM) {
+        uv = s.u_BaseColorUVTransform * uv;
+    }
 
     return uv.xy;
 }
@@ -139,9 +134,9 @@ vec2 getMetallicRoughnessUV()
 {
     vec3 uv = vec3(s.u_MetallicRoughnessUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
 
-#ifdef HAS_METALLICROUGHNESS_UV_TRANSFORM
-    uv = s.u_MetallicRoughnessUVTransform * uv;
-#endif
+    if (HAS_METALLICROUGHNESS_UV_TRANSFORM) {
+        uv = s.u_MetallicRoughnessUVTransform * uv;
+    }
 
     return uv.xy;
 }
@@ -155,9 +150,9 @@ vec2 getSpecularGlossinessUV()
 {
     vec3 uv = vec3(s.u_SpecularGlossinessUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
 
-#ifdef HAS_SPECULARGLOSSINESS_UV_TRANSFORM
-    uv = s.u_SpecularGlossinessUVTransform * uv;
-#endif
+    if (HAS_SPECULARGLOSSINESS_UV_TRANSFORM) {
+        uv = s.u_SpecularGlossinessUVTransform * uv;
+    }
 
     return uv.xy;
 }
@@ -166,9 +161,9 @@ vec2 getDiffuseUV()
 {
     vec3 uv = vec3(s.u_DiffuseUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
 
-#ifdef HAS_DIFFUSE_UV_TRANSFORM
-    uv = s.u_DiffuseUVTransform * uv;
-#endif
+    if (HAS_DIFFUSE_UV_TRANSFORM) {
+        uv = s.u_DiffuseUVTransform * uv;
+    }
 
     return uv.xy;
 }
@@ -183,27 +178,27 @@ layout (set = 4, binding = 9) uniform sampler2D u_ClearcoatNormalSampler;
 vec2 getClearcoatUV()
 {
     vec3 uv = vec3(s.u_ClearcoatUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_CLEARCOAT_UV_TRANSFORM
-    uv = s.u_ClearcoatUVTransform * uv;
-#endif
+    if (HAS_CLEARCOAT_UV_TRANSFORM) {
+        uv = s.u_ClearcoatUVTransform * uv;
+    }
     return uv.xy;
 }
 
 vec2 getClearcoatRoughnessUV()
 {
     vec3 uv = vec3(s.u_ClearcoatRoughnessUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_CLEARCOATROUGHNESS_UV_TRANSFORM
-    uv = s.u_ClearcoatRoughnessUVTransform * uv;
-#endif
+    if (HAS_CLEARCOATROUGHNESS_UV_TRANSFORM) {
+        uv = s.u_ClearcoatRoughnessUVTransform * uv;
+    }
     return uv.xy;
 }
 
 vec2 getClearcoatNormalUV()
 {
     vec3 uv = vec3(s.u_ClearcoatNormalUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_CLEARCOATNORMAL_UV_TRANSFORM
-    uv = s.u_ClearcoatNormalUVTransform * uv;
-#endif
+    if (HAS_CLEARCOATNORMAL_UV_TRANSFORM) {
+        uv = s.u_ClearcoatNormalUVTransform * uv;
+    }
     return uv.xy;
 }
 
@@ -216,18 +211,18 @@ layout (set = 4, binding = 11) uniform sampler2D u_SheenRoughnessSampler;
 vec2 getSheenColorUV()
 {
     vec3 uv = vec3(s.u_SheenColorUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_SHEENCOLOR_UV_TRANSFORM
-    uv = s.u_SheenColorUVTransform * uv;
-#endif
+    if (HAS_SHEENCOLOR_UV_TRANSFORM) {
+        uv = s.u_SheenColorUVTransform * uv;
+    }
     return uv.xy;
 }
 
 vec2 getSheenRoughnessUV()
 {
     vec3 uv = vec3(s.u_SheenRoughnessUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_SHEENROUGHNESS_UV_TRANSFORM
-    uv = s.u_SheenRoughnessUVTransform * uv;
-#endif
+    if (HAS_SHEENROUGHNESS_UV_TRANSFORM) {
+        uv = s.u_SheenRoughnessUVTransform * uv;
+    }
     return uv.xy;
 }
 
@@ -240,18 +235,18 @@ layout (set = 4, binding = 13) uniform sampler2D u_SpecularColorSampler;
 vec2 getSpecularUV()
 {
     vec3 uv = vec3(s.u_SpecularUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_SPECULAR_UV_TRANSFORM
-    uv = s.u_SpecularUVTransform * uv;
-#endif
+    if (HAS_SPECULAR_UV_TRANSFORM) {
+        uv = s.u_SpecularUVTransform * uv;
+    }
     return uv.xy;
 }
 
 vec2 getSpecularColorUV()
 {
     vec3 uv = vec3(s.u_SpecularColorUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_SPECULARCOLOR_UV_TRANSFORM
-    uv = s.u_SpecularColorUVTransform * uv;
-#endif
+    if (HAS_SPECULARCOLOR_UV_TRANSFORM) {
+        uv = s.u_SpecularColorUVTransform * uv;
+    }
     return uv.xy;
 }
 
@@ -264,9 +259,9 @@ layout (set = 4, binding = 15) uniform sampler2D u_TransmissionFramebufferSample
 vec2 getTransmissionUV()
 {
     vec3 uv = vec3(s.u_TransmissionUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_TRANSMISSION_UV_TRANSFORM
-    uv = s.u_TransmissionUVTransform * uv;
-#endif
+    if (HAS_TRANSMISSION_UV_TRANSFORM) {
+        uv = s.u_TransmissionUVTransform * uv;
+    }
     return uv.xy;
 }
 
@@ -278,9 +273,9 @@ layout (set = 4, binding = 16) uniform sampler2D u_ThicknessSampler;
 vec2 getThicknessUV()
 {
     vec3 uv = vec3(s.u_ThicknessUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_THICKNESS_UV_TRANSFORM
-    uv = s.u_ThicknessUVTransform * uv;
-#endif
+    if (HAS_THICKNESS_UV_TRANSFORM) {
+        uv = s.u_ThicknessUVTransform * uv;
+    }
     return uv.xy;
 }
 
@@ -293,18 +288,18 @@ layout (set = 4, binding = 18) uniform sampler2D u_IridescenceThicknessSampler;
 vec2 getIridescenceUV()
 {
     vec3 uv = vec3(s.u_IridescenceUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_IRIDESCENCE_UV_TRANSFORM
-    uv = s.u_IridescenceUVTransform * uv;
-#endif
+    if (HAS_IRIDESCENCE_UV_TRANSFORM) {
+        uv = s.u_IridescenceUVTransform * uv;
+    }
     return uv.xy;
 }
 
 vec2 getIridescenceThicknessUV()
 {
     vec3 uv = vec3(s.u_IridescenceThicknessUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_IRIDESCENCETHICKNESS_UV_TRANSFORM
-    uv = s.u_IridescenceThicknessUVTransform * uv;
-#endif
+    if (HAS_IRIDESCENCETHICKNESS_UV_TRANSFORM) {
+        uv = s.u_IridescenceThicknessUVTransform * uv;
+    }
     return uv.xy;
 }
 
@@ -317,18 +312,18 @@ layout (set = 4, binding = 20) uniform sampler2D u_DiffuseTransmissionColorSampl
 vec2 getDiffuseTransmissionUV()
 {
     vec3 uv = vec3(s.u_DiffuseTransmissionUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_DIFFUSETRANSMISSION_UV_TRANSFORM
-    uv = s.u_DiffuseTransmissionUVTransform * uv;
-#endif
+    if (HAS_DIFFUSETRANSMISSION_UV_TRANSFORM) {
+        uv = s.u_DiffuseTransmissionUVTransform * uv;
+    }
     return uv.xy;
 }
 
 vec2 getDiffuseTransmissionColorUV()
 {
     vec3 uv = vec3(s.u_DiffuseTransmissionColorUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_DIFFUSETRANSMISSIONCOLOR_UV_TRANSFORM
-    uv = s.u_DiffuseTransmissionColorUVTransform * uv;
-#endif
+    if (HAS_DIFFUSETRANSMISSIONCOLOR_UV_TRANSFORM) {
+        uv = s.u_DiffuseTransmissionColorUVTransform * uv;
+    }
     return uv.xy;
 }
 
@@ -339,9 +334,9 @@ layout (set = 4, binding = 21) uniform sampler2D u_AnisotropySampler;
 vec2 getAnisotropyUV()
 {
     vec3 uv = vec3(s.u_AnisotropyUVSet < 1 ? v_texcoord_0 : v_texcoord_1, 1.0);
-#ifdef HAS_ANISOTROPY_UV_TRANSFORM
-    uv = s.u_AnisotropyUVTransform * uv;
-#endif
+    if (HAS_ANISOTROPY_UV_TRANSFORM) {
+        uv = s.u_AnisotropyUVTransform * uv;
+    }
     return uv.xy;
 }
 

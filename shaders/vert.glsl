@@ -7,24 +7,14 @@ layout (location = 1) in vec3 a_normal;
 layout (location = 2) in vec4 a_tangent;
 layout (location = 3) in vec2 a_texcoord_0;
 layout (location = 4) in vec2 a_texcoord_1;
+layout (location = 5) in vec4 a_color_0;
 
 layout (location = 0) out vec3 v_Position;
 layout (location = 1) out vec2 v_texcoord_0;
 layout (location = 2) out vec2 v_texcoord_1;
-layout (location = 3) out vec3 v_Normal;
-layout (location = 4) out mat3 v_TBN;
-
-
-
-#ifdef HAS_COLOR_0_VEC3
-in vec3 a_color_0;
-out vec3 v_Color;
-#endif
-
-#ifdef HAS_COLOR_0_VEC4
-in vec4 a_color_0;
-out vec4 v_Color;
-#endif
+layout (location = 3) out vec4 v_Color;
+layout (location = 4) out vec3 v_Normal;
+layout (location = 5) out mat3 v_TBN;
 
 #ifdef USE_INSTANCING
 in mat4 a_instance_model_matrix;
@@ -97,10 +87,10 @@ void main()
             vec3 tangentW = vec3(modelMatrix * vec4(tangent, 0.0));
             vec3 bitangentW = cross(normalW, tangentW) * a_tangent.w;
 
-#ifdef HAS_VERT_NORMAL_UV_TRANSFORM
-            tangentW = material.u_vertNormalUVTransform * tangentW;
-            bitangentW = material.u_vertNormalUVTransform * bitangentW;
-#endif
+            if (HAS_VERT_NORMAL_UV_TRANSFORM) {
+                tangentW = material.u_vertNormalUVTransform * tangentW;
+                bitangentW = material.u_vertNormalUVTransform * bitangentW;
+            }
 
             bitangentW = normalize(bitangentW);
             tangentW = normalize(tangentW);
@@ -111,16 +101,17 @@ void main()
         }
     }
 
-    v_texcoord_0 = vec2(0.0, 0.0);
-    v_texcoord_1 = vec2(0.0, 0.0);
+    if (HAS_TEXCOORD_0_VEC2) {
+        v_texcoord_0 = a_texcoord_0;
+    } else {
+        v_texcoord_0 = vec2(0.0, 0.0);
+    }
 
-#ifdef HAS_TEXCOORD_0_VEC2
-    v_texcoord_0 = a_texcoord_0;
-#endif
-
-#ifdef HAS_TEXCOORD_1_VEC2
-    v_texcoord_1 = a_texcoord_1;
-#endif
+    if (HAS_TEXCOORD_1_VEC2) {
+        v_texcoord_1 = a_texcoord_1;
+    } else {
+        v_texcoord_1 = vec2(0.0, 0.0);
+    }
 
 #ifdef USE_MORPHING
     v_texcoord_0 += getTargetTexCoord0(gl_VertexID);
@@ -128,19 +119,19 @@ void main()
 #endif
 
 
-#if defined(HAS_COLOR_0_VEC3)
-    v_Color = a_color_0;
+    if (HAS_COLOR_0_VEC3) {
+        v_Color = a_color_0;
 #if defined(USE_MORPHING)
-    v_Color = clamp(v_Color + getTargetColor0(gl_VertexID).xyz, 0.0f, 1.0f);
+        v_Color = clamp(v_Color + getTargetColor0(gl_VertexID).xyz, 0.0f, 1.0f);
 #endif
-#endif
+    }
 
-#if defined(HAS_COLOR_0_VEC4)
-    v_Color = a_color_0;
+    if (HAS_COLOR_0_VEC4) {
+        v_Color = a_color_0;
 #if defined(USE_MORPHING)
-    v_Color = clamp(v_Color + getTargetColor0(gl_VertexID), 0.0f, 1.0f);
+        v_Color = clamp(v_Color + getTargetColor0(gl_VertexID), 0.0f, 1.0f);
 #endif
-#endif
+    }
 
     gl_Position = camera.u_ViewProjectionMatrix * pos;
 }

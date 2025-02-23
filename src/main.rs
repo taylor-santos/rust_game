@@ -15,9 +15,12 @@
 use crate::camera::FirstPersonCamera;
 use crate::gltf::{load_gltf, CombinedVertex, Gltf, Object, TextureFormat};
 use crate::material::Material;
-use cgmath::{Matrix, Matrix4, Point3, Rad, SquareMatrix, Vector3};
-use image::{DynamicImage, ImageBuffer, ImageReader};
+use crate::shader::*;
+use cgmath::{Matrix, Matrix4, Rad, SquareMatrix};
+use image::{ColorType, DynamicImage, ImageBuffer, ImageReader};
 use ktx2::SupercompressionScheme;
+use rayon::iter::Either;
+use std::cmp::min;
 use std::collections::{HashMap, VecDeque};
 use std::f32::consts::FRAC_PI_4;
 use std::time::{Duration, Instant};
@@ -32,19 +35,21 @@ use vulkano::descriptor_set::layout::{
     DescriptorSetLayout, DescriptorSetLayoutCreateInfo, DescriptorType,
 };
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::device::{Device, DeviceOwned};
 use vulkano::format::Format;
+use vulkano::half::f16;
+use vulkano::image::sampler::SamplerAddressMode::{ClampToEdge, Repeat};
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{
     ImageAspects, ImageCreateFlags, ImageCreateInfo, ImageSubresourceLayers, ImageType,
 };
-use vulkano::instance::{InstanceCreateInfo, InstanceExtensions};
 use vulkano::padded::Padded;
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::CullMode;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
 use vulkano::pipeline::{Pipeline, PipelineBindPoint};
-use vulkano::shader::{DescriptorBindingRequirements, ShaderStages, SpecializationConstant};
+use vulkano::shader::{DescriptorBindingRequirements, ShaderModule, ShaderStages};
 use vulkano::swapchain::PresentMode;
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -87,6 +92,7 @@ use winit::{
 mod camera;
 mod gltf;
 mod material;
+mod shader;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -98,8 +104,8 @@ fn main() -> Result<(), impl Error> {
 struct Skybox {
     pub lambertian: Arc<ImageView>,
     pub ggx: Arc<ImageView>,
-    pub lut_ggx: Arc<ImageView>,
     pub charlie: Arc<ImageView>,
+    pub lut_ggx: Arc<ImageView>,
     pub lut_charlie: Arc<ImageView>,
     pub lut_sheen_e: Arc<ImageView>,
 }
@@ -120,6 +126,7 @@ struct App {
     null_texture: Arc<ImageView>,
     skyboxes: Skybox,
     sampler: Arc<Sampler>,
+    wrap_sampler: Arc<Sampler>,
     camera: FirstPersonCamera,
     input_state: InputState,
     rcx: Option<RenderContext>,
@@ -138,14 +145,15 @@ struct InputState {
 struct RenderContext {
     attachment_image_views: Vec<Arc<ImageView>>,
     depth_image_view: Arc<ImageView>,
-    pipeline: Arc<GraphicsPipeline>,
+    pipelines: HashMap<
+        MaterialSpecializationConstants,
+        HashMap<ObjectSpecializationConstants, PipelineContext>,
+    >,
     viewport: Viewport,
     frame_times: VecDeque<Instant>,
-    material_sets: Vec<(Arc<DescriptorSet>, Arc<DescriptorSet>)>,
-    const_set: Arc<DescriptorSet>,
-    skybox_set: Arc<DescriptorSet>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upload_image<T: BufferContents + Send + Sync, I: IntoIterator<Item = T>>(
     builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
     pixels: I,
@@ -306,22 +314,40 @@ fn load_png(
     queue: Arc<Queue>,
 ) -> Result<Arc<ImageView>, Box<dyn Error>> {
     let img = ImageReader::open(path)?.decode()?;
-
-    let rgba_image = img.to_rgba8();
-    let (width, height) = rgba_image.dimensions();
-    let pixels = rgba_image.into_raw();
-
-    Ok(upload_image(
-        image_builder,
-        pixels,
-        [width, height, 1],
-        1,
-        1,
-        memory_allocator.clone(),
-        command_buffer_allocator.clone(),
-        queue,
-        Format::R8G8B8A8_UNORM,
-    )?)
+    let color = img.color();
+    let width = img.width();
+    let height = img.height();
+    match color {
+        ColorType::Rgb8 => {
+            let pixels = img.to_rgba8().as_raw().to_owned();
+            Ok(upload_image(
+                image_builder,
+                pixels,
+                [width, height, 1],
+                1,
+                1,
+                memory_allocator.clone(),
+                command_buffer_allocator.clone(),
+                queue,
+                Format::R8G8B8A8_UNORM,
+            )?)
+        }
+        ColorType::Rgb16 => {
+            let pixels = img.to_rgba16().as_raw().to_owned();
+            Ok(upload_image(
+                image_builder,
+                pixels,
+                [width, height, 1],
+                1,
+                1,
+                memory_allocator.clone(),
+                command_buffer_allocator.clone(),
+                queue,
+                Format::R16G16B16A16_UNORM,
+            )?)
+        }
+        _ => panic!("Unsupported color type {:?}", color),
+    }
 }
 
 impl App {
@@ -372,6 +398,7 @@ impl App {
         let Gltf {
             meshes,
             textures,
+            texture_maps,
             materials,
             objects,
         } = load_gltf("models/DamagedHelmet.glb").expect("Couldn't load gltf model");
@@ -385,7 +412,7 @@ impl App {
             .reduce(|(v1, i1), (v2, i2)| (v1 + v2, i1 + i2))
             .unwrap();
 
-        let (vertex_buffer, index_buffer, draw_infos) = {
+        let (vertex_buffer, index_buffer, mut draw_infos) = {
             let mut combined_verts = Vec::with_capacity(vert_count / 3);
             let mut combined_indices = Vec::with_capacity(index_count);
             let mut draw_infos = Vec::new();
@@ -393,12 +420,15 @@ impl App {
             for mesh in meshes {
                 let mut prim_infos = Vec::new();
                 for prim in mesh.primitives {
-                    prim_infos.push(PrimitiveDrawInfo {
+                    let info = PrimitiveDrawInfo {
                         index_offset: combined_indices.len() as u32,
                         vertex_offset: combined_verts.len() as i32,
                         index_count: prim.indices.len() as u32,
                         mat_idx: prim.mat_idx,
-                    });
+                        object_constants: prim.spec_constants,
+                        object_ids: Vec::new(),
+                    };
+                    prim_infos.push(info);
 
                     combined_verts.extend(prim.vertices);
                     combined_indices.extend(prim.indices);
@@ -427,6 +457,12 @@ impl App {
             (vertex_buffer, index_buffer, draw_infos)
         };
 
+        for (obj_idx, object) in objects.iter().enumerate() {
+            for prim in &mut draw_infos[object.mesh_idx] {
+                prim.object_ids.push(obj_idx);
+            }
+        }
+
         let mut image_builder = AutoCommandBufferBuilder::primary(
             command_buffer_allocator.clone(),
             context.graphics_queue().queue_family_index(),
@@ -437,19 +473,61 @@ impl App {
         let textures = {
             let timer = Instant::now();
 
-            let textures = textures
+            let textures = texture_maps
                 .into_iter()
-                .map(|texture| {
-                    let pixels = match texture.format {
-                        TextureFormat::R8G8B8A8 => texture.pixels,
-                        TextureFormat::R8G8B8 => DynamicImage::ImageRgb8(
-                            ImageBuffer::from_raw(texture.width, texture.height, texture.pixels)
+                .map(|texture_map| {
+                    let texture = &textures[texture_map.index];
+                    let is_srgb = texture_map
+                        .usage
+                        .as_ref()
+                        .map(Either::is_left)
+                        .unwrap_or(false);
+
+                    let (pixels, format) = match texture.format {
+                        TextureFormat::R8G8B8A8 => (
+                            texture.pixels.clone(),
+                            match is_srgb {
+                                true => Format::R8G8B8A8_SRGB,
+                                false => Format::R8G8B8A8_UNORM,
+                            },
+                        ),
+                        TextureFormat::R8G8B8 => {
+                            let pixels = DynamicImage::ImageRgb8(
+                                ImageBuffer::from_raw(
+                                    texture.width,
+                                    texture.height,
+                                    texture.pixels.clone(),
+                                )
                                 .unwrap(),
-                        )
-                        .to_rgba8()
-                        .into_raw(),
+                            )
+                            .to_rgba8()
+                            .into_raw();
+
+                            (
+                                pixels,
+                                match is_srgb {
+                                    true => Format::R8G8B8A8_SRGB,
+                                    false => Format::R8G8B8A8_UNORM,
+                                },
+                            )
+                        }
+                        TextureFormat::R8 => (
+                            texture.pixels.clone(),
+                            match is_srgb {
+                                true => Format::R8_SRGB,
+                                false => Format::R8_UNORM,
+                            },
+                        ),
+                        TextureFormat::R16G16B16A16 => (
+                            texture.pixels.clone(),
+                            match is_srgb {
+                                true => Format::R16G16B16A16_SFLOAT,
+                                false => Format::R16G16B16A16_UNORM,
+                            },
+                        ),
                         _ => panic!("unsupported texture format: {:?}", texture.format),
                     };
+
                     let extent: [u32; 3] = [texture.width, texture.height, 1];
 
                     upload_image(
@@ -461,7 +539,7 @@ impl App {
                         memory_allocator.clone(),
                         command_buffer_allocator.clone(),
                         context.graphics_queue().clone(),
-                        Format::R8G8B8A8_UNORM,
+                        format,
                     )
                     .unwrap()
                 })
@@ -477,7 +555,7 @@ impl App {
         };
 
         let null_texture = {
-            let pixel = vec![255u8; 4]; // RGBA black
+            let pixel = vec![0u8, 0, 0, 255]; // RGBA black
             let extent: [u32; 3] = [1, 1, 1]; // 1x1 texture
 
             upload_image(
@@ -495,8 +573,10 @@ impl App {
         };
 
         let skyboxes = {
+            let env = "helipad";
+
             let lambertian = load_ktx2(
-                "textures/field/lambertian/diffuse.ktx2",
+                format!("textures/{env}/lambertian/diffuse.ktx2").as_str(),
                 &mut image_builder,
                 memory_allocator.clone(),
                 command_buffer_allocator.clone(),
@@ -504,37 +584,79 @@ impl App {
             )
             .unwrap();
             let ggx = load_ktx2(
-                "textures/field/ggx/specular.ktx2",
+                format!("textures/{env}/ggx/specular.ktx2").as_str(),
                 &mut image_builder,
                 memory_allocator.clone(),
                 command_buffer_allocator.clone(),
                 context.graphics_queue().clone(),
             )
             .unwrap();
-            let lut_ggx = load_png(
-                "textures/lut_ggx.png",
-                &mut image_builder,
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                context.graphics_queue().clone(),
-            )
-            .unwrap();
+
             let charlie = load_ktx2(
-                "textures/field/charlie/sheen.ktx2",
+                format!("textures/{env}/charlie/sheen.ktx2").as_str(),
                 &mut image_builder,
                 memory_allocator.clone(),
                 command_buffer_allocator.clone(),
                 context.graphics_queue().clone(),
             )
             .unwrap();
-            let lut_charlie = load_png(
-                "textures/lut_charlie.png",
+
+            // let lut_charlie = load_png(
+            //     "textures/lut_charlie.png",
+            //     &mut image_builder,
+            //     memory_allocator.clone(),
+            //     command_buffer_allocator.clone(),
+            //     context.graphics_queue().clone(),
+            // )
+            //    .unwrap();
+
+            // let lut_ggx = load_png(
+            //     "textures/lut_ggx.png",
+            //     &mut image_builder,
+            //     memory_allocator.clone(),
+            //     command_buffer_allocator.clone(),
+            //     context.graphics_queue().clone(),
+            // )
+            // .unwrap();
+
+            let lut_charlie = upload_image(
                 &mut image_builder,
+                include_bytes!("../textures/lut_charlie.bin")
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        f16::from_bits(bits)
+                    })
+                    .collect::<Vec<_>>(),
+                [1024, 1024, 1],
+                1,
+                1,
                 memory_allocator.clone(),
                 command_buffer_allocator.clone(),
                 context.graphics_queue().clone(),
+                Format::R16G16B16A16_SFLOAT,
             )
             .unwrap();
+
+            let lut_ggx = upload_image(
+                &mut image_builder,
+                include_bytes!("../textures/lut_ggx.bin")
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        f16::from_bits(bits)
+                    })
+                    .collect::<Vec<_>>(),
+                [1024, 1024, 1],
+                1,
+                1,
+                memory_allocator.clone(),
+                command_buffer_allocator.clone(),
+                context.graphics_queue().clone(),
+                Format::R16G16B16A16_SFLOAT,
+            )
+            .unwrap();
+
             let lut_sheen_e = load_png(
                 "textures/lut_sheen_E.png",
                 &mut image_builder,
@@ -547,8 +669,8 @@ impl App {
             Skybox {
                 lambertian,
                 ggx,
-                lut_ggx,
                 charlie,
+                lut_ggx,
                 lut_charlie,
                 lut_sheen_e,
             }
@@ -566,7 +688,19 @@ impl App {
 
         let sampler = Sampler::new(
             context.device().clone(),
-            SamplerCreateInfo::simple_repeat_linear(),
+            SamplerCreateInfo {
+                address_mode: [ClampToEdge, ClampToEdge, Repeat],
+                ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
+            },
+        )
+        .expect("Couldn't create sampler");
+
+        let wrap_sampler = Sampler::new(
+            context.device().clone(),
+            SamplerCreateInfo {
+                address_mode: [Repeat; 3],
+                ..SamplerCreateInfo::simple_repeat_linear()
+            },
         )
         .expect("Couldn't create sampler");
 
@@ -588,6 +722,7 @@ impl App {
             null_texture,
             skyboxes,
             sampler,
+            wrap_sampler,
             camera,
             input_state: Default::default(),
             rcx: None,
@@ -623,6 +758,184 @@ impl Default for InputState {
     }
 }
 
+fn build_pipeline(
+    device: Arc<Device>,
+    swapchain_format: Format,
+    vert: Arc<ShaderModule>,
+    frag: Arc<ShaderModule>,
+    specialization_constants: SpecializationConstants,
+    double_sided: bool,
+) -> Arc<GraphicsPipeline> {
+    // First, we load the shaders that the pipeline will use: the vertex shader and the
+    // fragment shader.
+    //
+    // A Vulkan shader can in theory contain multiple entry points, so we have to specify
+    // which one.
+
+    let constants: Vec<_> = specialization_constants.into();
+
+    let vs = vert
+        .specialize(constants.clone().into_iter().collect())
+        .unwrap()
+        .entry_point("main")
+        .unwrap();
+    let fs = frag
+        .specialize(constants.into_iter().collect())
+        .unwrap()
+        .entry_point("main")
+        .unwrap();
+
+    // Automatically generate a vertex input state from the vertex shader's input
+    // interface, that takes a single vertex buffer containing `Vertex` structs.
+    let vertex_input_state = CombinedVertex::per_vertex().definition(&vs).unwrap();
+
+    // Make a list of the shader stages that the pipeline will have.
+    let stages = [
+        PipelineShaderStageCreateInfo::new(vs),
+        PipelineShaderStageCreateInfo::new(fs),
+    ];
+
+    // We must now create a **pipeline layout** object, which describes the locations and
+    // types of descriptor sets and push constants used by the shaders in the pipeline.
+    //
+    // Multiple pipelines can share a common layout object, which is more efficient. The
+    // shaders in a pipeline must use a subset of the resources described in its pipeline
+    // layout, but the pipeline layout is allowed to contain resources that are not present
+    // in the shaders; they can be used by shaders in other pipelines that share the same
+    // layout. Thus, it is a good idea to design shaders so that many pipelines have common
+    // resource locations, which allows them to share pipeline layouts.
+    let bindings = [
+        // set = 0
+        vec![
+            DescriptorType::UniformBuffer, // binding = 0 uniform Constants
+        ],
+        // set = 1
+        vec![
+            DescriptorType::UniformBuffer, // binding = 0 uniform Camera
+        ],
+        // set = 2
+        vec![DescriptorType::CombinedImageSampler; 6], // IBL Samplers
+        // set = 3
+        vec![
+            DescriptorType::UniformBuffer, // binding = 0 uniform Material
+            DescriptorType::UniformBuffer, // binding = 1 uniform MatSamplers
+        ],
+        // set = 4
+        vec![DescriptorType::CombinedImageSampler; 22], // Texture Samplers
+    ];
+
+    let push_constant_ranges = vec![PushConstantRange {
+        stages: ShaderStages::all_graphics(),
+        offset: 0,
+        size: size_of::<shader::fs::Object>() as u32,
+    }];
+
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineLayoutCreateInfo {
+            set_layouts: bindings
+                .into_iter()
+                .map(|set| {
+                    DescriptorSetLayout::new(
+                        device.clone(),
+                        DescriptorSetLayoutCreateInfo {
+                            bindings: set
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, binding)| {
+                                    (
+                                        idx as u32,
+                                        (&DescriptorBindingRequirements {
+                                            descriptor_types: vec![binding],
+                                            descriptor_count: Some(1),
+                                            stages: ShaderStages::all_graphics(),
+                                            ..Default::default()
+                                        })
+                                            .into(),
+                                    )
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>(),
+            push_constant_ranges,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // We describe the formats of attachment images where the colors, depth and/or stencil
+    // information will be written. The pipeline will only be usable with this particular
+    // configuration of the attachment images.
+    let subpass = PipelineRenderingCreateInfo {
+        // We specify a single color attachment that will be rendered to. When we begin
+        // rendering, we will specify a swapchain image to be used as this attachment, so
+        // here we set its format to be the same format as the swapchain.
+        color_attachment_formats: vec![Some(swapchain_format)],
+        depth_attachment_format: Some(Format::D32_SFLOAT),
+        ..Default::default()
+    };
+
+    // Finally, create the pipeline.
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            // How vertex data is read from the vertex buffers into the vertex shader.
+            vertex_input_state: Some(vertex_input_state),
+            // How vertices are arranged into primitive shapes. The default primitive shape
+            // is a triangle.
+            input_assembly_state: Some(InputAssemblyState::default()),
+            // How primitives are transformed and clipped to fit the framebuffer. We use a
+            // resizable viewport, set to draw over the entire window.
+            viewport_state: Some(ViewportState::default()),
+            // How polygons are culled and converted into a raster of pixels. The default
+            // value does not perform any culling.
+            rasterization_state: Some(RasterizationState {
+                cull_mode: if double_sided {
+                    CullMode::None
+                } else {
+                    CullMode::Back
+                },
+                ..Default::default()
+            }),
+            // How multiple fragment shader samples are converted to a single pixel value.
+            // The default value does not perform any multisampling.
+            multisample_state: Some(MultisampleState::default()),
+            // How pixel values are combined with the values already present in the
+            // framebuffer. The default value overwrites the old value with the new one,
+            // without any blending.
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.color_attachment_formats.len() as u32,
+                ColorBlendAttachmentState::default(),
+            )),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState::simple()),
+                ..Default::default()
+            }),
+            // Dynamic states allows us to specify parts of the pipeline settings when
+            // recording the command buffer, before we perform drawing. Here, we specify
+            // that the viewport should be dynamic.
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .unwrap()
+}
+
+struct PipelineContext {
+    pipeline: Arc<GraphicsPipeline>,
+    material_sets: HashMap<usize, (Arc<DescriptorSet>, Arc<DescriptorSet>)>,
+    const_set: Arc<DescriptorSet>,
+    skybox_set: Arc<DescriptorSet>,
+    draw_infos: Vec<PrimitiveDrawInfo>,
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(primary_window_id) = self.windows.primary_window_id() {
@@ -633,9 +946,9 @@ impl ApplicationHandler for App {
             event_loop,
             &self.context,
             &WindowDescriptor {
-                present_mode: PresentMode::Immediate,
-                width: 1804.,
-                height: 1885.,
+                present_mode: PresentMode::Mailbox,
+                width: 1524.,
+                height: 1500.,
                 scale_factor_override: Some(1.0),
                 ..Default::default()
             },
@@ -663,199 +976,19 @@ impl ApplicationHandler for App {
         let depth_image_view =
             ImageView::new_default(depth_image.clone()).expect("Failed to create depth image view");
 
+        let vertex_shader = vs::load(self.context.device().clone()).unwrap();
+        let fragment_shader = fs::load(self.context.device().clone()).unwrap();
+
         // Before we draw, we have to create what is called a **pipeline**. A pipeline describes
         // how a GPU operation is to be performed. It is similar to an OpenGL program, but it also
         // contains many settings for customization, all baked into a single object. For drawing,
         // we create a **graphics** pipeline, but there are also other types of pipeline.
-        let pipeline = {
-            // First, we load the shaders that the pipeline will use: the vertex shader and the
-            // fragment shader.
-            //
-            // A Vulkan shader can in theory contain multiple entry points, so we have to specify
-            // which one.
-
-            let specialization_constants = [
-                true.into(),  // HAS_NORMAL_VEC3
-                true.into(),  // HAS_TANGENT_VEC4
-                true.into(),  // MATERIAL_METALLICROUGHNESS
-                false.into(), // MATERIAL_SPECULARGLOSSINESS
-                false.into(), // MATERIAL_CLEARCOAT
-                false.into(), // MATERIAL_SHEEN
-                false.into(), // MATERIAL_SPECULAR
-                false.into(), // MATERIAL_TRANSMISSION
-                false.into(), // MATERIAL_VOLUME
-                false.into(), // MATERIAL_IRIDESCENCE
-                false.into(), // MATERIAL_DIFFUSE_TRANSMISSION
-                false.into(), // MATERIAL_ANISOTROPY
-                false.into(), // MATERIAL_IOR
-                false.into(), // MATERIAL_DISPERSION
-                false.into(), // MATERIAL_EMISSIVE_STRENGTH
-                false.into(), // MATERIAL_UNLIT
-            ];
-
-            let vs = vs::load(self.context.device().clone())
-                .unwrap()
-                .specialize(
-                    specialization_constants
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, v)| (i as u32, v))
-                        .collect(),
-                )
-                .unwrap()
-                .entry_point("main")
-                .unwrap();
-            let fs = fs::load(self.context.device().clone())
-                .unwrap()
-                .specialize(
-                    specialization_constants
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, v)| (i as u32, v))
-                        .collect(),
-                )
-                .unwrap()
-                .entry_point("main")
-                .unwrap();
-
-            // Automatically generate a vertex input state from the vertex shader's input
-            // interface, that takes a single vertex buffer containing `Vertex` structs.
-            let vertex_input_state = CombinedVertex::per_vertex().definition(&vs).unwrap();
-
-            // Make a list of the shader stages that the pipeline will have.
-            let stages = [
-                PipelineShaderStageCreateInfo::new(vs),
-                PipelineShaderStageCreateInfo::new(fs),
-            ];
-
-            // We must now create a **pipeline layout** object, which describes the locations and
-            // types of descriptor sets and push constants used by the shaders in the pipeline.
-            //
-            // Multiple pipelines can share a common layout object, which is more efficient. The
-            // shaders in a pipeline must use a subset of the resources described in its pipeline
-            // layout, but the pipeline layout is allowed to contain resources that are not present
-            // in the shaders; they can be used by shaders in other pipelines that share the same
-            // layout. Thus, it is a good idea to design shaders so that many pipelines have common
-            // resource locations, which allows them to share pipeline layouts.
-            let bindings = [
-                // set = 0
-                vec![
-                    DescriptorType::UniformBuffer, // binding = 0 uniform Constants
-                ],
-                // set = 1
-                vec![
-                    DescriptorType::UniformBuffer, // binding = 0 uniform Camera
-                ],
-                // set = 2
-                vec![DescriptorType::CombinedImageSampler; 6], // IBL Samplers
-                // set = 3
-                vec![
-                    DescriptorType::UniformBuffer, // binding = 0 uniform Material
-                    DescriptorType::UniformBuffer, // binding = 1 uniform MatSamplers
-                ],
-                // set = 4
-                vec![DescriptorType::CombinedImageSampler; 22], // Texture Samplers
-            ];
-
-            let push_constant_ranges = vec![PushConstantRange {
-                stages: ShaderStages::all_graphics(),
-                offset: 0,
-                size: size_of::<fs::Object>() as u32,
-            }];
-
-            let layout = PipelineLayout::new(
-                self.context.device().clone(),
-                PipelineLayoutCreateInfo {
-                    set_layouts: bindings
-                        .into_iter()
-                        .map(|set| {
-                            DescriptorSetLayout::new(
-                                self.context.device().clone(),
-                                DescriptorSetLayoutCreateInfo {
-                                    bindings: set
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(idx, binding)| {
-                                            (
-                                                idx as u32,
-                                                (&DescriptorBindingRequirements {
-                                                    descriptor_types: vec![binding],
-                                                    descriptor_count: Some(1),
-                                                    stages: ShaderStages::all_graphics(),
-                                                    ..Default::default()
-                                                })
-                                                    .into(),
-                                            )
-                                        })
-                                        .collect(),
-                                    ..Default::default()
-                                },
-                            )
-                            .unwrap()
-                        })
-                        .collect::<Vec<_>>(),
-                    push_constant_ranges,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-            // We describe the formats of attachment images where the colors, depth and/or stencil
-            // information will be written. The pipeline will only be usable with this particular
-            // configuration of the attachment images.
-            let subpass = PipelineRenderingCreateInfo {
-                // We specify a single color attachment that will be rendered to. When we begin
-                // rendering, we will specify a swapchain image to be used as this attachment, so
-                // here we set its format to be the same format as the swapchain.
-                color_attachment_formats: vec![Some(window_renderer.swapchain_format())],
-                depth_attachment_format: Some(Format::D32_SFLOAT),
-                ..Default::default()
-            };
-
-            // Finally, create the pipeline.
-            GraphicsPipeline::new(
-                self.context.device().clone(),
-                None,
-                GraphicsPipelineCreateInfo {
-                    stages: stages.into_iter().collect(),
-                    // How vertex data is read from the vertex buffers into the vertex shader.
-                    vertex_input_state: Some(vertex_input_state),
-                    // How vertices are arranged into primitive shapes. The default primitive shape
-                    // is a triangle.
-                    input_assembly_state: Some(InputAssemblyState::default()),
-                    // How primitives are transformed and clipped to fit the framebuffer. We use a
-                    // resizable viewport, set to draw over the entire window.
-                    viewport_state: Some(ViewportState::default()),
-                    // How polygons are culled and converted into a raster of pixels. The default
-                    // value does not perform any culling.
-                    rasterization_state: Some(RasterizationState {
-                        cull_mode: CullMode::Back,
-                        ..Default::default()
-                    }),
-                    // How multiple fragment shader samples are converted to a single pixel value.
-                    // The default value does not perform any multisampling.
-                    multisample_state: Some(MultisampleState::default()),
-                    // How pixel values are combined with the values already present in the
-                    // framebuffer. The default value overwrites the old value with the new one,
-                    // without any blending.
-                    color_blend_state: Some(ColorBlendState::with_attachment_states(
-                        subpass.color_attachment_formats.len() as u32,
-                        ColorBlendAttachmentState::default(),
-                    )),
-                    depth_stencil_state: Some(DepthStencilState {
-                        depth: Some(DepthState::simple()),
-                        ..Default::default()
-                    }),
-                    // Dynamic states allows us to specify parts of the pipeline settings when
-                    // recording the command buffer, before we perform drawing. Here, we specify
-                    // that the viewport should be dynamic.
-                    dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                    subpass: Some(subpass.into()),
-                    ..GraphicsPipelineCreateInfo::layout(layout)
-                },
-            )
-            .unwrap()
-        };
+        // let pipeline = build_pipeline(
+        //     self.context.device().clone(),
+        //     window_renderer.swapchain_format(),
+        //     vertex_shader.clone(),
+        //     fragment_shader.clone(),
+        // );
 
         // Dynamic viewports allow us to recreate just the viewport when the window is resized.
         // Otherwise we would have to recreate the whole pipeline.
@@ -871,175 +1004,96 @@ impl ApplicationHandler for App {
             v
         };
 
-        let material_sets: Vec<_> = {
-            let identity3 = [
-                Padded([1f32, 0., 0.]),
-                Padded([0., 1., 0.]),
-                Padded([0., 0., 1.]),
-            ];
+        let mat_prim_map = {
+            let mut mat_prim_map = vec![Vec::new(); self.materials.len()];
+            for object in &self.objects {
+                for info in &self.draw_infos[object.mesh_idx] {
+                    let mat_idx = info.mat_idx;
+                    mat_prim_map[mat_idx].push(info.clone());
+                }
+            }
+            mat_prim_map
+        };
+        /*
+        for object in self.objects {
+            for info in self.draw_infos[object.mesh_idx] {
+                let mat_idx = info.mat_idx;
+                let material_constants = mat_constants[mat_idx];
+                pipelines.entry(material_constants).or_default().entry(info.object_constants).or_insert_with(|| PipelineContext {
+                    pipeline: build_pipeline(
+                        self.context.device().clone(),
+                        window_renderer.swapchain_format(),
+                        vertex_shader.clone(),
+                        fragment_shader.clone(),
+                        SpecializationConstants {
+                            object_constants: info.object_constants,
+                            material_constants,
+                        }
+                    ),
+                });
+
+            }
+        }
+         */
+
+        let const_set = {
+            #[allow(clippy::useless_conversion)]
+            let uniform = fs::Constants {
+                u_MipCount: min(
+                    self.skyboxes.ggx.image().mip_levels() as i32,
+                    self.skyboxes.charlie.image().mip_levels() as i32,
+                )
+                .into(),
+                u_EnvRotation: [
+                    Padded([0f32, 0., -1.]),
+                    Padded([0., 1., 0.]),
+                    Padded([1., 0., 0.]),
+                ]
+                .into(),
+                u_EnvIntensity: 1.0.into(),
+                u_Exposure: 1.0.into(),
+            };
+            let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+            *subbuffer.write().unwrap() = uniform;
+
+            WriteDescriptorSet::buffer(0, subbuffer)
+        };
+
+        let skybox_set = {
+            [
+                (&self.skyboxes.lambertian, &self.wrap_sampler),
+                (&self.skyboxes.ggx, &self.wrap_sampler),
+                (&self.skyboxes.charlie, &self.wrap_sampler),
+                (&self.skyboxes.lut_ggx, &self.sampler),
+                (&self.skyboxes.lut_charlie, &self.sampler),
+                (&self.skyboxes.lut_sheen_e, &self.sampler),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (texture, sampler))| {
+                WriteDescriptorSet::image_view_sampler(idx as u32, texture.clone(), sampler.clone())
+            })
+        };
+
+        let pipelines = {
+            let mut pipelines = HashMap::<
+                MaterialSpecializationConstants,
+                HashMap<ObjectSpecializationConstants, PipelineContext>,
+            >::new();
+
             self.materials
                 .iter()
-                .map(|mat| {
+                .enumerate()
+                .for_each(|(mat_idx, mat)| {
                     let material_set = {
-                        let mat_uniform = fs::Material {
-                            u_MetallicFactor: mat.pbr_metallic_roughness.metallic_factor.into(),
-                            u_RoughnessFactor: mat.pbr_metallic_roughness.roughness_factor.into(),
-                            u_BaseColorFactor: mat.pbr_metallic_roughness.base_color_factor.into(),
-                            u_SpecularFactor: Default::default(),
-                            u_DiffuseFactor: Default::default(),
-                            u_GlossinessFactor: 0.0,
-                            u_SheenRoughnessFactor: mat
-                                .sheen_roughness_factor
-                                .unwrap_or_default()
-                                .into(),
-                            u_SheenColorFactor: mat.sheen_color_factor.unwrap_or_default().into(),
-                            u_ClearcoatFactor: 0.0,
-                            u_ClearcoatRoughnessFactor: Default::default(),
-                            u_KHR_materials_specular_specularColorFactor: Default::default(),
-                            u_KHR_materials_specular_specularFactor: 0.0,
-                            u_TransmissionFactor: 1.0,
-                            u_ThicknessFactor: 0.0.into(),
-                            u_AttenuationColor: Default::default(),
-                            u_AttenuationDistance: 0.0,
-                            u_IridescenceFactor: 0.0,
-                            u_IridescenceIor: 0.0,
-                            u_IridescenceThicknessMinimum: 0.0,
-                            u_IridescenceThicknessMaximum: 0.0,
-                            u_DiffuseTransmissionFactor: Default::default(),
-                            u_DiffuseTransmissionColorFactor: Default::default(),
-                            u_EmissiveStrength: 0.0,
-                            u_Ior: 1.0.into(),
-                            u_Anisotropy: Default::default(),
-                            u_Dispersion: 0.0,
-                            u_AlphaCutoff: mat.alpha_cutoff.unwrap_or(0.5).into(),
-                            //u_vertNormalUVTransform: mat.normal_texture.as_ref().and_then(|t| t.info.transform).map(Into::into).unwrap_or(identity3).into(),
-                        };
+                        let mat_uniform: fs::Material = mat.into();
                         let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
                         *subbuffer.write().unwrap() = mat_uniform;
                         WriteDescriptorSet::buffer(0, subbuffer)
                     };
 
                     let mat_sampler_set = {
-                        let mat_samplers = fs::MatSamplers {
-                            u_NormalScale: mat
-                                .normal_texture
-                                .as_ref()
-                                .map(|t| t.scale)
-                                .unwrap_or(1.0),
-                            u_NormalUVSet: mat
-                                .normal_texture
-                                .as_ref()
-                                .map(|t| t.info.texture.tex_coord as i32)
-                                .unwrap_or(0)
-                                .into(),
-                            u_NormalUVTransform: mat
-                                .normal_texture
-                                .as_ref()
-                                .and_then(|t| t.info.transform)
-                                .map(Into::into)
-                                .unwrap_or(identity3)
-                                .into(),
-                            u_EmissiveFactor: mat.emissive_factor.into(),
-                            u_EmissiveUVSet: mat
-                                .emissive_texture
-                                .as_ref()
-                                .map(|t| t.texture.tex_coord as i32)
-                                .unwrap_or(0)
-                                .into(),
-                            u_EmissiveUVTransform: mat
-                                .emissive_texture
-                                .as_ref()
-                                .and_then(|t| t.transform)
-                                .map(Into::into)
-                                .unwrap_or(identity3)
-                                .into(),
-                            u_OcclusionUVSet: mat
-                                .occlusion_texture
-                                .as_ref()
-                                .map(|t| t.info.texture.tex_coord as i32)
-                                .unwrap_or(0)
-                                .into(),
-                            u_OcclusionStrength: mat
-                                .occlusion_texture
-                                .as_ref()
-                                .map(|t| t.scale)
-                                .unwrap_or(0.0)
-                                .into(),
-                            u_OcclusionUVTransform: mat
-                                .occlusion_texture
-                                .as_ref()
-                                .and_then(|t| t.info.transform)
-                                .map(Into::into)
-                                .unwrap_or(identity3)
-                                .into(),
-                            u_BaseColorUVSet: mat
-                                .base_color_texture
-                                .as_ref()
-                                .map(|t| t.texture.tex_coord as i32)
-                                .unwrap_or(0)
-                                .into(),
-                            u_BaseColorUVTransform: mat
-                                .base_color_texture
-                                .as_ref()
-                                .and_then(|t| t.transform)
-                                .map(Into::into)
-                                .unwrap_or(identity3)
-                                .into(),
-                            u_MetallicRoughnessUVSet: mat
-                                .pbr_metallic_roughness
-                                .metallic_roughness_texture
-                                .as_ref()
-                                .map(|t| t.texture.tex_coord as i32)
-                                .unwrap_or(0)
-                                .into(),
-                            u_MetallicRoughnessUVTransform: mat
-                                .pbr_metallic_roughness
-                                .metallic_roughness_texture
-                                .as_ref()
-                                .and_then(|t| t.transform)
-                                .map(Into::into)
-                                .unwrap_or(identity3)
-                                .into(),
-                            u_SheenRoughnessUVSet: 0.into(), // TODO
-                            u_SheenRoughnessUVTransform: identity3, // TODO
-                            u_SheenColorUVSet: 0.into(),     // TODO
-                            u_SheenColorUVTransform: identity3, // TODO
-                            u_DiffuseUVSet: 0.into(),        // TODO
-                            u_DiffuseUVTransform: identity3, // TODO
-                            u_SpecularGlossinessUVSet: 0.into(), // TODO
-                            u_SpecularGlossinessUVTransform: identity3, // TODO
-                            u_ClearcoatUVSet: 0.into(),      // TODO
-                            u_ClearcoatUVTransform: identity3, // TODO
-                            u_ClearcoatRoughnessUVSet: 0.into(), // TODO
-                            u_ClearcoatRoughnessUVTransform: identity3, // TODO
-                            u_ClearcoatNormalUVSet: 0.into(), // TODO
-                            u_ClearcoatNormalUVTransform: identity3, // TODO
-                            u_ClearcoatNormalScale: 1.0.into(), // TODO
-                            u_SpecularUVSet: 0.into(),       // TODO
-                            u_SpecularUVTransform: identity3, // TODO
-                            u_SpecularColorUVSet: 0.into(),  // TODO
-                            u_SpecularColorUVTransform: identity3, // TODO
-                            u_TransmissionUVSet: 0.into(),   // TODO
-                            u_TransmissionUVTransform: identity3, // TODO
-                            u_TransmissionFramebufferSize: self
-                                .windows
-                                .get_primary_window()
-                                .unwrap()
-                                .inner_size()
-                                .into(), // TODO
-                            u_ThicknessUVSet: 0.into(),      // TODO
-                            u_ThicknessUVTransform: identity3, // TODO
-                            u_IridescenceUVSet: 0.into(),    // TODO
-                            u_IridescenceUVTransform: identity3, // TODO
-                            u_IridescenceThicknessUVSet: 0.into(), // TODO
-                            u_IridescenceThicknessUVTransform: identity3, // TODO
-                            u_DiffuseTransmissionUVSet: 0.into(), // TODO
-                            u_DiffuseTransmissionUVTransform: identity3, // TODO
-                            u_DiffuseTransmissionColorUVSet: 0.into(), // TODO
-                            u_DiffuseTransmissionColorUVTransform: identity3, // TODO
-                            u_AnisotropyUVSet: 0.into(),     // TODO
-                            u_AnisotropyUVTransform: identity3, // TODO
-                        };
+                        let mat_samplers: fs::MatSamplers = mat.into();
                         let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
                         *subbuffer.write().unwrap() = mat_samplers;
                         WriteDescriptorSet::buffer(1, subbuffer)
@@ -1047,156 +1101,164 @@ impl ApplicationHandler for App {
 
                     let textures = [
                         // (set = 4, binding = 0) u_NormalSampler
-                        mat.normal_texture.as_ref().map(|t| &t.info.texture),
+                        mat.normal_texture.as_ref().map(|t| &t.info),
                         // (set = 4, binding = 1) u_EmissiveSampler
-                        mat.emissive_texture.as_ref().map(|t| &t.texture),
+                        mat.emissive_texture.as_ref(),
                         // (set = 4, binding = 2) u_OcclusionSampler
-                        mat.occlusion_texture.as_ref().map(|t| &t.info.texture),
+                        mat.occlusion_texture.as_ref().map(|t| &t.info),
                         // (set = 4, binding = 3) u_BaseColorSampler
-                        mat.base_color_texture.as_ref().map(|t| &t.texture),
+                        mat.pbr_metallic_roughness.base_color_texture.as_ref(),
                         // (set = 4, binding = 4) u_MetallicRoughnessSampler
                         mat.pbr_metallic_roughness
                             .metallic_roughness_texture
-                            .as_ref()
-                            .map(|t| &t.texture),
+                            .as_ref(),
                         // (set = 4, binding = 5) u_DiffuseSampler
-                        None, // TODO
+                        mat.pbr_specular_glossiness
+                            .as_ref()
+                            .and_then(|t| t.diffuse_texture.as_ref()),
                         // (set = 4, binding = 6) u_SpecularGlossinessSampler
-                        None, // TODO
+                        mat.pbr_specular_glossiness
+                            .as_ref()
+                            .and_then(|t| t.specular_glossiness_texture.as_ref()),
                         // (set = 4, binding = 7) u_ClearcoatSampler
-                        None, // TODO
+                        mat.clearcoat.as_ref().and_then(|c| c.texture.as_ref()),
                         // (set = 4, binding = 8) u_ClearcoatRoughnessSampler
-                        None, // TODO
+                        mat.clearcoat
+                            .as_ref()
+                            .and_then(|c| c.roughness_texture.as_ref()),
                         // (set = 4, binding = 9) u_ClearcoatNormalSampler
-                        None, // TODO
+                        mat.clearcoat
+                            .as_ref()
+                            .and_then(|c| c.normal_texture.as_ref())
+                            .map(|t| &t.info),
                         // (set = 4, binding = 10) u_SheenColorSampler
-                        None, // TODO
+                        mat.sheen.as_ref().and_then(|s| s.color_texture.as_ref()),
                         // (set = 4, binding = 11) u_SheenRoughnessSampler
-                        None, // TODO
+                        mat.sheen
+                            .as_ref()
+                            .and_then(|s| s.roughness_texture.as_ref()),
                         // (set = 4, binding = 12) u_SpecularSampler
-                        None, // TODO
+                        mat.specular.as_ref().and_then(|s| s.texture.as_ref()),
                         // (set = 4, binding = 13) u_SpecularColorSampler
-                        None, // TODO
+                        mat.specular.as_ref().and_then(|s| s.color_texture.as_ref()),
                         // (set = 4, binding = 14) u_TransmissionSampler
-                        None, // TODO
+                        mat.transmission.as_ref().and_then(|t| t.texture.as_ref()),
                         // (set = 4, binding = 15) u_TransmissionFramebufferSampler
                         None, // TODO
                         // (set = 4, binding = 16) u_ThicknessSampler
-                        None, // TODO
+                        mat.volume
+                            .as_ref()
+                            .and_then(|v| v.thickness_texture.as_ref()),
                         // (set = 4, binding = 17) u_IridescenceSampler
-                        None, // TODO
+                        mat.iridescence.as_ref().and_then(|i| i.texture.as_ref()),
                         // (set = 4, binding = 18) u_IridescenceThicknessSampler
-                        None, // TODO
+                        mat.iridescence
+                            .as_ref()
+                            .and_then(|i| i.thickness_texture.as_ref()),
                         // (set = 4, binding = 19) u_DiffuseTransmissionSampler
-                        None, // TODO
+                        mat.diffuse_transmission
+                            .as_ref()
+                            .and_then(|d| d.texture.as_ref()),
                         // (set = 4, binding = 20) u_DiffuseTransmissionColorSampler
-                        None, // TODO
+                        mat.diffuse_transmission
+                            .as_ref()
+                            .and_then(|d| d.color_texture.as_ref()),
                         // (set = 4, binding = 21) u_AnisotropySampler
-                        None, // TODO
+                        mat.anisotropy.as_ref().and_then(|a| a.texture.as_ref()),
                     ]
-                    .map(|t| t.map(|t| &self.textures[t.index]));
+                    .map(|opt_t| opt_t.map(|t| &self.textures[t.texture.index]));
 
-                    let material_set = DescriptorSet::new(
-                        self.descriptor_set_allocator.clone(),
-                        pipeline.layout().set_layouts().get(3).unwrap().clone(),
-                        [material_set, mat_sampler_set].into_iter(),
-                        [],
-                    )
-                    .unwrap();
+                    for prim in &mat_prim_map[mat_idx] {
+                        let mat_const = mat.into();
+                        let pcx = pipelines
+                            .entry(mat_const)
+                            .or_default()
+                            .entry(prim.object_constants)
+                            .or_insert_with(|| {
+                                let spec_constants = SpecializationConstants {
+                                    object_constants: prim.object_constants,
+                                    material_constants: mat_const,
+                                };
+                                let pipeline = build_pipeline(
+                                    self.context.device().clone(),
+                                    window_renderer.swapchain_format(),
+                                    vertex_shader.clone(),
+                                    fragment_shader.clone(),
+                                    spec_constants,
+                                    mat.double_sided,
+                                );
 
-                    let texture_set = DescriptorSet::new(
-                        self.descriptor_set_allocator.clone(),
-                        pipeline.layout().set_layouts().get(4).unwrap().clone(),
-                        textures
-                            .into_iter()
-                            .enumerate()
-                            .map(|(idx, texture)| match texture {
-                                Some(texture) => WriteDescriptorSet::image_view_sampler(
-                                    idx as u32,
-                                    texture.clone(),
-                                    self.sampler.clone(),
-                                ),
-                                None => WriteDescriptorSet::image_view_sampler(
-                                    idx as u32,
-                                    self.null_texture.clone(),
-                                    self.sampler.clone(),
-                                ),
-                            }),
-                        [],
-                    )
-                    .unwrap();
+                                let material_sets = HashMap::new();
+                                let const_set = DescriptorSet::new(
+                                    self.descriptor_set_allocator.clone(),
+                                    #[allow(clippy::get_first)]
+                                    pipeline.layout().set_layouts().get(0).unwrap().clone(),
+                                    [const_set.clone()],
+                                    [],
+                                )
+                                .unwrap();
+                                let skybox_set = DescriptorSet::new(
+                                    self.descriptor_set_allocator.clone(),
+                                    pipeline.layout().set_layouts().get(2).unwrap().clone(),
+                                    skybox_set.clone(),
+                                    [],
+                                )
+                                .unwrap();
 
-                    (material_set, texture_set)
-                })
-                .collect()
-        };
+                                let draw_infos = Vec::new();
 
-        let const_set = {
-            let const_set = {
-                let uniform = fs::Constants {
-                    u_MipCount: 5.into(), // TODO
-                    u_EnvRotation: [
-                        Padded([0f32, 0., 1.]),
-                        Padded([0., 1., 0.]),
-                        Padded([1., 0., 0.]),
-                    ]
-                    .into(),
-                    u_EnvIntensity: 1.0.into(),
-                    u_Exposure: 1.0.into(),
-                };
-                let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
-                *subbuffer.write().unwrap() = uniform;
-                WriteDescriptorSet::buffer(0, subbuffer)
-            };
+                                PipelineContext {
+                                    pipeline,
+                                    material_sets,
+                                    const_set,
+                                    skybox_set,
+                                    draw_infos,
+                                }
+                            });
 
-            DescriptorSet::new(
-                self.descriptor_set_allocator.clone(),
-                pipeline.layout().set_layouts().get(0).unwrap().clone(),
-                [const_set],
-                [],
-            )
-            .unwrap()
-        };
+                        pcx.draw_infos.push(prim.clone());
 
-        let skybox_set = {
-            let skybox_set = {
-                [
-                    &self.skyboxes.lambertian,
-                    &self.skyboxes.ggx,
-                    &self.skyboxes.lut_ggx,
-                    &self.skyboxes.charlie,
-                    &self.skyboxes.lut_charlie,
-                    &self.skyboxes.lut_sheen_e,
-                ]
-                .into_iter()
-                .enumerate()
-                .map(|(idx, texture)| {
-                    WriteDescriptorSet::image_view_sampler(
-                        idx as u32,
-                        texture.clone(),
-                        self.sampler.clone(),
-                    )
-                })
-            };
+                        pcx.material_sets.entry(mat_idx).or_insert_with(|| {
+                            let material_set = DescriptorSet::new(
+                                self.descriptor_set_allocator.clone(),
+                                pcx.pipeline.layout().set_layouts().get(3).unwrap().clone(),
+                                [material_set.clone(), mat_sampler_set.clone()].into_iter(),
+                                [],
+                            )
+                            .unwrap();
 
-            DescriptorSet::new(
-                self.descriptor_set_allocator.clone(),
-                pipeline.layout().set_layouts().get(2).unwrap().clone(),
-                skybox_set,
-                [],
-            )
-            .unwrap()
+                            let texture_set = DescriptorSet::new(
+                                self.descriptor_set_allocator.clone(),
+                                pcx.pipeline.layout().set_layouts().get(4).unwrap().clone(),
+                                textures
+                                    .into_iter()
+                                    .map(|t| t.unwrap_or(&self.null_texture))
+                                    .enumerate()
+                                    .map(|(idx, texture)| {
+                                        WriteDescriptorSet::image_view_sampler(
+                                            idx as u32,
+                                            texture.clone(),
+                                            self.wrap_sampler.clone(),
+                                        )
+                                    }),
+                                [],
+                            )
+                            .unwrap();
+
+                            (material_set, texture_set)
+                        });
+                    }
+                });
+
+            pipelines
         };
 
         self.rcx = Some(RenderContext {
             attachment_image_views,
             depth_image_view,
-            pipeline,
+            pipelines,
             viewport,
             frame_times,
-            material_sets,
-            const_set,
-            skybox_set,
         });
     }
 
@@ -1206,6 +1268,7 @@ impl ApplicationHandler for App {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
+        #[allow(clippy::single_match)]
         match event {
             DeviceEvent::MouseMotion { delta: (dx, dy) } => {
                 if self.input_state.cursor_confined {
@@ -1268,6 +1331,8 @@ impl ApplicationHandler for App {
                     let frame_time = total_time / rcx.frame_times.len() as u32;
                     let fps = rcx.frame_times.len() as f64 / total_time.as_secs_f64();
                     println!("{} fps ({:.2?})", fps as u32, frame_time);
+                    // dbg!(self.camera.position);
+                    // dbg!(self.camera.get_view_matrix());
                     rcx.frame_times.clear();
                 }
                 rcx.frame_times.push_back(frame_start);
@@ -1364,7 +1429,7 @@ impl ApplicationHandler for App {
                             //
                             // Only attachments that have `AttachmentLoadOp::Clear` are provided
                             // with clear values, any others should use `None` as the clear value.
-                            clear_value: Some([0.0, 0.0, 1.0, 1.0].into()),
+                            clear_value: Some([0.2, 0.2, 0.2, 1.0].into()),
                             ..RenderingAttachmentInfo::image_view(
                                 rcx.attachment_image_views[window_renderer.image_index() as usize]
                                     .clone(),
@@ -1383,8 +1448,6 @@ impl ApplicationHandler for App {
                     //
                     // TODO: Document state setting and how it affects subsequent draw commands.
                     .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
-                    .unwrap()
-                    .bind_pipeline_graphics(rcx.pipeline.clone())
                     .unwrap();
 
                 builder
@@ -1393,25 +1456,7 @@ impl ApplicationHandler for App {
                     .bind_index_buffer(self.index_buffer.clone())
                     .unwrap();
 
-                builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        rcx.pipeline.layout().clone(),
-                        0,
-                        rcx.const_set.clone(),
-                    )
-                    .unwrap();
-
-                builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        rcx.pipeline.layout().clone(),
-                        2,
-                        rcx.skybox_set.clone(),
-                    )
-                    .unwrap();
-
-                {
+                let cam_set = {
                     let proj = {
                         let aspect_ratio = window_size.width as f32 / window_size.height as f32;
                         let near = 0.005;
@@ -1430,128 +1475,108 @@ impl ApplicationHandler for App {
                         correction * proj
                     };
                     let view = self.camera.get_view_matrix();
-
+                    let position = self.camera.position;
                     let view_proj = proj * view;
 
                     let cam_uniform = fs::Camera {
                         u_ViewMatrix: view.into(),
                         u_ProjectionMatrix: proj.into(),
                         u_ViewProjectionMatrix: view_proj.into(),
-                        u_Camera: self.camera.position.into(),
+                        u_Camera: position.into(),
                     };
-
-                    /*
-                    let matrix = Matrix4::new(
-                        0.6345784664154053,
-                        0.,
-                        0.7728584408760071,
-                        0.,
-                        0.11100656539201736,
-                        0.9896312952041626,
-                        -0.09114524722099304,
-                        0.,
-                        -0.7648448944091797,
-                        0.14363117516040802,
-                        0.6279987096786499,
-                        0.,
-                        -2.3856077194213867,
-                        0.4475397765636444,
-                        1.769579529762268,
-                        1.
-                    );
-
-                    let proj = cgmath::perspective(
-                        Rad(0.7853981633974483),
-                        window_size.width as f32 / window_size.height as f32,
-                        0.0037298484617011808,
-                        37.29848461701181,
-                    );
-                    println!("{:?}",proj);
-
-                    let correction = Matrix4::<f32>::new(
-                        1.0, 0.0, 0.0, 0.0,
-                        0.0, -1.0, 0.0, 0.0,
-                        0.0, 0.0, 0.5, 0.0,
-                        0.0, 0.0, 0.5, 1.0,
-                    );
-
-                    let view_proj = correction * proj * matrix.invert().unwrap();
-
-
-                    let cam_uniform = fs::Camera {
-                        u_Camera: [matrix.w.x, matrix.w.y, matrix.w.z],
-                        u_ViewProjectionMatrix: view_proj.into(),
-                    };
-
-                     */
 
                     let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
                     *subbuffer.write().unwrap() = cam_uniform;
-                    let write_set = WriteDescriptorSet::buffer(0, subbuffer);
+                    WriteDescriptorSet::buffer(0, subbuffer)
+                };
 
-                    let set = DescriptorSet::new(
-                        self.descriptor_set_allocator.clone(),
-                        rcx.pipeline.layout().set_layouts().get(1).unwrap().clone(),
-                        [write_set],
-                        [],
-                    )
-                    .unwrap();
-
-                    builder
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Graphics,
-                            rcx.pipeline.layout().clone(),
-                            1,
-                            set,
-                        )
-                        .unwrap();
-                }
-
-                for object in &self.objects {
-                    {
-                        let model = object.transform;
-                        let normal = model.transpose().invert().unwrap();
-                        let uniform = fs::Object {
-                            u_ModelMatrix: model.into(),
-                            u_NormalMatrix: normal.into(),
-                        };
+                for obj_pipelines in rcx.pipelines.values() {
+                    for pcx in obj_pipelines.values() {
                         builder
-                            .push_constants(rcx.pipeline.layout().clone(), 0, uniform)
-                            .unwrap();
-                    }
-
-                    for prim in &self.draw_infos[object.mesh_idx] {
-                        let (mat_set, tex_set) = rcx.material_sets[prim.mat_idx].clone();
-
-                        builder
-                            .bind_descriptor_sets(
-                                PipelineBindPoint::Graphics,
-                                rcx.pipeline.layout().clone(),
-                                3,
-                                mat_set,
-                            )
+                            .bind_pipeline_graphics(pcx.pipeline.clone())
                             .unwrap();
 
                         builder
                             .bind_descriptor_sets(
                                 PipelineBindPoint::Graphics,
-                                rcx.pipeline.layout().clone(),
-                                4,
-                                tex_set,
-                            )
-                            .unwrap();
-
-                        unsafe {
-                            // We add a draw command.
-                            builder.draw_indexed(
-                                prim.index_count,
-                                1,
-                                prim.index_offset,
-                                prim.vertex_offset,
+                                pcx.pipeline.layout().clone(),
                                 0,
+                                pcx.const_set.clone(),
                             )
+                            .unwrap();
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                pcx.pipeline.layout().clone(),
+                                2,
+                                pcx.skybox_set.clone(),
+                            )
+                            .unwrap();
+
+                        {
+                            let set = DescriptorSet::new(
+                                self.descriptor_set_allocator.clone(),
+                                pcx.pipeline.layout().set_layouts().get(1).unwrap().clone(),
+                                [cam_set.clone()],
+                                [],
+                            )
+                            .unwrap();
+
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Graphics,
+                                    pcx.pipeline.layout().clone(),
+                                    1,
+                                    set,
+                                )
+                                .unwrap();
                         }
-                        .unwrap();
+
+                        for prim in &pcx.draw_infos {
+                            let (mat_set, tex_set) = pcx.material_sets[&prim.mat_idx].clone();
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Graphics,
+                                    pcx.pipeline.layout().clone(),
+                                    3,
+                                    mat_set,
+                                )
+                                .unwrap();
+
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Graphics,
+                                    pcx.pipeline.layout().clone(),
+                                    4,
+                                    tex_set,
+                                )
+                                .unwrap();
+
+                            for obj_idx in &prim.object_ids {
+                                let object = &self.objects[*obj_idx];
+                                let model = object.transform;
+                                let normal = model.transpose().invert().unwrap();
+                                let data = fs::Object {
+                                    u_ModelMatrix: model.into(),
+                                    u_NormalMatrix: normal.into(),
+                                };
+                                builder
+                                    .push_constants(pcx.pipeline.layout().clone(), 0, data)
+                                    .unwrap();
+
+                                unsafe {
+                                    // We add a draw command.
+                                    builder.draw_indexed(
+                                        prim.index_count,
+                                        1,
+                                        prim.index_offset,
+                                        prim.vertex_offset,
+                                        0,
+                                    )
+                                }
+                                .unwrap();
+                            }
+                        }
                     }
                 }
 
@@ -1580,12 +1605,14 @@ impl ApplicationHandler for App {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PrimitiveDrawInfo {
-    index_offset: u32,
-    vertex_offset: i32,
-    index_count: u32,
-    mat_idx: usize,
+    pub index_offset: u32,
+    pub vertex_offset: i32,
+    pub index_count: u32,
+    pub mat_idx: usize,
+    pub object_constants: ObjectSpecializationConstants,
+    pub object_ids: Vec<usize>,
 }
 
 fn create_buffer<T: BufferContents + Send + Sync, I: IntoIterator<Item = T>>(
@@ -1665,121 +1692,3 @@ where
 //
 // A more detailed overview of what the `shader!` macro generates can be found in the
 // vulkano-shaders crate docs. You can view them at https://docs.rs/vulkano-shaders/
-
-mod vs {
-    vulkano_shaders::shader! {
-        ty: "vertex",
-        path: "shaders/vert.glsl",
-        include: ["shaders"],
-        define: [
-            ("HAS_POSITION_VEC3", "1"),
-            ("HAS_TEXCOORD_0_VEC2", "1"),
-            // Keep synced with fragment shader
-            // ("HAS_TEXCOORD_0_VEC2", "1"),
-            // ("HAS_TEXCOORD_1_VEC2", "1"),
-            // ("HAS_VERT_NORMAL_UV_TRANSFORM", "1"),
-            // ("HAS_COLOR_0_VEC3", "1"),
-            // ("HAS_COLOR_0_VEC4", "1"),
-
-            // Unique to vertex shader
-            // ("USE_INSTANCING", "1"),
-            // ("USE_MORPHING", "1"),
-            // ("USE_SKINNING", "1"),
-        ],
-    }
-}
-
-mod fs {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/pbr.glsl",
-        include: ["shaders"],
-        define: [
-            ("HAS_NORMAL_MAP", "1"),
-            ("HAS_OCCLUSION_MAP", "1"),
-            ("HAS_EMISSIVE_MAP", "1"),
-            ("HAS_BASE_COLOR_MAP", "1"),
-            ("HAS_METALLIC_ROUGHNESS_MAP", "1"),
-            ("ALPHAMODE", "ALPHAMODE_OPAQUE"),
-            ("HAS_POSITION_VEC3", "1"),
-            ("HAS_TEXCOORD_0_VEC2", "1"),
-            ("USE_IBL", "1"),
-            ("TONEMAP_KHR_PBR_NEUTRAL", "1"),
-            ("DEBUG", "DEBUG_NONE"),
-            // sheen
-            // ("HAS_NORMAL_MAP", "1"),
-            // ("HAS_OCCLUSION_UV_TRANSFORM", "1"),
-            // ("HAS_OCCLUSION_MAP", "1"),
-            // ("HAS_BASECOLOR_UV_TRANSFORM", "1"),
-            // ("HAS_BASE_COLOR_MAP", "1"),
-            // ("ALPHAMODE", "ALPHAMODE_OPAQUE"),
-            // ("HAS_POSITION_VEC3", "1"),
-            // ("HAS_TEXCOORD_0_VEC2", "1"),
-            // ("HAS_TEXCOORD_1_VEC2", "1"),
-            // //("HAS_VERT_NORMAL_UV_TRANSFORM", "1"),
-            // ("USE_IBL", "1"),
-            // ("TONEMAP_KHR_PBR_NEUTRAL", "1"),
-            // ("DEBUG", "DEBUG_NORMAL_SHADING"),
-
-        //    // Keep synced with vertex shader
-        //    ("HAS_TEXCOORD_0_VEC2", "1"),
-        //    ("HAS_TEXCOORD_1_VEC2", "1"),
-        //    // ("HAS_COLOR_0_VEC3", "1"),
-        //    // ("HAS_COLOR_0_VEC4", "1"),
-
-        //    // Unique to fragment shader
-        //    ("DEBUG", "DEBUG_NONE"),
-        //    ("ALPHAMODE", "ALPHAMODE_OPAQUE"),
-        //    ("HAS_NORMAL_MAP", "1"),
-        //    ("HAS_BASE_COLOR_MAP", "1"),
-        //    ("HAS_EMISSIVE_MAP", "1"),
-        //    ("USE_IBL", "1"),
-        //    ("HAS_OCCLUSION_MAP", "1"),
-        //    ("HAS_METALLIC_ROUGHNESS_MAP", "1"),
-        //    ("TONEMAP_KHR_PBR_NEUTRAL", "1"),
-            // ("HAS_ANISOTROPY_MAP", "1"),
-            // ("HAS_ANISOTROPY_UV_TRANSFORM", "1"),
-            // ("HAS_BASECOLOR_UV_TRANSFORM", "1"),
-            // ("HAS_CLEARCOAT_MAP", "1"),
-            // ("HAS_CLEARCOAT_NORMAL_MAP", "1"),
-            // ("HAS_CLEARCOAT_ROUGHNESS_MAP", "1"),
-            // ("HAS_CLEARCOAT_UV_TRANSFORM", "1"),
-            // ("HAS_CLEARCOATNORMAL_UV_TRANSFORM", "1"),
-            // ("HAS_CLEARCOATROUGHNESS_UV_TRANSFORM", "1"),
-            // ("HAS_DIFFUSE_MAP", "1"),
-            // ("HAS_DIFFUSE_TRANSMISSION_COLOR_MAP", "1"),
-            // ("HAS_DIFFUSE_TRANSMISSION_MAP", "1"),
-            // ("HAS_DIFFUSE_UV_TRANSFORM", "1"),
-            // ("HAS_DIFFUSETRANSMISSION_UV_TRANSFORM", "1"),
-            // ("HAS_DIFFUSETRANSMISSIONCOLOR_UV_TRANSFORM", "1"),
-            // ("HAS_EMISSIVE_UV_TRANSFORM", "1"),
-            // ("HAS_IRIDESCENCE_MAP", "1"),
-            // ("HAS_IRIDESCENCE_THICKNESS_MAP", "1"),
-            // ("HAS_IRIDESCENCE_UV_TRANSFORM", "1"),
-            // ("HAS_IRIDESCENCETHICKNESS_UV_TRANSFORM", "1"),
-            // ("HAS_METALLICROUGHNESS_UV_TRANSFORM", "1"),
-            // ("HAS_NORMAL_UV_TRANSFORM", "1"),
-            // ("HAS_OCCLUSION_UV_TRANSFORM", "1"),
-            // ("HAS_SHEEN_COLOR_MAP", "1"),
-            // ("HAS_SHEEN_ROUGHNESS_MAP", "1"),
-            // ("HAS_SHEENCOLOR_UV_TRANSFORM", "1"),
-            // ("HAS_SHEENROUGHNESS_UV_TRANSFORM", "1"),
-            // ("HAS_SPECULAR_COLOR_MAP", "1"),
-            // ("HAS_SPECULAR_GLOSSINESS_MAP", "1"),
-            // ("HAS_SPECULAR_MAP", "1"),
-            // ("HAS_SPECULAR_UV_TRANSFORM", "1"),
-            // ("HAS_SPECULARCOLOR_UV_TRANSFORM", "1"),
-            // ("HAS_SPECULARGLOSSINESS_UV_TRANSFORM", "1"),
-            // ("HAS_THICKNESS_MAP", "1"),
-            // ("HAS_THICKNESS_UV_TRANSFORM", "1"),
-            // ("HAS_TRANSMISSION_MAP", "1"),
-            // ("HAS_TRANSMISSION_UV_TRANSFORM", "1"),
-            // ("LINEAR_OUTPUT", "1"),
-            // ("NOT_TRIANGLE", "1"),
-            // ("TONEMAP_ACES_HILL", "1"),
-            // ("TONEMAP_ACES_HILL_EXPOSURE_BOOST", "1"),
-            // ("TONEMAP_ACES_NARKOWICZ", "1"),
-            // ("USE_PUNCTUAL", "1"),
-        ],
-    }
-}

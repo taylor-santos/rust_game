@@ -1735,7 +1735,6 @@ dependencies = [
  "ktx2",
  "mikktspace",
  "rayon",
- "serde_json",
  "vulkano",
  "vulkano-shaders",
  "vulkano-util",

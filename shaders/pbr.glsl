@@ -16,9 +16,6 @@
 
 #version 450
 
-#define ALPHAMODE_OPAQUE 0
-#define ALPHAMODE_MASK 1
-#define ALPHAMODE_BLEND 2
 #define DEBUG_NONE 0
 #define DEBUG_NORMAL_SHADING 1
 #define DEBUG_NORMAL_TEXTURE 2
@@ -50,6 +47,13 @@
 #define DEBUG_ANISOTROPIC_DIRECTION 28
 
 precision highp float;
+
+layout (location = 0) in vec3 v_Position;
+layout (location = 1) in vec2 v_texcoord_0;
+layout (location = 2) in vec2 v_texcoord_1;
+layout (location = 3) in vec4 v_Color;
+layout (location = 4) in vec3 v_Normal;
+layout (location = 5) in mat3 v_TBN;
 
 layout (set = 0, binding = 0) uniform Constants {
     int     u_MipCount;
@@ -157,9 +161,9 @@ void main()
 {
     vec4 baseColor = getBaseColor();
 
-#if ALPHAMODE == ALPHAMODE_OPAQUE
-    baseColor.a = 1.0;
-#endif
+    if (ALPHAMODE_OPAQUE) {
+        baseColor.a = 1.0;
+    }
     vec3 color = vec3(0);
 
     vec3 v = normalize(camera.u_Camera - v_Position);
@@ -278,7 +282,6 @@ void main()
     }
 
     // Calculate lighting contribution from image based lighting source (IBL)
-
 #ifdef USE_IBL
     {
 #else
@@ -338,11 +341,11 @@ void main()
         color = f_sheen + color * albedoSheenScaling;
         color = mix(color, clearcoat_brdf, clearcoatFactor * clearcoatFresnel);
 
-#ifdef HAS_OCCLUSION_MAP
-        float ao = 1.0;
-        ao = texture(u_OcclusionSampler,  getOcclusionUV()).r;
-        color = color * (1.0 + s.u_OcclusionStrength * (ao - 1.0));
-#endif
+        if (HAS_OCCLUSION_MAP) {
+            float ao = 1.0;
+            ao = texture(u_OcclusionSampler,  getOcclusionUV()).r;
+            color = color * (1.0 + s.u_OcclusionStrength * (ao - 1.0));
+        }
 
     }
 
@@ -459,36 +462,32 @@ void main()
     if (MATERIAL_EMISSIVE_STRENGTH) {
         f_emissive *= material.u_EmissiveStrength;
     }
-#ifdef HAS_EMISSIVE_MAP
-    f_emissive *= texture(u_EmissiveSampler, getEmissiveUV()).rgb;
-#endif
+    if (HAS_EMISSIVE_MAP) {
+        f_emissive *= texture(u_EmissiveSampler, getEmissiveUV()).rgb;
+    }
 
 
     if (MATERIAL_UNLIT) {
         color = baseColor.rgb;
     } else {
-#if defined(NOT_TRIANGLE)
-        if (!HAS_NORMAL_VEC3) {
+        if (NOT_TRIANGLE && !HAS_NORMAL_VEC3) {
             //Points or Lines with no NORMAL attribute SHOULD be rendered without lighting and instead use the sum of the base color value and the emissive value.
             color = f_emissive + baseColor.rgb;
         } else {
             color = f_emissive * (1.0 - clearcoatFactor * clearcoatFresnel) + color;
         }
-#else
-        color = f_emissive * (1.0 - clearcoatFactor * clearcoatFresnel) + color;
-#endif
     }
 
 #if DEBUG == DEBUG_NONE
 
-#if ALPHAMODE == ALPHAMODE_MASK
-    // Late discard to avoid sampling artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
-    if (baseColor.a < material.u_AlphaCutoff)
-    {
-        discard;
+    if (ALPHAMODE_MASK) {
+        // Late discard to avoid sampling artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
+        if (baseColor.a < material.u_AlphaCutoff)
+        {
+            discard;
+        }
+        baseColor.a = 1.0;
     }
-    baseColor.a = 1.0;
-#endif
 
 #ifdef LINEAR_OUTPUT
     g_finalColor = vec4(color.rgb, baseColor.a);
@@ -512,14 +511,20 @@ void main()
     // Debug views:
 
     // Generic:
-#if DEBUG == DEBUG_UV_0 && defined(HAS_TEXCOORD_0_VEC2)
-    g_finalColor.rgb = vec3(v_texcoord_0, 0);
+#if DEBUG == DEBUG_UV_0
+    if (HAS_TEXCOORD_0_VEC2) {
+        g_finalColor.rgb = vec3(v_texcoord_0, 0);
+    }
 #endif
-#if DEBUG == DEBUG_UV_1 && defined(HAS_TEXCOORD_1_VEC2)
-    g_finalColor.rgb = vec3(v_texcoord_1, 0);
+#if DEBUG == DEBUG_UV_1
+    if (HAS_TEXCOORD_1_VEC2) {
+        g_finalColor.rgb = vec3(v_texcoord_1, 0);
+    }
 #endif
-#if DEBUG == DEBUG_NORMAL_TEXTURE && defined(HAS_NORMAL_MAP)
-    g_finalColor.rgb = (normalInfo.ntex + 1.0) / 2.0;
+#if DEBUG == DEBUG_NORMAL_TEXTURE
+    if (HAS_NORMAL_MAP) {
+        g_finalColor.rgb = (normalInfo.ntex + 1.0) / 2.0;
+    }
 #endif
 #if DEBUG == DEBUG_NORMAL_SHADING
     g_finalColor.rgb = (n + 1.0) / 2.0;
@@ -587,9 +592,9 @@ void main()
 
 #if DEBUG == DEBUG_SPECULAR_COLOR
         vec3 specularTexture = vec3(1.0);
-#ifdef HAS_SPECULAR_COLOR_MAP
-        specularTexture.rgb = texture(u_SpecularColorSampler, getSpecularColorUV()).rgb;
-#endif
+        if (HAS_SPECULAR_COLOR_MAP) {
+            specularTexture.rgb = texture(u_SpecularColorSampler, getSpecularColorUV()).rgb;
+        }
         g_finalColor.rgb = material.u_KHR_materials_specular_specularColorFactor * specularTexture.rgb;
 #endif
     }
@@ -602,7 +607,7 @@ void main()
     }
     if (MATERIAL_VOLUME) {
 #if DEBUG == DEBUG_VOLUME_THICKNESS
-        g_finalColor.rgb = vec3(materialInfo.thickness / u_ThicknessFactor);
+        g_finalColor.rgb = vec3(materialInfo.thickness / material.u_ThicknessFactor);
 #endif
     }
 
@@ -623,10 +628,10 @@ void main()
 #endif
 #if DEBUG == DEBUG_ANISOTROPIC_DIRECTION
         vec2 direction = vec2(1.0, 0.0);
-#ifdef HAS_ANISOTROPY_MAP
-        direction = texture(u_AnisotropySampler, getAnisotropyUV()).xy;
-        direction = direction * 2.0 - vec2(1.0); // [0, 1] -> [-1, 1]
-#endif
+        if (HAS_ANISOTROPY_MAP) {
+            direction = texture(u_AnisotropySampler, getAnisotropyUV()).xy;
+            direction = direction * 2.0 - vec2(1.0); // [0, 1] -> [-1, 1]
+        }
         vec2 directionRotation = material.u_Anisotropy.xy; // cos(theta), sin(theta)
         mat2 rotationMatrix = mat2(directionRotation.x, directionRotation.y, -directionRotation.y, directionRotation.x);
         direction = (direction + vec2(1.0)) * 0.5; // [-1, 1] -> [0, 1]

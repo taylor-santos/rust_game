@@ -1,3 +1,4 @@
+use std::f32::consts::PI;
 use std::ops::Neg;
 
 use cgmath::num_traits::clamp;
@@ -82,8 +83,8 @@ impl FirstPersonCamera {
 impl Default for FirstPersonCamera {
     fn default() -> Self {
         Self {
-            position: Point3::new(0.0, 0.0, -4.0),
-            yaw: Rad(0.0),
+            position: Point3::new(0.0, 0.0, 4.0),
+            yaw: Rad(PI),
             pitch: Rad(0.0),
             speed: 5.0,
             sensitivity: 0.1,
