@@ -145,6 +145,7 @@ struct InputState {
 struct RenderContext {
     attachment_image_views: Vec<Arc<ImageView>>,
     depth_image_view: Arc<ImageView>,
+    pipeline_layout: Arc<PipelineLayout>,
     pipelines: HashMap<
         MaterialSpecializationConstants,
         HashMap<ObjectSpecializationConstants, PipelineContext>,
@@ -765,6 +766,7 @@ fn build_pipeline(
     frag: Arc<ShaderModule>,
     specialization_constants: SpecializationConstants,
     double_sided: bool,
+    layout: Arc<PipelineLayout>,
 ) -> Arc<GraphicsPipeline> {
     // First, we load the shaders that the pipeline will use: the vertex shader and the
     // fragment shader.
@@ -794,78 +796,6 @@ fn build_pipeline(
         PipelineShaderStageCreateInfo::new(vs),
         PipelineShaderStageCreateInfo::new(fs),
     ];
-
-    // We must now create a **pipeline layout** object, which describes the locations and
-    // types of descriptor sets and push constants used by the shaders in the pipeline.
-    //
-    // Multiple pipelines can share a common layout object, which is more efficient. The
-    // shaders in a pipeline must use a subset of the resources described in its pipeline
-    // layout, but the pipeline layout is allowed to contain resources that are not present
-    // in the shaders; they can be used by shaders in other pipelines that share the same
-    // layout. Thus, it is a good idea to design shaders so that many pipelines have common
-    // resource locations, which allows them to share pipeline layouts.
-    let bindings = [
-        // set = 0
-        vec![
-            DescriptorType::UniformBuffer, // binding = 0 uniform Constants
-        ],
-        // set = 1
-        vec![
-            DescriptorType::UniformBuffer, // binding = 0 uniform Camera
-        ],
-        // set = 2
-        vec![DescriptorType::CombinedImageSampler; 6], // IBL Samplers
-        // set = 3
-        vec![
-            DescriptorType::UniformBuffer, // binding = 0 uniform Material
-            DescriptorType::UniformBuffer, // binding = 1 uniform MatSamplers
-        ],
-        // set = 4
-        vec![DescriptorType::CombinedImageSampler; 22], // Texture Samplers
-    ];
-
-    let push_constant_ranges = vec![PushConstantRange {
-        stages: ShaderStages::all_graphics(),
-        offset: 0,
-        size: size_of::<shader::fs::Object>() as u32,
-    }];
-
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineLayoutCreateInfo {
-            set_layouts: bindings
-                .into_iter()
-                .map(|set| {
-                    DescriptorSetLayout::new(
-                        device.clone(),
-                        DescriptorSetLayoutCreateInfo {
-                            bindings: set
-                                .into_iter()
-                                .enumerate()
-                                .map(|(idx, binding)| {
-                                    (
-                                        idx as u32,
-                                        (&DescriptorBindingRequirements {
-                                            descriptor_types: vec![binding],
-                                            descriptor_count: Some(1),
-                                            stages: ShaderStages::all_graphics(),
-                                            ..Default::default()
-                                        })
-                                            .into(),
-                                    )
-                                })
-                                .collect(),
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-                })
-                .collect::<Vec<_>>(),
-            push_constant_ranges,
-            ..Default::default()
-        },
-    )
-    .unwrap();
 
     // We describe the formats of attachment images where the colors, depth and/or stencil
     // information will be written. The pipeline will only be usable with this particular
@@ -979,16 +909,79 @@ impl ApplicationHandler for App {
         let vertex_shader = vs::load(self.context.device().clone()).unwrap();
         let fragment_shader = fs::load(self.context.device().clone()).unwrap();
 
-        // Before we draw, we have to create what is called a **pipeline**. A pipeline describes
-        // how a GPU operation is to be performed. It is similar to an OpenGL program, but it also
-        // contains many settings for customization, all baked into a single object. For drawing,
-        // we create a **graphics** pipeline, but there are also other types of pipeline.
-        // let pipeline = build_pipeline(
-        //     self.context.device().clone(),
-        //     window_renderer.swapchain_format(),
-        //     vertex_shader.clone(),
-        //     fragment_shader.clone(),
-        // );
+        let pipeline_layout = {
+            // We must now create a **pipeline layout** object, which describes the locations and
+            // types of descriptor sets and push constants used by the shaders in the pipeline.
+            //
+            // Multiple pipelines can share a common layout object, which is more efficient. The
+            // shaders in a pipeline must use a subset of the resources described in its pipeline
+            // layout, but the pipeline layout is allowed to contain resources that are not present
+            // in the shaders; they can be used by shaders in other pipelines that share the same
+            // layout. Thus, it is a good idea to design shaders so that many pipelines have common
+            // resource locations, which allows them to share pipeline layouts.
+            let bindings = [
+                // set = 0
+                vec![
+                    DescriptorType::UniformBuffer, // binding = 0 uniform Constants
+                ],
+                // set = 1
+                vec![
+                    DescriptorType::UniformBuffer, // binding = 0 uniform Camera
+                ],
+                // set = 2
+                vec![DescriptorType::CombinedImageSampler; 6], // IBL Samplers
+                // set = 3
+                vec![
+                    DescriptorType::UniformBuffer, // binding = 0 uniform Material
+                    DescriptorType::UniformBuffer, // binding = 1 uniform MatSamplers
+                ],
+                // set = 4
+                vec![DescriptorType::CombinedImageSampler; 22], // Texture Samplers
+            ];
+
+            let push_constant_ranges = vec![PushConstantRange {
+                stages: ShaderStages::all_graphics(),
+                offset: 0,
+                size: size_of::<fs::Object>() as u32,
+            }];
+
+            PipelineLayout::new(
+                self.context.device().clone(),
+                PipelineLayoutCreateInfo {
+                    set_layouts: bindings
+                        .into_iter()
+                        .map(|set| {
+                            DescriptorSetLayout::new(
+                                self.context.device().clone(),
+                                DescriptorSetLayoutCreateInfo {
+                                    bindings: set
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(idx, binding)| {
+                                            (
+                                                idx as u32,
+                                                (&DescriptorBindingRequirements {
+                                                    descriptor_types: vec![binding],
+                                                    descriptor_count: Some(1),
+                                                    stages: ShaderStages::all_graphics(),
+                                                    ..Default::default()
+                                                })
+                                                    .into(),
+                                            )
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>(),
+                    push_constant_ranges,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
 
         // Dynamic viewports allow us to recreate just the viewport when the window is resized.
         // Otherwise we would have to recreate the whole pipeline.
@@ -1014,27 +1007,6 @@ impl ApplicationHandler for App {
             }
             mat_prim_map
         };
-        /*
-        for object in self.objects {
-            for info in self.draw_infos[object.mesh_idx] {
-                let mat_idx = info.mat_idx;
-                let material_constants = mat_constants[mat_idx];
-                pipelines.entry(material_constants).or_default().entry(info.object_constants).or_insert_with(|| PipelineContext {
-                    pipeline: build_pipeline(
-                        self.context.device().clone(),
-                        window_renderer.swapchain_format(),
-                        vertex_shader.clone(),
-                        fragment_shader.clone(),
-                        SpecializationConstants {
-                            object_constants: info.object_constants,
-                            material_constants,
-                        }
-                    ),
-                });
-
-            }
-        }
-         */
 
         let const_set = {
             #[allow(clippy::useless_conversion)]
@@ -1186,20 +1158,21 @@ impl ApplicationHandler for App {
                                     fragment_shader.clone(),
                                     spec_constants,
                                     mat.double_sided,
+                                    pipeline_layout.clone(),
                                 );
 
                                 let material_sets = HashMap::new();
                                 let const_set = DescriptorSet::new(
                                     self.descriptor_set_allocator.clone(),
                                     #[allow(clippy::get_first)]
-                                    pipeline.layout().set_layouts().get(0).unwrap().clone(),
+                                    pipeline_layout.set_layouts().get(0).unwrap().clone(),
                                     [const_set.clone()],
                                     [],
                                 )
                                 .unwrap();
                                 let skybox_set = DescriptorSet::new(
                                     self.descriptor_set_allocator.clone(),
-                                    pipeline.layout().set_layouts().get(2).unwrap().clone(),
+                                    pipeline_layout.set_layouts().get(2).unwrap().clone(),
                                     skybox_set.clone(),
                                     [],
                                 )
@@ -1221,7 +1194,7 @@ impl ApplicationHandler for App {
                         pcx.material_sets.entry(mat_idx).or_insert_with(|| {
                             let material_set = DescriptorSet::new(
                                 self.descriptor_set_allocator.clone(),
-                                pcx.pipeline.layout().set_layouts().get(3).unwrap().clone(),
+                                pipeline_layout.set_layouts().get(3).unwrap().clone(),
                                 [material_set.clone(), mat_sampler_set.clone()].into_iter(),
                                 [],
                             )
@@ -1229,7 +1202,7 @@ impl ApplicationHandler for App {
 
                             let texture_set = DescriptorSet::new(
                                 self.descriptor_set_allocator.clone(),
-                                pcx.pipeline.layout().set_layouts().get(4).unwrap().clone(),
+                                pipeline_layout.set_layouts().get(4).unwrap().clone(),
                                 textures
                                     .into_iter()
                                     .map(|t| t.unwrap_or(&self.null_texture))
@@ -1256,6 +1229,7 @@ impl ApplicationHandler for App {
         self.rcx = Some(RenderContext {
             attachment_image_views,
             depth_image_view,
+            pipeline_layout,
             pipelines,
             viewport,
             frame_times,
@@ -1456,7 +1430,7 @@ impl ApplicationHandler for App {
                     .bind_index_buffer(self.index_buffer.clone())
                     .unwrap();
 
-                let cam_set = {
+                {
                     let proj = {
                         let aspect_ratio = window_size.width as f32 / window_size.height as f32;
                         let near = 0.005;
@@ -1487,8 +1461,25 @@ impl ApplicationHandler for App {
 
                     let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
                     *subbuffer.write().unwrap() = cam_uniform;
-                    WriteDescriptorSet::buffer(0, subbuffer)
-                };
+                    let write_set = WriteDescriptorSet::buffer(0, subbuffer);
+
+                    let set = DescriptorSet::new(
+                        self.descriptor_set_allocator.clone(),
+                        rcx.pipeline_layout.set_layouts().get(1).unwrap().clone(),
+                        [write_set.clone()],
+                        [],
+                    )
+                    .unwrap();
+
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            rcx.pipeline_layout.clone(),
+                            1,
+                            set,
+                        )
+                        .unwrap();
+                }
 
                 for obj_pipelines in rcx.pipelines.values() {
                     for pcx in obj_pipelines.values() {
@@ -1499,7 +1490,7 @@ impl ApplicationHandler for App {
                         builder
                             .bind_descriptor_sets(
                                 PipelineBindPoint::Graphics,
-                                pcx.pipeline.layout().clone(),
+                                rcx.pipeline_layout.clone(),
                                 0,
                                 pcx.const_set.clone(),
                             )
@@ -1507,37 +1498,18 @@ impl ApplicationHandler for App {
                         builder
                             .bind_descriptor_sets(
                                 PipelineBindPoint::Graphics,
-                                pcx.pipeline.layout().clone(),
+                                rcx.pipeline_layout.clone(),
                                 2,
                                 pcx.skybox_set.clone(),
                             )
                             .unwrap();
-
-                        {
-                            let set = DescriptorSet::new(
-                                self.descriptor_set_allocator.clone(),
-                                pcx.pipeline.layout().set_layouts().get(1).unwrap().clone(),
-                                [cam_set.clone()],
-                                [],
-                            )
-                            .unwrap();
-
-                            builder
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Graphics,
-                                    pcx.pipeline.layout().clone(),
-                                    1,
-                                    set,
-                                )
-                                .unwrap();
-                        }
 
                         for prim in &pcx.draw_infos {
                             let (mat_set, tex_set) = pcx.material_sets[&prim.mat_idx].clone();
                             builder
                                 .bind_descriptor_sets(
                                     PipelineBindPoint::Graphics,
-                                    pcx.pipeline.layout().clone(),
+                                    rcx.pipeline_layout.clone(),
                                     3,
                                     mat_set,
                                 )
@@ -1546,7 +1518,7 @@ impl ApplicationHandler for App {
                             builder
                                 .bind_descriptor_sets(
                                     PipelineBindPoint::Graphics,
-                                    pcx.pipeline.layout().clone(),
+                                    rcx.pipeline_layout.clone(),
                                     4,
                                     tex_set,
                                 )
@@ -1561,7 +1533,7 @@ impl ApplicationHandler for App {
                                     u_NormalMatrix: normal.into(),
                                 };
                                 builder
-                                    .push_constants(pcx.pipeline.layout().clone(), 0, data)
+                                    .push_constants(rcx.pipeline_layout.clone(), 0, data)
                                     .unwrap();
 
                                 unsafe {
@@ -1676,19 +1648,3 @@ where
 
     device_local_buffer
 }
-
-// The next step is to create the shaders.
-//
-// The raw shader creation API provided by the vulkano library is unsafe for various
-// reasons, so The `shader!` macro provides a way to generate a Rust module from GLSL
-// source - in the example below, the source is provided as a string input directly to the
-// shader, but a path to a source file can be provided as well. Note that the user must
-// specify the type of shader (e.g. "vertex", "fragment", etc.) using the `ty` option of
-// the macro.
-//
-// The items generated by the `shader!` macro include a `load` function which loads the
-// shader using an input logical device. The module also includes type definitions for
-// layout structures defined in the shader source, for example uniforms and push constants.
-//
-// A more detailed overview of what the `shader!` macro generates can be found in the
-// vulkano-shaders crate docs. You can view them at https://docs.rs/vulkano-shaders/
