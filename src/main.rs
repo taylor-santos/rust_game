@@ -13,7 +13,7 @@
 // original triangle example.
 
 use crate::camera::FirstPersonCamera;
-use crate::gltf::{load_gltf, CombinedVertex, Gltf, TextureFormat};
+use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, TextureFormat};
 use crate::material::Material;
 use crate::shader::*;
 use cgmath::{EuclideanSpace, Matrix, Matrix4, MetricSpace, SquareMatrix};
@@ -51,7 +51,7 @@ use vulkano::pipeline::graphics::color_blend::{
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::CullMode;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
-use vulkano::pipeline::PipelineBindPoint;
+use vulkano::pipeline::{Pipeline, PipelineBindPoint};
 use vulkano::shader::{DescriptorBindingRequirements, ShaderModule, ShaderStages};
 use vulkano::swapchain::PresentMode;
 use vulkano::{
@@ -149,9 +149,15 @@ struct RenderContext {
     depth_image_view: Arc<ImageView>,
     pipeline_layout: Arc<PipelineLayout>,
     pipelines: Vec<PipelineContext>,
+    cubemap_pipeline: Arc<GraphicsPipeline>,
+    cubemap_index_buffer: Subbuffer<[u32]>,
+    cubemap_vertex_buffer: Subbuffer<[CubemapVertex]>,
+    cubemap_index_count: u32,
     pipeline_map:
         HashMap<MaterialSpecializationConstants, HashMap<ObjectSpecializationConstants, usize>>,
     intermediate_image_view: Arc<ImageView>,
+    const_set: Arc<DescriptorSet>,
+    skybox_set: Arc<DescriptorSet>,
     framebuffer_set: Arc<DescriptorSet>,
     viewport: Viewport,
     frame_times: VecDeque<Instant>,
@@ -913,11 +919,89 @@ fn build_pipeline(
     .unwrap()
 }
 
+fn build_cubemap_pipeline(
+    device: Arc<Device>,
+    swapchain_format: Format,
+    vert: Arc<ShaderModule>,
+    frag: Arc<ShaderModule>,
+    layout: Arc<PipelineLayout>,
+) -> Arc<GraphicsPipeline> {
+    // First, we load the shaders that the pipeline will use: the vertex shader and the
+    // fragment shader.
+    //
+    // A Vulkan shader can in theory contain multiple entry points, so we have to specify
+    // which one.
+
+    let vs = vert.entry_point("main").unwrap();
+    let fs = frag.entry_point("main").unwrap();
+
+    // Automatically generate a vertex input state from the vertex shader's input
+    // interface, that takes a single vertex buffer containing `Vertex` structs.
+    let vertex_input_state = CubemapVertex::per_vertex().definition(&vs).unwrap();
+
+    // Make a list of the shader stages that the pipeline will have.
+    let stages = [
+        PipelineShaderStageCreateInfo::new(vs),
+        PipelineShaderStageCreateInfo::new(fs),
+    ];
+
+    // We describe the formats of attachment images where the colors, depth and/or stencil
+    // information will be written. The pipeline will only be usable with this particular
+    // configuration of the attachment images.
+    let subpass = PipelineRenderingCreateInfo {
+        // We specify a single color attachment that will be rendered to. When we begin
+        // rendering, we will specify a swapchain image to be used as this attachment, so
+        // here we set its format to be the same format as the swapchain.
+        color_attachment_formats: vec![Some(swapchain_format)],
+        ..Default::default()
+    };
+
+    let color_blend_state = ColorBlendState::with_attachment_states(
+        subpass.color_attachment_formats.len() as u32,
+        ColorBlendAttachmentState::default(),
+    );
+
+    // Finally, create the pipeline.
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            // How vertex data is read from the vertex buffers into the vertex shader.
+            vertex_input_state: Some(vertex_input_state),
+            // How vertices are arranged into primitive shapes. The default primitive shape
+            // is a triangle.
+            input_assembly_state: Some(InputAssemblyState::default()),
+            // How primitives are transformed and clipped to fit the framebuffer. We use a
+            // resizable viewport, set to draw over the entire window.
+            viewport_state: Some(ViewportState::default()),
+            // How polygons are culled and converted into a raster of pixels. The default
+            // value does not perform any culling.
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..Default::default()
+            }),
+            // How multiple fragment shader samples are converted to a single pixel value.
+            // The default value does not perform any multisampling.
+            multisample_state: Some(MultisampleState::default()),
+            // How pixel values are combined with the values already present in the
+            // framebuffer. The default value overwrites the old value with the new one,
+            // without any blending.
+            color_blend_state: Some(color_blend_state),
+            // Dynamic states allows us to specify parts of the pipeline settings when
+            // recording the command buffer, before we perform drawing. Here, we specify
+            // that the viewport should be dynamic.
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .unwrap()
+}
+
 struct PipelineContext {
     pipeline: Arc<GraphicsPipeline>,
     material_sets: HashMap<usize, (Arc<DescriptorSet>, Arc<DescriptorSet>)>,
-    const_set: Arc<DescriptorSet>,
-    skybox_set: Arc<DescriptorSet>,
     prim_indices: Vec<usize>,
 }
 
@@ -930,23 +1014,6 @@ impl PipelineContext {
     ) {
         builder
             .bind_pipeline_graphics(self.pipeline.clone())
-            .unwrap();
-
-        builder
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                pipeline_layout.clone(),
-                0,
-                self.const_set.clone(),
-            )
-            .unwrap();
-        builder
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                pipeline_layout.clone(),
-                2,
-                self.skybox_set.clone(),
-            )
             .unwrap();
 
         for prim_idx in self.prim_indices.iter().copied() {
@@ -1008,7 +1075,7 @@ impl ApplicationHandler for App {
             event_loop,
             &self.context,
             &WindowDescriptor {
-                present_mode: PresentMode::Mailbox,
+                present_mode: PresentMode::Immediate,
                 width: 1024.,
                 height: 1024.,
                 scale_factor_override: Some(1.0),
@@ -1321,29 +1388,12 @@ impl ApplicationHandler for App {
                                 );
 
                                 let material_sets = HashMap::new();
-                                let const_set = DescriptorSet::new(
-                                    self.descriptor_set_allocator.clone(),
-                                    #[allow(clippy::get_first)]
-                                    pipeline_layout.set_layouts().get(0).unwrap().clone(),
-                                    [const_set.clone()],
-                                    [],
-                                )
-                                .unwrap();
-                                let skybox_set = DescriptorSet::new(
-                                    self.descriptor_set_allocator.clone(),
-                                    pipeline_layout.set_layouts().get(2).unwrap().clone(),
-                                    skybox_set.clone(),
-                                    [],
-                                )
-                                .unwrap();
 
                                 let prim_indices = Vec::new();
 
                                 let pipeline = PipelineContext {
                                     pipeline,
                                     material_sets,
-                                    const_set,
-                                    skybox_set,
                                     prim_indices,
                                 };
                                 let pipeline_idx = pipelines.len();
@@ -1392,14 +1442,21 @@ impl ApplicationHandler for App {
             (pipelines, pipeline_map)
         };
 
-        println!("Rendering {} material variants:", pipelines.len());
-        for (idx, (k, v)) in pipeline_map.iter().enumerate() {
-            println!(" {}) {}", idx + 1, k);
-            println!("\tWith {} object variants:", v.keys().len());
-            for (idx, k) in v.keys().enumerate() {
-                println!("\t {}) {}", idx + 1, k);
-            }
-        }
+        let const_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            #[allow(clippy::get_first)]
+            pipeline_layout.set_layouts().get(0).unwrap().clone(),
+            [const_set.clone()],
+            [],
+        )
+        .unwrap();
+        let skybox_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            pipeline_layout.set_layouts().get(2).unwrap().clone(),
+            skybox_set.clone(),
+            [],
+        )
+        .unwrap();
 
         // Create descriptor set for the intermediate image (set 5)
         let framebuffer_set = {
@@ -1418,13 +1475,135 @@ impl ApplicationHandler for App {
             .unwrap()
         };
 
+        let cubemap_pipeline = {
+            let vertex_shader = cubemap_vs::load(self.context.device().clone()).unwrap();
+            let fragment_shader = cubemap_fs::load(self.context.device().clone()).unwrap();
+
+            let cubemap_layout = {
+                let bindings = [
+                    // set = 0
+                    vec![
+                        DescriptorType::UniformBuffer, // binding = 0 uniform Constants
+                    ],
+                    // set = 1
+                    vec![
+                        DescriptorType::UniformBuffer, // binding = 0 uniform Camera
+                    ],
+                    // set = 2
+                    vec![DescriptorType::CombinedImageSampler; 6], // IBL Samplers
+                ];
+
+                PipelineLayout::new(
+                    self.context.device().clone(),
+                    PipelineLayoutCreateInfo {
+                        set_layouts: bindings
+                            .into_iter()
+                            .map(|set| {
+                                DescriptorSetLayout::new(
+                                    self.context.device().clone(),
+                                    DescriptorSetLayoutCreateInfo {
+                                        bindings: set
+                                            .into_iter()
+                                            .enumerate()
+                                            .map(|(idx, binding)| {
+                                                (
+                                                    idx as u32,
+                                                    (&DescriptorBindingRequirements {
+                                                        descriptor_types: vec![binding],
+                                                        descriptor_count: Some(1),
+                                                        stages: ShaderStages::all_graphics(),
+                                                        ..Default::default()
+                                                    })
+                                                        .into(),
+                                                )
+                                            })
+                                            .collect(),
+                                        ..Default::default()
+                                    },
+                                )
+                                .unwrap()
+                            })
+                            .collect::<Vec<_>>(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            };
+
+            build_cubemap_pipeline(
+                self.context.device().clone(),
+                window_renderer.swapchain_format(),
+                vertex_shader,
+                fragment_shader,
+                cubemap_layout,
+            )
+        };
+
+        let (cubemap_vertex_buffer, cubemap_index_buffer, cubemap_index_count) = {
+            let vertices: Vec<CubemapVertex> = [
+                [-1.0, -1.0, -1.0],
+                [1.0, -1.0, -1.0],
+                [1.0, 1.0, -1.0],
+                [-1.0, 1.0, -1.0],
+                [-1.0, -1.0, 1.0],
+                [1.0, -1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [-1.0, 1.0, 1.0],
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+
+            let indices: Vec<u32> = [
+                1, 2, 0, 2, 3, 0, 6, 2, 1, 1, 5, 6, 6, 5, 4, 4, 7, 6, 6, 3, 2, 7, 3, 6, 3, 7, 0, 7,
+                4, 0, 5, 1, 0, 4, 5, 0u32,
+            ]
+            .into_iter()
+            .collect();
+
+            let index_count = indices.len() as u32;
+
+            let vertex_buffer = create_buffer(
+                self.memory_allocator.clone(),
+                self.command_buffer_allocator.clone(),
+                self.context.graphics_queue().clone(),
+                BufferUsage::VERTEX_BUFFER,
+                vertices,
+            );
+
+            let index_buffer = create_buffer(
+                self.memory_allocator.clone(),
+                self.command_buffer_allocator.clone(),
+                self.context.graphics_queue().clone(),
+                BufferUsage::INDEX_BUFFER,
+                indices,
+            );
+
+            (vertex_buffer, index_buffer, index_count)
+        };
+
+        println!("Rendering {} material variants:", pipelines.len());
+        for (idx, (k, v)) in pipeline_map.iter().enumerate() {
+            println!(" {}) {}", idx + 1, k);
+            println!("\tWith {} object variants:", v.keys().len());
+            for (idx, k) in v.keys().enumerate() {
+                println!("\t {}) {}", idx + 1, k);
+            }
+        }
+
         self.rcx = Some(RenderContext {
             attachment_image_views,
             depth_image_view,
             pipeline_layout,
             pipelines,
+            cubemap_pipeline,
+            cubemap_vertex_buffer,
+            cubemap_index_buffer,
+            cubemap_index_count,
             pipeline_map,
             intermediate_image_view,
+            const_set,
+            skybox_set,
             framebuffer_set,
             viewport,
             frame_times,
@@ -1653,22 +1832,7 @@ impl ApplicationHandler for App {
                     b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                builder
-                    .bind_vertex_buffers(0, self.vertex_buffer.clone())
-                    .unwrap()
-                    .bind_index_buffer(self.index_buffer.clone())
-                    .unwrap();
-
-                builder
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        rcx.pipeline_layout.clone(),
-                        5,
-                        rcx.framebuffer_set.clone(),
-                    )
-                    .unwrap();
-
-                {
+                let cam_set = {
                     let aspect_ratio = window_size.width as f32 / window_size.height as f32;
                     let proj = self.camera.projection_matrix(aspect_ratio);
                     let view = self.camera.view_matrix();
@@ -1686,34 +1850,124 @@ impl ApplicationHandler for App {
                     *subbuffer.write().unwrap() = cam_uniform;
                     let write_set = WriteDescriptorSet::buffer(0, subbuffer);
 
-                    let set = DescriptorSet::new(
+                    DescriptorSet::new(
                         self.descriptor_set_allocator.clone(),
                         rcx.pipeline_layout.set_layouts().get(1).unwrap().clone(),
                         [write_set.clone()],
                         [],
                     )
-                    .unwrap();
-
-                    builder
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Graphics,
-                            rcx.pipeline_layout.clone(),
-                            1,
-                            set,
-                        )
-                        .unwrap();
-                }
+                    .unwrap()
+                };
 
                 builder
                     .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
                     .unwrap();
 
+                {
+                    builder
+                        .begin_rendering(RenderingInfo {
+                            color_attachments: vec![Some(RenderingAttachmentInfo {
+                                load_op: AttachmentLoadOp::Clear,
+                                store_op: AttachmentStoreOp::Store,
+                                clear_value: Some([0.2, 0.2, 0.2, 1.0].into()),
+                                ..RenderingAttachmentInfo::image_view(
+                                    rcx.attachment_image_views
+                                        [window_renderer.image_index() as usize]
+                                        .clone(),
+                                )
+                            })],
+                            ..Default::default()
+                        })
+                        .unwrap();
+
+                    builder
+                        .bind_pipeline_graphics(rcx.cubemap_pipeline.clone())
+                        .unwrap();
+
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            rcx.cubemap_pipeline.layout().clone(),
+                            0,
+                            rcx.const_set.clone(),
+                        )
+                        .unwrap();
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            rcx.cubemap_pipeline.layout().clone(),
+                            1,
+                            cam_set.clone(),
+                        )
+                        .unwrap();
+                    builder
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            rcx.cubemap_pipeline.layout().clone(),
+                            2,
+                            rcx.skybox_set.clone(),
+                        )
+                        .unwrap();
+
+                    builder
+                        .bind_index_buffer(rcx.cubemap_index_buffer.clone())
+                        .unwrap()
+                        .bind_vertex_buffers(0, rcx.cubemap_vertex_buffer.clone())
+                        .unwrap();
+
+                    unsafe { builder.draw_indexed(rcx.cubemap_index_count, 1, 0, 0, 0) }.unwrap();
+                    builder
+                        // We leave the render pass.
+                        .end_rendering()
+                        .unwrap();
+                }
+
+                builder
+                    .bind_vertex_buffers(0, self.vertex_buffer.clone())
+                    .unwrap()
+                    .bind_index_buffer(self.index_buffer.clone())
+                    .unwrap();
+
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        rcx.pipeline_layout.clone(),
+                        0,
+                        rcx.const_set.clone(),
+                    )
+                    .unwrap();
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        rcx.pipeline_layout.clone(),
+                        1,
+                        cam_set,
+                    )
+                    .unwrap();
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        rcx.pipeline_layout.clone(),
+                        2,
+                        rcx.skybox_set.clone(),
+                    )
+                    .unwrap();
+
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        rcx.pipeline_layout.clone(),
+                        5,
+                        rcx.framebuffer_set.clone(),
+                    )
+                    .unwrap();
+
                 builder
                     .begin_rendering(RenderingInfo {
                         color_attachments: vec![Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Clear,
+                            load_op: AttachmentLoadOp::Load,
                             store_op: AttachmentStoreOp::Store,
-                            clear_value: Some([0.2, 0.2, 0.2, 1.0].into()),
+                            clear_value: None,
                             ..RenderingAttachmentInfo::image_view(
                                 rcx.attachment_image_views[window_renderer.image_index() as usize]
                                     .clone(),
@@ -1773,22 +2027,6 @@ impl ApplicationHandler for App {
                         if curr_pcx != Some(pcx_idx) {
                             builder
                                 .bind_pipeline_graphics(pcx.pipeline.clone())
-                                .unwrap();
-                            builder
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Graphics,
-                                    rcx.pipeline_layout.clone(),
-                                    0,
-                                    pcx.const_set.clone(),
-                                )
-                                .unwrap();
-                            builder
-                                .bind_descriptor_sets(
-                                    PipelineBindPoint::Graphics,
-                                    rcx.pipeline_layout.clone(),
-                                    2,
-                                    pcx.skybox_set.clone(),
-                                )
                                 .unwrap();
                             curr_pcx = Some(pcx_idx);
                         }
@@ -1924,7 +2162,7 @@ impl ApplicationHandler for App {
                     .unwrap()
                     .boxed();
 
-                window_renderer.present(future, false);
+                window_renderer.present(future, true);
             }
             _ => {}
         }

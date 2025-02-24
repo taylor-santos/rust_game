@@ -32,6 +32,19 @@ pub struct CombinedVertex {
     a_color_0: [f32; 4],
 }
 
+#[derive(BufferContents, Vertex, Debug)]
+#[repr(C)]
+pub struct CubemapVertex {
+    #[format(R32G32B32_SFLOAT)]
+    a_position: [f32; 3],
+}
+
+impl From<[f32; 3]> for CubemapVertex {
+    fn from(a_position: [f32; 3]) -> Self {
+        Self { a_position }
+    }
+}
+
 #[derive(Debug)]
 pub struct Primitive {
     pub vertices: Vec<CombinedVertex>,

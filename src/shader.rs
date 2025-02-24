@@ -5,7 +5,7 @@ use vulkano::shader::SpecializationConstant;
 pub mod vs {
     vulkano_shaders::shader! {
         ty: "vertex",
-        path: "shaders/vert.glsl",
+        path: "shaders/pbr.vert",
         include: ["shaders"],
         define: [
             // ("USE_INSTANCING", "1"),
@@ -18,7 +18,7 @@ pub mod vs {
 pub mod fs {
     vulkano_shaders::shader! {
         ty: "fragment",
-        path: "shaders/pbr.glsl",
+        path: "shaders/pbr.frag",
         include: ["shaders"],
         define: [
             ("USE_IBL", "1"),
@@ -60,6 +60,29 @@ pub mod fs {
             // ("DEBUG", "DEBUG_UV_1"),
             // ("DEBUG", "DEBUG_VOLUME_THICKNESS"),
         ],
+    }
+}
+
+pub mod cubemap_vs {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        path: "shaders/cubemap.vert",
+        include: ["shaders"],
+    }
+}
+
+pub mod cubemap_fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "shaders/cubemap.frag",
+        include: ["shaders"],
+        define: [
+            ("TONEMAP_KHR_PBR_NEUTRAL", "1"),
+            // ("TONEMAP_ACES_HILL", "1"),
+            // ("TONEMAP_ACES_HILL_EXPOSURE_BOOST", "1"),
+            // ("TONEMAP_ACES_NARKOWICZ", "1"),
+            // ("LINEAR_OUTPUT", "1"),
+        ]
     }
 }
 

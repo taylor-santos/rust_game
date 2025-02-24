@@ -55,14 +55,6 @@ layout (location = 3) in vec4 v_Color;
 layout (location = 4) in vec3 v_Normal;
 layout (location = 5) in mat3 v_TBN;
 
-layout (set = 0, binding = 0) uniform Constants {
-    int     u_MipCount;
-    int     u_FramebufferMipCount;
-    mat3    u_EnvRotation;
-    float   u_EnvIntensity;
-    float   u_Exposure;
-} c;
-
 #include <shared.glsl>
 #include <tonemapping.glsl>
 #include <textures.glsl>

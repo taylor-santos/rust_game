@@ -72,6 +72,21 @@ layout (push_constant) uniform Object {
     mat4 u_NormalMatrix;
 } object;
 
+layout (set = 0, binding = 0) uniform Constants {
+    int     u_MipCount;
+    int     u_FramebufferMipCount;
+    mat3    u_EnvRotation;
+    float   u_EnvIntensity;
+    float   u_Exposure;
+} c;
+
+layout (set = 1, binding = 0) uniform Camera {
+    mat4 u_ViewMatrix;
+    mat4 u_ProjectionMatrix;
+    mat4 u_ViewProjectionMatrix;
+    vec3 u_Camera;
+} camera;
+
 layout (set = 3, binding = 0) uniform Material {
     // Metallic Roughness
     float u_MetallicFactor;
@@ -130,10 +145,3 @@ layout (set = 3, binding = 0) uniform Material {
 
     mat3 u_vertNormalUVTransform;
 } material;
-
-layout (set = 1, binding = 0) uniform Camera {
-    mat4 u_ViewMatrix;
-    mat4 u_ProjectionMatrix;
-    mat4 u_ViewProjectionMatrix;
-    vec3 u_Camera;
-} camera;
