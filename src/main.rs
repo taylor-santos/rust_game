@@ -35,9 +35,9 @@ use vulkano::descriptor_set::layout::{
 };
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::{Device, DeviceOwned};
-use vulkano::format::Format;
+use vulkano::format::{ClearValue, Format};
 use vulkano::half::f16;
-use vulkano::image::sampler::SamplerAddressMode::{ClampToEdge, Repeat};
+use vulkano::image::sampler::SamplerAddressMode::{ClampToEdge, MirroredRepeat, Repeat};
 use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo};
 use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{
@@ -113,6 +113,12 @@ struct Skybox {
     pub lut_sheen_e: Arc<ImageView>,
 }
 
+struct Samplers {
+    mirror_sampler_mipmap: Arc<Sampler>,
+    clamp_sampler_no_mipmap: Arc<Sampler>,
+    wrap_sampler_mipmap: Arc<Sampler>,
+}
+
 struct App {
     context: VulkanoContext,
     windows: VulkanoWindows,
@@ -127,8 +133,7 @@ struct App {
     textures: Vec<Arc<ImageView>>,
     null_texture: Arc<ImageView>,
     skyboxes: Skybox,
-    sampler: Arc<Sampler>,
-    wrap_sampler: Arc<Sampler>,
+    samplers: Samplers,
     camera: FirstPersonCamera,
     input_state: InputState,
     rcx: Option<RenderContext>,
@@ -716,7 +721,7 @@ impl App {
             .wait(None)
             .unwrap();
 
-        let sampler = Sampler::new(
+        let clamp_sampler_no_mipmap = Sampler::new(
             context.device().clone(),
             SamplerCreateInfo {
                 address_mode: [ClampToEdge, ClampToEdge, Repeat],
@@ -725,7 +730,16 @@ impl App {
         )
         .expect("Couldn't create sampler");
 
-        let wrap_sampler = Sampler::new(
+        let mirror_sampler_mipmap = Sampler::new(
+            context.device().clone(),
+            SamplerCreateInfo {
+                address_mode: [MirroredRepeat, MirroredRepeat, Repeat],
+                ..SamplerCreateInfo::simple_repeat_linear()
+            },
+        )
+        .expect("Couldn't create sampler");
+
+        let wrap_sampler_mipmap = Sampler::new(
             context.device().clone(),
             SamplerCreateInfo {
                 address_mode: [Repeat; 3],
@@ -733,6 +747,12 @@ impl App {
             },
         )
         .expect("Couldn't create sampler");
+
+        let samplers = Samplers {
+            mirror_sampler_mipmap,
+            clamp_sampler_no_mipmap,
+            wrap_sampler_mipmap,
+        };
 
         let camera = FirstPersonCamera::new();
 
@@ -750,8 +770,7 @@ impl App {
             textures,
             null_texture,
             skyboxes,
-            sampler,
-            wrap_sampler,
+            samplers,
             camera,
             input_state: Default::default(),
             rcx: None,
@@ -945,14 +964,17 @@ fn build_cubemap_pipeline(
         PipelineShaderStageCreateInfo::new(fs),
     ];
 
-    // We describe the formats of attachment images where the colors, depth and/or stencil
-    // information will be written. The pipeline will only be usable with this particular
-    // configuration of the attachment images.
     let subpass = PipelineRenderingCreateInfo {
-        // We specify a single color attachment that will be rendered to. When we begin
-        // rendering, we will specify a swapchain image to be used as this attachment, so
-        // here we set its format to be the same format as the swapchain.
         color_attachment_formats: vec![Some(swapchain_format)],
+        depth_attachment_format: Some(Format::D32_SFLOAT),
+        ..Default::default()
+    };
+
+    let depth_stencil_state = DepthStencilState {
+        depth: Some(DepthState {
+            write_enable: false,
+            compare_op: CompareOp::LessOrEqual,
+        }),
         ..Default::default()
     };
 
@@ -988,6 +1010,7 @@ fn build_cubemap_pipeline(
             // framebuffer. The default value overwrites the old value with the new one,
             // without any blending.
             color_blend_state: Some(color_blend_state),
+            depth_stencil_state: Some(depth_stencil_state),
             // Dynamic states allows us to specify parts of the pipeline settings when
             // recording the command buffer, before we perform drawing. Here, we specify
             // that the viewport should be dynamic.
@@ -1259,12 +1282,24 @@ impl ApplicationHandler for App {
 
         let skybox_set = {
             [
-                (&self.skyboxes.lambertian, &self.wrap_sampler),
-                (&self.skyboxes.ggx, &self.wrap_sampler),
-                (&self.skyboxes.charlie, &self.wrap_sampler),
-                (&self.skyboxes.lut_ggx, &self.sampler),
-                (&self.skyboxes.lut_charlie, &self.sampler),
-                (&self.skyboxes.lut_sheen_e, &self.sampler),
+                (
+                    &self.skyboxes.lambertian,
+                    &self.samplers.wrap_sampler_mipmap,
+                ),
+                (&self.skyboxes.ggx, &self.samplers.wrap_sampler_mipmap),
+                (&self.skyboxes.charlie, &self.samplers.wrap_sampler_mipmap),
+                (
+                    &self.skyboxes.lut_ggx,
+                    &self.samplers.clamp_sampler_no_mipmap,
+                ),
+                (
+                    &self.skyboxes.lut_charlie,
+                    &self.samplers.clamp_sampler_no_mipmap,
+                ),
+                (
+                    &self.skyboxes.lut_sheen_e,
+                    &self.samplers.clamp_sampler_no_mipmap,
+                ),
             ]
             .into_iter()
             .enumerate()
@@ -1427,7 +1462,7 @@ impl ApplicationHandler for App {
                                             WriteDescriptorSet::image_view_sampler(
                                                 idx as u32,
                                                 texture.clone(),
-                                                self.wrap_sampler.clone(),
+                                                self.samplers.wrap_sampler_mipmap.clone(),
                                             )
                                         }),
                                     [],
@@ -1464,7 +1499,7 @@ impl ApplicationHandler for App {
             let write_set = WriteDescriptorSet::image_view_sampler(
                 0,
                 intermediate_image_view.clone(),
-                self.wrap_sampler.clone(), // Use appropriate sampler
+                self.samplers.mirror_sampler_mipmap.clone(),
             );
             DescriptorSet::new(
                 self.descriptor_set_allocator.clone(),
@@ -1730,7 +1765,7 @@ impl ApplicationHandler for App {
                             let write_set = WriteDescriptorSet::image_view_sampler(
                                 0,
                                 rcx.intermediate_image_view.clone(),
-                                self.wrap_sampler.clone(),
+                                self.samplers.mirror_sampler_mipmap.clone(),
                             );
                             DescriptorSet::new(
                                 self.descriptor_set_allocator.clone(),
@@ -1863,23 +1898,28 @@ impl ApplicationHandler for App {
                     .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
                     .unwrap();
 
-                {
-                    builder
-                        .begin_rendering(RenderingInfo {
-                            color_attachments: vec![Some(RenderingAttachmentInfo {
-                                load_op: AttachmentLoadOp::Clear,
-                                store_op: AttachmentStoreOp::Store,
-                                clear_value: Some([0.2, 0.2, 0.2, 1.0].into()),
-                                ..RenderingAttachmentInfo::image_view(
-                                    rcx.attachment_image_views
-                                        [window_renderer.image_index() as usize]
-                                        .clone(),
-                                )
-                            })],
-                            ..Default::default()
-                        })
-                        .unwrap();
+                builder
+                    .begin_rendering(RenderingInfo {
+                        color_attachments: vec![Some(RenderingAttachmentInfo {
+                            load_op: AttachmentLoadOp::Clear,
+                            store_op: AttachmentStoreOp::Store,
+                            clear_value: Some(ClearValue::Float([1.0, 0.0, 1.0, 1.0])),
+                            ..RenderingAttachmentInfo::image_view(
+                                rcx.attachment_image_views[window_renderer.image_index() as usize]
+                                    .clone(),
+                            )
+                        })],
+                        depth_attachment: Some(RenderingAttachmentInfo {
+                            load_op: AttachmentLoadOp::Clear,
+                            store_op: AttachmentStoreOp::Store,
+                            clear_value: Some(1.0f32.into()),
+                            ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
+                        }),
+                        ..Default::default()
+                    })
+                    .unwrap();
 
+                {
                     builder
                         .bind_pipeline_graphics(rcx.cubemap_pipeline.clone())
                         .unwrap();
@@ -1916,10 +1956,6 @@ impl ApplicationHandler for App {
                         .unwrap();
 
                     unsafe { builder.draw_indexed(rcx.cubemap_index_count, 1, 0, 0, 0) }.unwrap();
-                    builder
-                        // We leave the render pass.
-                        .end_rendering()
-                        .unwrap();
                 }
 
                 builder
@@ -1962,27 +1998,6 @@ impl ApplicationHandler for App {
                     )
                     .unwrap();
 
-                builder
-                    .begin_rendering(RenderingInfo {
-                        color_attachments: vec![Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Load,
-                            store_op: AttachmentStoreOp::Store,
-                            clear_value: None,
-                            ..RenderingAttachmentInfo::image_view(
-                                rcx.attachment_image_views[window_renderer.image_index() as usize]
-                                    .clone(),
-                            )
-                        })],
-                        depth_attachment: Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Clear,
-                            store_op: AttachmentStoreOp::Store,
-                            clear_value: Some(1.0f32.into()),
-                            ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
-                        }),
-                        ..Default::default()
-                    })
-                    .unwrap();
-
                 // Render opaque geometry
                 if !opaque_objects.is_empty() {
                     for pcx_idx in opaque_objects {
@@ -1993,33 +2008,9 @@ impl ApplicationHandler for App {
                         );
                     }
                 }
-                builder
-                    // We leave the render pass.
-                    .end_rendering()
-                    .unwrap();
 
                 if !translucent_sorted.is_empty() {
                     // Render translucent geometry
-                    builder
-                        .begin_rendering(RenderingInfo {
-                            color_attachments: vec![Some(RenderingAttachmentInfo {
-                                load_op: AttachmentLoadOp::Load, // Load previous contents
-                                store_op: AttachmentStoreOp::Store,
-                                ..RenderingAttachmentInfo::image_view(
-                                    rcx.attachment_image_views
-                                        [window_renderer.image_index() as usize]
-                                        .clone(),
-                                )
-                            })],
-                            depth_attachment: Some(RenderingAttachmentInfo {
-                                load_op: AttachmentLoadOp::Load, // Keep depth buffer
-                                store_op: AttachmentStoreOp::Store,
-                                ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
-                            }),
-                            ..Default::default()
-                        })
-                        .unwrap();
-
                     let mut curr_pcx = None;
                     for (_, transform, prim_idx, pcx_idx) in translucent_sorted {
                         let prim = &self.prim_infos[prim_idx];
@@ -2073,11 +2064,12 @@ impl ApplicationHandler for App {
                         }
                         .unwrap();
                     }
-                    builder
-                        // We leave the render pass.
-                        .end_rendering()
-                        .unwrap();
                 }
+
+                builder
+                    // We leave the render pass.
+                    .end_rendering()
+                    .unwrap();
 
                 if !transmissive_objects.is_empty() {
                     // Render transmissive geometry
