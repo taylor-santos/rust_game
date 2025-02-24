@@ -312,16 +312,22 @@ pub struct MaterialSpecializationConstants {
     pub MATERIAL_EMISSIVE_STRENGTH: bool,
 }
 
-impl MaterialSpecializationConstants {
-    pub fn is_opaque(&self) -> bool {
-        !self.ALPHAMODE_BLEND && !self.MATERIAL_TRANSMISSION
-    }
-    pub fn is_transparent(&self) -> bool {
-        self.ALPHAMODE_BLEND && !self.MATERIAL_TRANSMISSION
-    }
+#[derive(Eq, PartialEq, Debug)]
+pub enum RenderType {
+    Opaque,
+    Translucent,
+    Transmissive,
+}
 
-    pub fn is_transmissive(&self) -> bool {
-        self.MATERIAL_TRANSMISSION
+impl MaterialSpecializationConstants {
+    pub fn render_type(&self) -> RenderType {
+        if self.MATERIAL_TRANSMISSION {
+            RenderType::Transmissive
+        } else if self.ALPHAMODE_BLEND {
+            RenderType::Translucent
+        } else {
+            RenderType::Opaque
+        }
     }
 }
 

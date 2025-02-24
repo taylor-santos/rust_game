@@ -13,10 +13,10 @@
 // original triangle example.
 
 use crate::camera::FirstPersonCamera;
-use crate::gltf::{load_gltf, CombinedVertex, Gltf, Object, TextureFormat};
+use crate::gltf::{load_gltf, CombinedVertex, Gltf, TextureFormat};
 use crate::material::Material;
 use crate::shader::*;
-use cgmath::{Matrix, SquareMatrix};
+use cgmath::{EuclideanSpace, Matrix, Matrix4, MetricSpace, SquareMatrix};
 use image::{ColorType, DynamicImage, ImageBuffer, ImageReader};
 use ktx2::SupercompressionScheme;
 use rayon::iter::Either;
@@ -122,9 +122,8 @@ struct App {
     uniform_buffer_allocator: SubbufferAllocator,
     vertex_buffer: Subbuffer<[CombinedVertex]>,
     index_buffer: Subbuffer<[u32]>,
-    draw_infos: Vec<Vec<PrimitiveDrawInfo>>,
+    prim_infos: Vec<PrimitiveDrawInfo>,
     materials: Vec<Material>,
-    objects: Vec<Object>,
     textures: Vec<Arc<ImageView>>,
     null_texture: Arc<ImageView>,
     skyboxes: Skybox,
@@ -149,10 +148,9 @@ struct RenderContext {
     attachment_image_views: Vec<Arc<ImageView>>,
     depth_image_view: Arc<ImageView>,
     pipeline_layout: Arc<PipelineLayout>,
-    pipelines: HashMap<
-        MaterialSpecializationConstants,
-        HashMap<ObjectSpecializationConstants, PipelineContext>,
-    >,
+    pipelines: Vec<PipelineContext>,
+    pipeline_map:
+        HashMap<MaterialSpecializationConstants, HashMap<ObjectSpecializationConstants, usize>>,
     intermediate_image_view: Arc<ImageView>,
     framebuffer_set: Arc<DescriptorSet>,
     viewport: Viewport,
@@ -422,28 +420,44 @@ impl App {
             .reduce(|(v1, i1), (v2, i2)| (v1 + v2, i1 + i2))
             .unwrap();
 
-        let (vertex_buffer, index_buffer, mut draw_infos) = {
+        let (vertex_buffer, index_buffer, prim_infos) = {
             let mut combined_verts = Vec::with_capacity(vert_count / 3);
             let mut combined_indices = Vec::with_capacity(index_count);
-            let mut draw_infos = Vec::new();
-
+            let mut mesh_infos = Vec::new();
+            let mut prim_infos = Vec::new();
+            let mut prims_offset = 0;
             for mesh in meshes {
-                let mut prim_infos = Vec::new();
+                let prims_count = mesh.primitives.len();
                 for prim in mesh.primitives {
-                    let info = PrimitiveDrawInfo {
+                    prim_infos.push(PrimitiveDrawInfo {
                         index_offset: combined_indices.len() as u32,
                         vertex_offset: combined_verts.len() as i32,
                         index_count: prim.indices.len() as u32,
                         mat_idx: prim.mat_idx,
-                        object_constants: prim.spec_constants,
-                        object_ids: Vec::new(),
-                    };
-                    prim_infos.push(info);
+                        spec_const: prim.spec_const,
+                        transforms: Vec::new(),
+                    });
 
                     combined_verts.extend(prim.vertices);
                     combined_indices.extend(prim.indices);
                 }
-                draw_infos.push(prim_infos);
+                mesh_infos.push(MeshDrawInfo {
+                    prims_offset,
+                    prims_count,
+                });
+                prims_offset += prims_count;
+            }
+
+            for object in objects {
+                let mesh_idx = object.mesh_idx;
+                let mesh_info = &mesh_infos[mesh_idx];
+                for prim in prim_infos
+                    .iter_mut()
+                    .skip(mesh_info.prims_offset)
+                    .take(mesh_info.prims_count)
+                {
+                    prim.transforms.push(object.transform);
+                }
             }
 
             let vertex_buffer = create_buffer(
@@ -464,14 +478,8 @@ impl App {
 
             println!("Combined vertex data in {:?}", timer.elapsed());
 
-            (vertex_buffer, index_buffer, draw_infos)
+            (vertex_buffer, index_buffer, prim_infos)
         };
-
-        for (obj_idx, object) in objects.iter().enumerate() {
-            for prim in &mut draw_infos[object.mesh_idx] {
-                prim.object_ids.push(obj_idx);
-            }
-        }
 
         let mut image_builder = AutoCommandBufferBuilder::primary(
             command_buffer_allocator.clone(),
@@ -731,9 +739,8 @@ impl App {
             uniform_buffer_allocator,
             vertex_buffer,
             index_buffer,
-            draw_infos,
+            prim_infos,
             materials,
-            objects,
             textures,
             null_texture,
             skyboxes,
@@ -825,7 +832,7 @@ fn build_pipeline(
     };
 
     let (depth_stencil_state, color_blend_state) =
-        if specialization_constants.material_constants.is_transparent() {
+        if specialization_constants.material_constants.render_type() == RenderType::Translucent {
             let depth_stencil_state = DepthStencilState {
                 depth: Some(DepthState {
                     write_enable: false, // Prevent transparent objects from writing depth
@@ -911,7 +918,7 @@ struct PipelineContext {
     material_sets: HashMap<usize, (Arc<DescriptorSet>, Arc<DescriptorSet>)>,
     const_set: Arc<DescriptorSet>,
     skybox_set: Arc<DescriptorSet>,
-    draw_infos: Vec<PrimitiveDrawInfo>,
+    prim_indices: Vec<usize>,
 }
 
 impl PipelineContext {
@@ -919,7 +926,7 @@ impl PipelineContext {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         pipeline_layout: Arc<PipelineLayout>,
-        objects: &[Object],
+        primitives: &[PrimitiveDrawInfo],
     ) {
         builder
             .bind_pipeline_graphics(self.pipeline.clone())
@@ -942,7 +949,8 @@ impl PipelineContext {
             )
             .unwrap();
 
-        for prim in &self.draw_infos {
+        for prim_idx in self.prim_indices.iter().copied() {
+            let prim = &primitives[prim_idx];
             let (mat_set, tex_set) = self.material_sets[&prim.mat_idx].clone();
             builder
                 .bind_descriptor_sets(
@@ -962,10 +970,10 @@ impl PipelineContext {
                 )
                 .unwrap();
 
-            for obj_idx in &prim.object_ids {
-                let object = &objects[*obj_idx];
-                let model = object.transform;
-                let normal = model.transpose().invert().unwrap();
+            for transform in prim.transforms.iter().copied() {
+                let normal = transform.transpose().invert().unwrap();
+                let model: [[f32; 4]; 4] = transform.into();
+                #[allow(clippy::useless_conversion)]
                 let data = fs::Object {
                     u_ModelMatrix: model.into(),
                     u_NormalMatrix: normal.into(),
@@ -1149,11 +1157,9 @@ impl ApplicationHandler for App {
 
         let mat_prim_map = {
             let mut mat_prim_map = vec![Vec::new(); self.materials.len()];
-            for object in &self.objects {
-                for info in &self.draw_infos[object.mesh_idx] {
-                    let mat_idx = info.mat_idx;
-                    mat_prim_map[mat_idx].push(info.clone());
-                }
+            for (prim_idx, prim) in self.prim_infos.iter().enumerate() {
+                let mat_idx = prim.mat_idx;
+                mat_prim_map[mat_idx].push(prim_idx);
             }
             mat_prim_map
         };
@@ -1200,10 +1206,11 @@ impl ApplicationHandler for App {
             })
         };
 
-        let pipelines = {
-            let mut pipelines = HashMap::<
+        let (pipelines, pipeline_map) = {
+            let mut pipelines = Vec::new();
+            let mut pipeline_map = HashMap::<
                 MaterialSpecializationConstants,
-                HashMap<ObjectSpecializationConstants, PipelineContext>,
+                HashMap<ObjectSpecializationConstants, usize>,
             >::new();
 
             self.materials
@@ -1291,15 +1298,16 @@ impl ApplicationHandler for App {
                     ]
                     .map(|opt_t| opt_t.map(|t| &self.textures[t.texture.index]));
 
-                    for prim in &mat_prim_map[mat_idx] {
+                    for prim_idx in mat_prim_map[mat_idx].iter().copied() {
                         let mat_const = mat.into();
-                        let pcx = pipelines
+                        let prim = &self.prim_infos[prim_idx];
+                        let pcx_idx = *pipeline_map
                             .entry(mat_const)
                             .or_default()
-                            .entry(prim.object_constants)
+                            .entry(prim.spec_const)
                             .or_insert_with(|| {
                                 let spec_constants = SpecializationConstants {
-                                    object_constants: prim.object_constants,
+                                    object_constants: prim.spec_const,
                                     material_constants: mat_const,
                                 };
                                 let pipeline = build_pipeline(
@@ -1329,56 +1337,63 @@ impl ApplicationHandler for App {
                                 )
                                 .unwrap();
 
-                                let draw_infos = Vec::new();
+                                let prim_indices = Vec::new();
 
-                                PipelineContext {
+                                let pipeline = PipelineContext {
                                     pipeline,
                                     material_sets,
                                     const_set,
                                     skybox_set,
-                                    draw_infos,
-                                }
+                                    prim_indices,
+                                };
+                                let pipeline_idx = pipelines.len();
+                                pipelines.push(pipeline);
+
+                                pipeline_idx
                             });
 
-                        pcx.draw_infos.push(prim.clone());
+                        pipelines[pcx_idx].prim_indices.push(prim_idx);
 
-                        pcx.material_sets.entry(mat_idx).or_insert_with(|| {
-                            let material_set = DescriptorSet::new(
-                                self.descriptor_set_allocator.clone(),
-                                pipeline_layout.set_layouts().get(3).unwrap().clone(),
-                                [material_set.clone(), mat_sampler_set.clone()].into_iter(),
-                                [],
-                            )
-                            .unwrap();
+                        pipelines[pcx_idx]
+                            .material_sets
+                            .entry(mat_idx)
+                            .or_insert_with(|| {
+                                let material_set = DescriptorSet::new(
+                                    self.descriptor_set_allocator.clone(),
+                                    pipeline_layout.set_layouts().get(3).unwrap().clone(),
+                                    [material_set.clone(), mat_sampler_set.clone()].into_iter(),
+                                    [],
+                                )
+                                .unwrap();
 
-                            let texture_set = DescriptorSet::new(
-                                self.descriptor_set_allocator.clone(),
-                                pipeline_layout.set_layouts().get(4).unwrap().clone(),
-                                textures
-                                    .into_iter()
-                                    .map(|t| t.unwrap_or(&self.null_texture))
-                                    .enumerate()
-                                    .map(|(idx, texture)| {
-                                        WriteDescriptorSet::image_view_sampler(
-                                            idx as u32,
-                                            texture.clone(),
-                                            self.wrap_sampler.clone(),
-                                        )
-                                    }),
-                                [],
-                            )
-                            .unwrap();
+                                let texture_set = DescriptorSet::new(
+                                    self.descriptor_set_allocator.clone(),
+                                    pipeline_layout.set_layouts().get(4).unwrap().clone(),
+                                    textures
+                                        .into_iter()
+                                        .map(|t| t.unwrap_or(&self.null_texture))
+                                        .enumerate()
+                                        .map(|(idx, texture)| {
+                                            WriteDescriptorSet::image_view_sampler(
+                                                idx as u32,
+                                                texture.clone(),
+                                                self.wrap_sampler.clone(),
+                                            )
+                                        }),
+                                    [],
+                                )
+                                .unwrap();
 
-                            (material_set, texture_set)
-                        });
+                                (material_set, texture_set)
+                            });
                     }
                 });
 
-            pipelines
+            (pipelines, pipeline_map)
         };
 
         println!("Rendering {} material variants:", pipelines.len());
-        for (idx, (k, v)) in pipelines.iter().enumerate() {
+        for (idx, (k, v)) in pipeline_map.iter().enumerate() {
             println!(" {}) {}", idx + 1, k);
             println!("\tWith {} object variants:", v.keys().len());
             for (idx, k) in v.keys().enumerate() {
@@ -1408,6 +1423,7 @@ impl ApplicationHandler for App {
             depth_image_view,
             pipeline_layout,
             pipelines,
+            pipeline_map,
             intermediate_image_view,
             framebuffer_set,
             viewport,
@@ -1602,45 +1618,40 @@ impl ApplicationHandler for App {
                 )
                 .unwrap();
 
-                builder
-                    // Before we can draw, we have to *enter a render pass*. We specify which
-                    // attachments we are going to use for rendering here, which needs to match
-                    // what was previously specified when creating the pipeline.
-                    .begin_rendering(RenderingInfo {
-                        // As before, we specify one color attachment, but now we specify the image
-                        // view to use as well as how it should be used.
-                        color_attachments: vec![Some(RenderingAttachmentInfo {
-                            // `Clear` means that we ask the GPU to clear the content of this
-                            // attachment at the start of rendering.
-                            load_op: AttachmentLoadOp::Clear,
-                            // `Store` means that we ask the GPU to store the rendered output in
-                            // the attachment image. We could also ask it to discard the result.
-                            store_op: AttachmentStoreOp::Store,
-                            // The value to clear the attachment with. Here we clear it with a blue
-                            // color.
-                            //
-                            // Only attachments that have `AttachmentLoadOp::Clear` are provided
-                            // with clear values, any others should use `None` as the clear value.
-                            clear_value: Some([0.2, 0.2, 0.2, 1.0].into()),
-                            ..RenderingAttachmentInfo::image_view(
-                                rcx.attachment_image_views[window_renderer.image_index() as usize]
-                                    .clone(),
-                            )
-                        })],
-                        depth_attachment: Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Clear,
-                            store_op: AttachmentStoreOp::Store,
-                            clear_value: Some(1.0f32.into()),
-                            ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
-                        }),
-                        ..Default::default()
-                    })
-                    .unwrap()
-                    // We are now inside the first subpass of the render pass.
-                    //
-                    // TODO: Document state setting and how it affects subsequent draw commands.
-                    .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
-                    .unwrap();
+                let mut opaque_objects = Vec::<usize>::new();
+                let mut translucent_objects = Vec::<usize>::new();
+                let mut transmissive_objects = Vec::<usize>::new();
+
+                for (mat_specs, obj_pipelines) in &rcx.pipeline_map {
+                    match mat_specs.render_type() {
+                        RenderType::Opaque => opaque_objects.extend(obj_pipelines.values()),
+                        RenderType::Translucent => {
+                            translucent_objects.extend(obj_pipelines.values())
+                        }
+                        RenderType::Transmissive => {
+                            transmissive_objects.extend(obj_pipelines.values())
+                        }
+                    }
+                }
+
+                let mut translucent_sorted = Vec::new();
+                for pcx_idx in translucent_objects.iter().cloned() {
+                    let pcx = &rcx.pipelines[pcx_idx];
+                    for prim_idx in pcx.prim_indices.iter().copied() {
+                        let prim = &self.prim_infos[prim_idx];
+                        for transform in prim.transforms.iter() {
+                            let dist = self
+                                .camera
+                                .position
+                                .to_vec()
+                                .distance2(transform.w.truncate());
+                            translucent_sorted.push((dist, *transform, prim_idx, pcx_idx));
+                        }
+                    }
+                }
+                translucent_sorted.sort_by(|(a, ..), (b, ..)| {
+                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                });
 
                 builder
                     .bind_vertex_buffers(0, self.vertex_buffer.clone())
@@ -1693,45 +1704,39 @@ impl ApplicationHandler for App {
                         .unwrap();
                 }
 
-                // Render opaque geometry
-                for (mat_specs, obj_pipelines) in &rcx.pipelines {
-                    if !mat_specs.is_opaque() {
-                        continue;
-                    }
-                    for pcx in obj_pipelines.values() {
-                        pcx.render(&mut builder, rcx.pipeline_layout.clone(), &self.objects);
-                    }
-                }
                 builder
-                    // We leave the render pass.
-                    .end_rendering()
+                    .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
                     .unwrap();
 
-                // Render translucent geometry
                 builder
                     .begin_rendering(RenderingInfo {
                         color_attachments: vec![Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Load, // Load previous contents
+                            load_op: AttachmentLoadOp::Clear,
                             store_op: AttachmentStoreOp::Store,
+                            clear_value: Some([0.2, 0.2, 0.2, 1.0].into()),
                             ..RenderingAttachmentInfo::image_view(
                                 rcx.attachment_image_views[window_renderer.image_index() as usize]
                                     .clone(),
                             )
                         })],
                         depth_attachment: Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Load, // Keep depth buffer
+                            load_op: AttachmentLoadOp::Clear,
                             store_op: AttachmentStoreOp::Store,
+                            clear_value: Some(1.0f32.into()),
                             ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
                         }),
                         ..Default::default()
                     })
                     .unwrap();
-                for (mat_specs, obj_pipelines) in &rcx.pipelines {
-                    if !mat_specs.is_transparent() {
-                        continue;
-                    }
-                    for pcx in obj_pipelines.values() {
-                        pcx.render(&mut builder, rcx.pipeline_layout.clone(), &self.objects);
+
+                // Render opaque geometry
+                if !opaque_objects.is_empty() {
+                    for pcx_idx in opaque_objects {
+                        rcx.pipelines[pcx_idx].render(
+                            &mut builder,
+                            rcx.pipeline_layout.clone(),
+                            &self.prim_infos,
+                        );
                     }
                 }
                 builder
@@ -1739,74 +1744,177 @@ impl ApplicationHandler for App {
                     .end_rendering()
                     .unwrap();
 
-                // Render transmissive geometry
-                let src_image =
-                    rcx.attachment_image_views[window_renderer.image_index() as usize].image();
-                let dst_image = rcx.intermediate_image_view.image();
-                builder
-                    .blit_image(BlitImageInfo::images(src_image.clone(), dst_image.clone()))
-                    .unwrap();
-                let dimensions = src_image.extent();
-                let mip_levels = max_mip_levels(dimensions);
-                for mip_level in 1..mip_levels {
-                    let regions = [ImageBlit {
-                        src_subresource: ImageSubresourceLayers {
-                            aspects: dst_image.format().aspects(),
-                            mip_level: mip_level - 1,
-                            array_layers: 0..dst_image.array_layers(),
-                        },
-                        dst_subresource: ImageSubresourceLayers {
-                            aspects: dst_image.format().aspects(),
-                            mip_level,
-                            array_layers: 0..dst_image.array_layers(),
-                        },
-                        src_offsets: [
-                            [0, 0, 0],
-                            mip_level_extent(dimensions, mip_level - 1).unwrap(),
-                        ],
-                        dst_offsets: [[0, 0, 0], mip_level_extent(dimensions, mip_level).unwrap()],
-                        ..Default::default()
-                    }];
+                if !translucent_sorted.is_empty() {
+                    // Render translucent geometry
                     builder
-                        .blit_image(BlitImageInfo {
-                            src_image_layout: ImageLayout::General,
-                            dst_image_layout: ImageLayout::General,
-                            regions: regions.into(),
-                            filter: Filter::Linear,
-                            ..BlitImageInfo::images(dst_image.clone(), dst_image.clone())
+                        .begin_rendering(RenderingInfo {
+                            color_attachments: vec![Some(RenderingAttachmentInfo {
+                                load_op: AttachmentLoadOp::Load, // Load previous contents
+                                store_op: AttachmentStoreOp::Store,
+                                ..RenderingAttachmentInfo::image_view(
+                                    rcx.attachment_image_views
+                                        [window_renderer.image_index() as usize]
+                                        .clone(),
+                                )
+                            })],
+                            depth_attachment: Some(RenderingAttachmentInfo {
+                                load_op: AttachmentLoadOp::Load, // Keep depth buffer
+                                store_op: AttachmentStoreOp::Store,
+                                ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
+                            }),
+                            ..Default::default()
                         })
                         .unwrap();
-                }
-                builder
-                    .begin_rendering(RenderingInfo {
-                        color_attachments: vec![Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Load, // Load previous contents
-                            store_op: AttachmentStoreOp::Store,
-                            ..RenderingAttachmentInfo::image_view(
-                                rcx.attachment_image_views[window_renderer.image_index() as usize]
-                                    .clone(),
+
+                    let mut curr_pcx = None;
+                    for (_, transform, prim_idx, pcx_idx) in translucent_sorted {
+                        let prim = &self.prim_infos[prim_idx];
+                        let pcx = &rcx.pipelines[pcx_idx];
+                        if curr_pcx != Some(pcx_idx) {
+                            builder
+                                .bind_pipeline_graphics(pcx.pipeline.clone())
+                                .unwrap();
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Graphics,
+                                    rcx.pipeline_layout.clone(),
+                                    0,
+                                    pcx.const_set.clone(),
+                                )
+                                .unwrap();
+                            builder
+                                .bind_descriptor_sets(
+                                    PipelineBindPoint::Graphics,
+                                    rcx.pipeline_layout.clone(),
+                                    2,
+                                    pcx.skybox_set.clone(),
+                                )
+                                .unwrap();
+                            curr_pcx = Some(pcx_idx);
+                        }
+
+                        let (mat_set, tex_set) = pcx.material_sets[&prim.mat_idx].clone();
+
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                rcx.pipeline_layout.clone(),
+                                3,
+                                mat_set,
                             )
-                        })],
-                        depth_attachment: Some(RenderingAttachmentInfo {
-                            load_op: AttachmentLoadOp::Load, // Keep depth buffer
-                            store_op: AttachmentStoreOp::Store,
-                            ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
-                        }),
-                        ..Default::default()
-                    })
-                    .unwrap();
-                for (mat_specs, obj_pipelines) in &rcx.pipelines {
-                    if !mat_specs.is_transmissive() {
-                        continue;
+                            .unwrap();
+
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                rcx.pipeline_layout.clone(),
+                                4,
+                                tex_set,
+                            )
+                            .unwrap();
+
+                        let normal = transform.transpose().invert().unwrap();
+                        let model: [[f32; 4]; 4] = transform.into();
+                        #[allow(clippy::useless_conversion)]
+                        let data = fs::Object {
+                            u_ModelMatrix: model.into(),
+                            u_NormalMatrix: normal.into(),
+                        };
+                        builder
+                            .push_constants(rcx.pipeline_layout.clone(), 0, data)
+                            .unwrap();
+                        unsafe {
+                            // We add a draw command.
+                            builder.draw_indexed(
+                                prim.index_count,
+                                1,
+                                prim.index_offset,
+                                prim.vertex_offset,
+                                0,
+                            )
+                        }
+                        .unwrap();
                     }
-                    for pcx in obj_pipelines.values() {
-                        pcx.render(&mut builder, rcx.pipeline_layout.clone(), &self.objects);
-                    }
+                    builder
+                        // We leave the render pass.
+                        .end_rendering()
+                        .unwrap();
                 }
-                builder
-                    // We leave the render pass.
-                    .end_rendering()
-                    .unwrap();
+
+                if !transmissive_objects.is_empty() {
+                    // Render transmissive geometry
+                    let src_image =
+                        rcx.attachment_image_views[window_renderer.image_index() as usize].image();
+                    let dst_image = rcx.intermediate_image_view.image();
+                    builder
+                        .blit_image(BlitImageInfo::images(src_image.clone(), dst_image.clone()))
+                        .unwrap();
+                    let dimensions = src_image.extent();
+                    let mip_levels = max_mip_levels(dimensions);
+                    for mip_level in 1..mip_levels {
+                        let regions = [ImageBlit {
+                            src_subresource: ImageSubresourceLayers {
+                                aspects: dst_image.format().aspects(),
+                                mip_level: mip_level - 1,
+                                array_layers: 0..dst_image.array_layers(),
+                            },
+                            dst_subresource: ImageSubresourceLayers {
+                                aspects: dst_image.format().aspects(),
+                                mip_level,
+                                array_layers: 0..dst_image.array_layers(),
+                            },
+                            src_offsets: [
+                                [0, 0, 0],
+                                mip_level_extent(dimensions, mip_level - 1).unwrap(),
+                            ],
+                            dst_offsets: [
+                                [0, 0, 0],
+                                mip_level_extent(dimensions, mip_level).unwrap(),
+                            ],
+                            ..Default::default()
+                        }];
+                        builder
+                            .blit_image(BlitImageInfo {
+                                src_image_layout: ImageLayout::General,
+                                dst_image_layout: ImageLayout::General,
+                                regions: regions.into(),
+                                filter: Filter::Linear,
+                                ..BlitImageInfo::images(dst_image.clone(), dst_image.clone())
+                            })
+                            .unwrap();
+                    }
+                    builder
+                        .begin_rendering(RenderingInfo {
+                            color_attachments: vec![Some(RenderingAttachmentInfo {
+                                load_op: AttachmentLoadOp::Load, // Load previous contents
+                                store_op: AttachmentStoreOp::Store,
+                                ..RenderingAttachmentInfo::image_view(
+                                    rcx.attachment_image_views
+                                        [window_renderer.image_index() as usize]
+                                        .clone(),
+                                )
+                            })],
+                            depth_attachment: Some(RenderingAttachmentInfo {
+                                load_op: AttachmentLoadOp::Load, // Keep depth buffer
+                                store_op: AttachmentStoreOp::Store,
+                                ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
+                            }),
+                            ..Default::default()
+                        })
+                        .unwrap();
+
+                    for pcx_idx in transmissive_objects {
+                        rcx.pipelines[pcx_idx].render(
+                            &mut builder,
+                            rcx.pipeline_layout.clone(),
+                            &self.prim_infos,
+                        );
+                    }
+                    builder
+                        // We leave the render pass.
+                        .end_rendering()
+                        .unwrap();
+                }
 
                 // Finish recording the command buffer by calling `end`.
                 let command_buffer = builder.build().unwrap();
@@ -1828,14 +1936,20 @@ impl ApplicationHandler for App {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PrimitiveDrawInfo {
     pub index_offset: u32,
     pub vertex_offset: i32,
     pub index_count: u32,
     pub mat_idx: usize,
-    pub object_constants: ObjectSpecializationConstants,
-    pub object_ids: Vec<usize>,
+    pub spec_const: ObjectSpecializationConstants,
+    pub transforms: Vec<Matrix4<f32>>,
+}
+
+#[derive(Debug)]
+struct MeshDrawInfo {
+    pub prims_offset: usize,
+    pub prims_count: usize,
 }
 
 fn create_buffer<T: BufferContents + Send + Sync, I: IntoIterator<Item = T>>(
