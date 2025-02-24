@@ -57,6 +57,7 @@ layout (location = 5) in mat3 v_TBN;
 
 layout (set = 0, binding = 0) uniform Constants {
     int     u_MipCount;
+    int     u_FramebufferMipCount;
     mat3    u_EnvRotation;
     float   u_EnvIntensity;
     float   u_Exposure;
@@ -73,89 +74,6 @@ layout (set = 0, binding = 0) uniform Constants {
 #include <iridescence.glsl>
 
 layout (location = 0) out vec4 g_finalColor;
-
-vec2 getCubeUV(vec3 r, out int faceId) {
-    float absX = abs(r.x);
-    float absY = abs(r.y);
-    float absZ = abs(r.z);
-    vec2 uv;
-
-    if (absX >= absY && absX >= absZ) {
-        // X is dominant.
-        if (r.x > 0.0) {
-            // +X face.
-            uv = vec2(-r.z, -r.y) / absX;
-            faceId = 0;
-        } else {
-            // -X face.
-            uv = vec2(r.z, -r.y) / absX;
-            faceId = 1;
-        }
-    } else if (absY >= absX && absY >= absZ) {
-        // Y is dominant.
-        if (r.y > 0.0) {
-            // +Y face.
-            uv = vec2(r.x, r.z) / absY;
-            faceId = 2;
-        } else {
-            // -Y face.
-            uv = vec2(r.x, -r.z) / absY;
-            faceId = 3;
-        }
-    } else {
-        // Z is dominant.
-        if (r.z > 0.0) {
-            // +Z face.
-            uv = vec2(r.x, -r.y) / absZ;
-            faceId = 4;
-        } else {
-            // -Z face.
-            uv = vec2(-r.x, -r.y) / absZ;
-            faceId = 5;
-        }
-    }
-    // Remap from [-1, 1] to [0, 1]
-    uv = uv * 0.5 + 0.5;
-    return uv;
-}
-
-vec3 skyboxColor(vec3 r) {
-    int faceId;
-    vec2 uv = getCubeUV(r, faceId);
-
-    // Assign a unique base color per cube face.
-    vec3 faceColor;
-    if (faceId == 0)
-        faceColor = vec3(1.0, 0.0, 0.0); // +X: Red.
-    else if (faceId == 1)
-        faceColor = vec3(0.0, 1.0, 0.0); // -X: Green.
-    else if (faceId == 2)
-        faceColor = vec3(0.0, 0.0, 1.0); // +Y: Blue.
-    else if (faceId == 3)
-        faceColor = vec3(1.0, 1.0, 0.0); // -Y: Yellow.
-    else if (faceId == 4)
-        faceColor = vec3(1.0, 0.0, 1.0); // +Z: Magenta.
-    else // faceId == 5
-        faceColor = vec3(0.0, 1.0, 1.0); // -Z: Cyan.
-
-    // Grid settings.
-    float cells = 10.0;
-    float lineThickness = 0.03;
-
-    // Compute local grid UVs.
-    vec2 gridUV = fract(uv * cells);
-    // Determine distance to the nearest grid boundary.
-    float distToEdge = min(min(gridUV.x, 1.0 - gridUV.x),
-                           min(gridUV.y, 1.0 - gridUV.y));
-    // Smooth grid lines: near boundaries, 'line' approaches 1.
-    float line = smoothstep(0.0, lineThickness, lineThickness - distToEdge);
-
-    // Black grid lines.
-    vec3 lineColor = vec3(0.0);
-    // Mix the base face color and grid lines.
-    return mix(faceColor, lineColor, line);
-}
-
 
 void main()
 {
@@ -198,6 +116,8 @@ void main()
 
     if (MATERIAL_METALLICROUGHNESS) {
         materialInfo = getMetallicRoughnessInfo(materialInfo);
+    } else {
+        materialInfo.metallic = 0.0;
     }
 
     if (MATERIAL_SHEEN) {
@@ -218,6 +138,10 @@ void main()
 
     if (MATERIAL_VOLUME) {
         materialInfo = getVolumeInfo(materialInfo);
+    } else {
+        materialInfo.thickness = 0.0;
+        materialInfo.attenuationColor = vec3(0.0);
+        materialInfo.attenuationDistance = 0.0;
     }
 
     if (MATERIAL_IRIDESCENCE) {
@@ -478,7 +402,7 @@ void main()
         }
     }
 
-#if DEBUG == DEBUG_NONE
+
 
     if (ALPHAMODE_MASK) {
         // Late discard to avoid sampling artifacts. See https://github.com/KhronosGroup/glTF-Sample-Viewer/issues/267
@@ -488,6 +412,8 @@ void main()
         }
         baseColor.a = 1.0;
     }
+
+#if DEBUG == DEBUG_NONE
 
 #ifdef LINEAR_OUTPUT
     g_finalColor = vec4(color.rgb, baseColor.a);

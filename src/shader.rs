@@ -1,4 +1,4 @@
-use crate::material::{AlphaMode, Material, TextureTransform};
+use crate::material::{AlphaMode, Material};
 use std::fmt::Formatter;
 use vulkano::shader::SpecializationConstant;
 
@@ -161,9 +161,8 @@ impl From<&Material> for fs::MatSamplers {
             u_SpecularColorUVSet: unwrap!(mat.specular?.color_texture?.tex_coord()),
             u_SpecularColorUVTransform: unwrap!(mat.specular?.color_texture?.transform?),
 
-            u_TransmissionUVSet: 0.into(), // TODO
-            u_TransmissionUVTransform: TextureTransform::default().into(), // TODO
-            u_TransmissionFramebufferSize: [0; 2].into(), // TODO
+            u_TransmissionUVSet: unwrap!(mat.transmission?.texture?.tex_coord()),
+            u_TransmissionUVTransform: unwrap!(mat.transmission?.texture?.transform?),
 
             u_ThicknessUVSet: unwrap!(mat.volume?.thickness_texture?.tex_coord()),
             u_ThicknessUVTransform: unwrap!(mat.volume?.thickness_texture?.transform?),
@@ -321,7 +320,7 @@ impl MaterialSpecializationConstants {
         self.ALPHAMODE_BLEND && !self.MATERIAL_TRANSMISSION
     }
 
-    pub fn is_transmission(&self) -> bool {
+    pub fn is_transmissive(&self) -> bool {
         self.MATERIAL_TRANSMISSION
     }
 }

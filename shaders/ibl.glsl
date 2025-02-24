@@ -52,15 +52,14 @@ vec3 getIBLRadianceGGX(vec3 n, vec3 v, float roughness)
     return specularLight;
 }
 
-// TODO: re-enable when transmission works
-// vec3 getTransmissionSample(vec2 fragCoord, float roughness, float ior)
-// {
-//     float framebufferLod = log2(float(s.u_TransmissionFramebufferSize.x)) * applyIorToRoughness(roughness, ior);
-//     // TODO: re-enable when transmission works
-//     vec3 transmittedLight = textureLod(u_TransmissionFramebufferSampler, fragCoord.xy, framebufferLod).rgb;
-//
-//     return transmittedLight;
-// }
+
+vec3 getTransmissionSample(vec2 fragCoord, float roughness, float ior)
+{
+    float framebufferLod = c.u_FramebufferMipCount * applyIorToRoughness(roughness, ior);
+    vec3 transmittedLight = textureLod(u_TransmissionFramebufferSampler, fragCoord.xy, framebufferLod).rgb;
+
+    return transmittedLight;
+}
 
 
 vec3 getIBLVolumeRefraction(vec3 n, vec3 v, float perceptualRoughness, vec3 baseColor, vec3 f0, vec3 f90,
@@ -87,8 +86,7 @@ vec3 getIBLVolumeRefraction(vec3 n, vec3 v, float perceptualRoughness, vec3 base
             refractionCoords /= 2.0;
 
             // Sample framebuffer to get pixel the refracted ray hits for this color channel.
-            // TODO: re-enable when transmission works
-            // transmittedLight[i] = getTransmissionSample(refractionCoords, perceptualRoughness, iors[i])[i];
+            transmittedLight[i] = getTransmissionSample(refractionCoords, perceptualRoughness, iors[i])[i];
         }
     } else {
         vec3 transmissionRay = getVolumeTransmissionRay(n, v, thickness, ior, modelMatrix);
@@ -102,8 +100,7 @@ vec3 getIBLVolumeRefraction(vec3 n, vec3 v, float perceptualRoughness, vec3 base
         refractionCoords /= 2.0;
 
         // Sample framebuffer to get pixel the refracted ray hits.
-        // TODO: re-enable when transmission works
-        // transmittedLight = getTransmissionSample(refractionCoords, perceptualRoughness, ior);
+        transmittedLight = getTransmissionSample(refractionCoords, perceptualRoughness, ior);
     }
     vec3 attenuatedColor = applyVolumeAttenuation(transmittedLight, transmissionRayLength, attenuationColor, attenuationDistance);
 

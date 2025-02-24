@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use std::{error::Error, sync::Arc};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::command_buffer::{
-    BufferImageCopy, CopyBufferInfo, CopyBufferToImageInfo, PrimaryAutoCommandBuffer,
-    PrimaryCommandBufferAbstract,
+    BlitImageInfo, BufferImageCopy, CopyBufferInfo, CopyBufferToImageInfo, ImageBlit,
+    PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::layout::{
@@ -38,13 +38,17 @@ use vulkano::device::{Device, DeviceOwned};
 use vulkano::format::Format;
 use vulkano::half::f16;
 use vulkano::image::sampler::SamplerAddressMode::{ClampToEdge, Repeat};
-use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
+use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo};
 use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{
-    ImageAspects, ImageCreateFlags, ImageCreateInfo, ImageSubresourceLayers, ImageType,
+    max_mip_levels, mip_level_extent, ImageAspects, ImageCreateFlags, ImageCreateInfo, ImageLayout,
+    ImageSubresourceLayers, ImageType,
 };
 use vulkano::padded::Padded;
-use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::color_blend::{
+    AttachmentBlend, BlendFactor, BlendOp, ColorComponents,
+};
+use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::CullMode;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
 use vulkano::pipeline::PipelineBindPoint;
@@ -56,7 +60,7 @@ use vulkano::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
         RenderingAttachmentInfo, RenderingInfo,
     },
-    device::{DeviceFeatures, Queue},
+    device::{DeviceExtensions, DeviceFeatures, Queue},
     image::{view::ImageView, Image, ImageUsage},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
@@ -149,6 +153,8 @@ struct RenderContext {
         MaterialSpecializationConstants,
         HashMap<ObjectSpecializationConstants, PipelineContext>,
     >,
+    intermediate_image_view: Arc<ImageView>,
+    framebuffer_set: Arc<DescriptorSet>,
     viewport: Viewport,
     frame_times: VecDeque<Instant>,
 }
@@ -355,6 +361,10 @@ impl App {
         let context = VulkanoContext::new(VulkanoConfig {
             device_features: DeviceFeatures {
                 dynamic_rendering: true,
+                ..Default::default()
+            },
+            device_extensions: DeviceExtensions {
+                khr_swapchain: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -814,6 +824,45 @@ fn build_pipeline(
         ..Default::default()
     };
 
+    let (depth_stencil_state, color_blend_state) =
+        if specialization_constants.material_constants.is_transparent() {
+            let depth_stencil_state = DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: false, // Prevent transparent objects from writing depth
+                    compare_op: CompareOp::LessOrEqual, // Keep depth test to allow occlusion
+                }),
+                ..Default::default()
+            };
+            let color_blend_state = ColorBlendState::with_attachment_states(
+                1,
+                ColorBlendAttachmentState {
+                    blend: Some(AttachmentBlend {
+                        src_color_blend_factor: BlendFactor::SrcAlpha,
+                        dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
+                        color_blend_op: BlendOp::Add,
+                        src_alpha_blend_factor: BlendFactor::One,
+                        dst_alpha_blend_factor: BlendFactor::OneMinusSrcAlpha,
+                        alpha_blend_op: BlendOp::Add,
+                    }),
+                    color_write_mask: ColorComponents::all(),
+                    color_write_enable: true,
+                },
+            );
+
+            (depth_stencil_state, color_blend_state)
+        } else {
+            let depth_stencil_state = DepthStencilState {
+                depth: Some(DepthState::simple()),
+                ..Default::default()
+            };
+            let color_blend_state = ColorBlendState::with_attachment_states(
+                subpass.color_attachment_formats.len() as u32,
+                ColorBlendAttachmentState::default(),
+            );
+
+            (depth_stencil_state, color_blend_state)
+        };
+
     // Finally, create the pipeline.
     GraphicsPipeline::new(
         device.clone(),
@@ -844,14 +893,8 @@ fn build_pipeline(
             // How pixel values are combined with the values already present in the
             // framebuffer. The default value overwrites the old value with the new one,
             // without any blending.
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.color_attachment_formats.len() as u32,
-                ColorBlendAttachmentState::default(),
-            )),
-            depth_stencil_state: Some(DepthStencilState {
-                depth: Some(DepthState::simple()),
-                ..Default::default()
-            }),
+            color_blend_state: Some(color_blend_state),
+            depth_stencil_state: Some(depth_stencil_state),
             // Dynamic states allows us to specify parts of the pipeline settings when
             // recording the command buffer, before we perform drawing. Here, we specify
             // that the viewport should be dynamic.
@@ -876,7 +919,7 @@ impl PipelineContext {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         pipeline_layout: Arc<PipelineLayout>,
-        objects: &Vec<Object>,
+        objects: &[Object],
     ) {
         builder
             .bind_pipeline_graphics(self.pipeline.clone())
@@ -958,18 +1001,42 @@ impl ApplicationHandler for App {
             &self.context,
             &WindowDescriptor {
                 present_mode: PresentMode::Mailbox,
-                width: 1524.,
-                height: 1500.,
+                width: 1024.,
+                height: 1024.,
                 scale_factor_override: Some(1.0),
                 ..Default::default()
             },
-            |_| {},
+            |info| {
+                // Framebuffer needs TRANSFER_SRC so that it can be blitted onto the TransmissionFramebufferSampler
+                info.image_usage |= ImageUsage::TRANSFER_SRC;
+            },
         );
         let window_renderer = self.windows.get_primary_renderer_mut().unwrap();
+
         let window_size = window_renderer.window().inner_size();
 
         // Create image views from the current swapchain images.
         let attachment_image_views = window_renderer.swapchain_image_views().to_vec();
+
+        let mip_levels = max_mip_levels([window_size.width, window_size.height, 1]);
+        let intermediate_image = Image::new(
+            self.memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: window_renderer.swapchain_format(),
+                extent: [window_size.width, window_size.height, 1],
+                mip_levels,
+                usage: ImageUsage::COLOR_ATTACHMENT
+                    | ImageUsage::SAMPLED
+                    | ImageUsage::TRANSFER_SRC
+                    | ImageUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap();
+
+        let intermediate_image_view = ImageView::new_default(intermediate_image).unwrap();
 
         let depth_image = Image::new(
             self.memory_allocator.clone(),
@@ -1018,9 +1085,8 @@ impl ApplicationHandler for App {
                 ],
                 // set = 4
                 vec![DescriptorType::CombinedImageSampler; 21], // Texture Samplers
-                                                                // set = 5
-                                                                // TODO: re-enable when transmission works
-                                                                // vec![DescriptorType::CombinedImageSampler], // Framebuffer Sampler
+                // set = 5
+                vec![DescriptorType::CombinedImageSampler], // Framebuffer Sampler
             ];
 
             let push_constant_ranges = vec![PushConstantRange {
@@ -1100,6 +1166,9 @@ impl ApplicationHandler for App {
                     self.skyboxes.charlie.image().mip_levels() as i32,
                 )
                 .into(),
+                u_FramebufferMipCount: (max_mip_levels([window_size.width, window_size.height, 1])
+                    as i32)
+                    .into(),
                 u_EnvRotation: [
                     Padded([0f32, 0., -1.]),
                     Padded([0., 1., 0.]),
@@ -1317,11 +1386,30 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Create descriptor set for the intermediate image (set 5)
+        let framebuffer_set = {
+            let layout = pipeline_layout.set_layouts().get(5).unwrap().clone();
+            let write_set = WriteDescriptorSet::image_view_sampler(
+                0,
+                intermediate_image_view.clone(),
+                self.wrap_sampler.clone(), // Use appropriate sampler
+            );
+            DescriptorSet::new(
+                self.descriptor_set_allocator.clone(),
+                layout,
+                [write_set],
+                [],
+            )
+            .unwrap()
+        };
+
         self.rcx = Some(RenderContext {
             attachment_image_views,
             depth_image_view,
             pipeline_layout,
             pipelines,
+            intermediate_image_view,
+            framebuffer_set,
             viewport,
             frame_times,
         });
@@ -1406,6 +1494,8 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                let swapchain_format = window_renderer.swapchain_format();
+
                 // Begin rendering by acquiring the gpu future from the window renderer.
                 let previous_frame_end = window_renderer
                     .acquire(Some(Duration::from_millis(1000)), |swapchain_images| {
@@ -1417,6 +1507,45 @@ impl ApplicationHandler for App {
                             .iter()
                             .map(|image| ImageView::new_default(image.image().clone()).unwrap())
                             .collect();
+
+                        let mip_levels = max_mip_levels([window_size.width, window_size.height, 1]);
+                        let intermediate_image = Image::new(
+                            self.memory_allocator.clone(),
+                            ImageCreateInfo {
+                                image_type: ImageType::Dim2d,
+                                format: swapchain_format,
+                                extent: [window_size.width, window_size.height, 1],
+                                mip_levels,
+                                usage: ImageUsage::COLOR_ATTACHMENT
+                                    | ImageUsage::SAMPLED
+                                    | ImageUsage::TRANSFER_SRC
+                                    | ImageUsage::TRANSFER_DST,
+                                ..Default::default()
+                            },
+                            AllocationCreateInfo::default(),
+                        )
+                        .expect("Failed to create intermediate image");
+
+                        rcx.intermediate_image_view = ImageView::new_default(intermediate_image)
+                            .expect("Failed to create intermediate image view");
+
+                        // Update framebuffer descriptor set with new intermediate image
+                        rcx.framebuffer_set = {
+                            let layout = rcx.pipeline_layout.set_layouts().get(5).unwrap().clone();
+                            let write_set = WriteDescriptorSet::image_view_sampler(
+                                0,
+                                rcx.intermediate_image_view.clone(),
+                                self.wrap_sampler.clone(),
+                            );
+                            DescriptorSet::new(
+                                self.descriptor_set_allocator.clone(),
+                                layout,
+                                [write_set],
+                                [],
+                            )
+                            .unwrap()
+                        };
+
                         let depth_image = Image::new(
                             self.memory_allocator.clone(),
                             ImageCreateInfo {
@@ -1519,6 +1648,15 @@ impl ApplicationHandler for App {
                     .bind_index_buffer(self.index_buffer.clone())
                     .unwrap();
 
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        rcx.pipeline_layout.clone(),
+                        5,
+                        rcx.framebuffer_set.clone(),
+                    )
+                    .unwrap();
+
                 {
                     let aspect_ratio = window_size.width as f32 / window_size.height as f32;
                     let proj = self.camera.projection_matrix(aspect_ratio);
@@ -1555,6 +1693,7 @@ impl ApplicationHandler for App {
                         .unwrap();
                 }
 
+                // Render opaque geometry
                 for (mat_specs, obj_pipelines) in &rcx.pipelines {
                     if !mat_specs.is_opaque() {
                         continue;
@@ -1563,7 +1702,107 @@ impl ApplicationHandler for App {
                         pcx.render(&mut builder, rcx.pipeline_layout.clone(), &self.objects);
                     }
                 }
+                builder
+                    // We leave the render pass.
+                    .end_rendering()
+                    .unwrap();
 
+                // Render translucent geometry
+                builder
+                    .begin_rendering(RenderingInfo {
+                        color_attachments: vec![Some(RenderingAttachmentInfo {
+                            load_op: AttachmentLoadOp::Load, // Load previous contents
+                            store_op: AttachmentStoreOp::Store,
+                            ..RenderingAttachmentInfo::image_view(
+                                rcx.attachment_image_views[window_renderer.image_index() as usize]
+                                    .clone(),
+                            )
+                        })],
+                        depth_attachment: Some(RenderingAttachmentInfo {
+                            load_op: AttachmentLoadOp::Load, // Keep depth buffer
+                            store_op: AttachmentStoreOp::Store,
+                            ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
+                        }),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                for (mat_specs, obj_pipelines) in &rcx.pipelines {
+                    if !mat_specs.is_transparent() {
+                        continue;
+                    }
+                    for pcx in obj_pipelines.values() {
+                        pcx.render(&mut builder, rcx.pipeline_layout.clone(), &self.objects);
+                    }
+                }
+                builder
+                    // We leave the render pass.
+                    .end_rendering()
+                    .unwrap();
+
+                // Render transmissive geometry
+                let src_image =
+                    rcx.attachment_image_views[window_renderer.image_index() as usize].image();
+                let dst_image = rcx.intermediate_image_view.image();
+                builder
+                    .blit_image(BlitImageInfo::images(src_image.clone(), dst_image.clone()))
+                    .unwrap();
+                let dimensions = src_image.extent();
+                let mip_levels = max_mip_levels(dimensions);
+                for mip_level in 1..mip_levels {
+                    let regions = [ImageBlit {
+                        src_subresource: ImageSubresourceLayers {
+                            aspects: dst_image.format().aspects(),
+                            mip_level: mip_level - 1,
+                            array_layers: 0..dst_image.array_layers(),
+                        },
+                        dst_subresource: ImageSubresourceLayers {
+                            aspects: dst_image.format().aspects(),
+                            mip_level,
+                            array_layers: 0..dst_image.array_layers(),
+                        },
+                        src_offsets: [
+                            [0, 0, 0],
+                            mip_level_extent(dimensions, mip_level - 1).unwrap(),
+                        ],
+                        dst_offsets: [[0, 0, 0], mip_level_extent(dimensions, mip_level).unwrap()],
+                        ..Default::default()
+                    }];
+                    builder
+                        .blit_image(BlitImageInfo {
+                            src_image_layout: ImageLayout::General,
+                            dst_image_layout: ImageLayout::General,
+                            regions: regions.into(),
+                            filter: Filter::Linear,
+                            ..BlitImageInfo::images(dst_image.clone(), dst_image.clone())
+                        })
+                        .unwrap();
+                }
+                builder
+                    .begin_rendering(RenderingInfo {
+                        color_attachments: vec![Some(RenderingAttachmentInfo {
+                            load_op: AttachmentLoadOp::Load, // Load previous contents
+                            store_op: AttachmentStoreOp::Store,
+                            ..RenderingAttachmentInfo::image_view(
+                                rcx.attachment_image_views[window_renderer.image_index() as usize]
+                                    .clone(),
+                            )
+                        })],
+                        depth_attachment: Some(RenderingAttachmentInfo {
+                            load_op: AttachmentLoadOp::Load, // Keep depth buffer
+                            store_op: AttachmentStoreOp::Store,
+                            ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
+                        }),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                for (mat_specs, obj_pipelines) in &rcx.pipelines {
+                    if !mat_specs.is_transmissive() {
+                        continue;
+                    }
+                    for pcx in obj_pipelines.values() {
+                        pcx.render(&mut builder, rcx.pipeline_layout.clone(), &self.objects);
+                    }
+                }
                 builder
                     // We leave the render pass.
                     .end_rendering()

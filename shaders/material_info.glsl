@@ -89,7 +89,7 @@ NormalInfo getNormalInfo(vec3 v)
         b = cross(ng, t);
     }
 
-    if (NOT_TRIANGLE) {
+    if (!NOT_TRIANGLE) {
         // For a back-facing surface, the tangential basis vectors are negated.
         if (gl_FrontFacing == false)
         {

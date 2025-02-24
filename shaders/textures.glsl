@@ -7,9 +7,7 @@ layout (set = 2, binding = 3) uniform sampler2D     u_GGXLUT;
 layout (set = 2, binding = 4) uniform sampler2D     u_CharlieLUT;
 layout (set = 2, binding = 5) uniform sampler2D     u_SheenELUT;
 
-
-// TODO: re-enable when transmission works
-// layout (set = 5, binding = 0) uniform sampler2D u_TransmissionFramebufferSampler;
+layout (set = 5, binding = 0) uniform sampler2D     u_TransmissionFramebufferSampler;
 
 
 // General Material
@@ -59,7 +57,6 @@ layout (set = 3, binding = 1) uniform MatSamplers {
 
     int         u_TransmissionUVSet;
     mat3        u_TransmissionUVTransform;
-    ivec2       u_TransmissionFramebufferSize;
 
     int         u_ThicknessUVSet;
     mat3        u_ThicknessUVTransform;
