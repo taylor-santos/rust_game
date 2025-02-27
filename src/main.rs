@@ -13,14 +13,18 @@
 // original triangle example.
 
 use crate::camera::FirstPersonCamera;
-use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, TextureFormat};
+use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, Object, TextureFormat};
 use crate::material::Material;
 use crate::shader::*;
-use cgmath::{EuclideanSpace, Matrix, Matrix4, MetricSpace, SquareMatrix};
+use cgmath::{EuclideanSpace, Matrix, MetricSpace, SquareMatrix};
 use image::{ColorType, DynamicImage, ImageBuffer, ImageReader};
+use imgui::{TableFlags, TableSortDirection};
+use imgui_vulkano_renderer::Renderer;
+use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use ktx2::SupercompressionScheme;
 use rayon::iter::Either;
-use std::cmp::min;
+use rayon::prelude::*;
+use std::cmp::{min, Ordering};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use std::{error::Error, sync::Arc};
@@ -82,7 +86,7 @@ use vulkano::{
 };
 use vulkano_util::context::{VulkanoConfig, VulkanoContext};
 use vulkano_util::window::{VulkanoWindows, WindowDescriptor};
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton};
+use winit::event::{DeviceEvent, DeviceId, ElementState, Event, MouseButton, StartCause};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::CursorGrabMode;
 use winit::{
@@ -128,6 +132,7 @@ struct App {
     uniform_buffer_allocator: SubbufferAllocator,
     vertex_buffer: Subbuffer<[CombinedVertex]>,
     index_buffer: Subbuffer<[u32]>,
+    objects: Vec<Object>,
     prim_infos: Vec<PrimitiveDrawInfo>,
     materials: Vec<Material>,
     textures: Vec<Arc<ImageView>>,
@@ -136,6 +141,8 @@ struct App {
     samplers: Samplers,
     camera: FirstPersonCamera,
     input_state: InputState,
+    imgui_ctx: imgui::Context,
+    last_frame: Instant,
     rcx: Option<RenderContext>,
 }
 
@@ -166,6 +173,8 @@ struct RenderContext {
     framebuffer_set: Arc<DescriptorSet>,
     viewport: Viewport,
     frame_times: VecDeque<Instant>,
+    imgui_platform: WinitPlatform,
+    imgui_renderer: Renderer,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -418,7 +427,7 @@ impl App {
             meshes,
             textures,
             texture_maps,
-            materials,
+            mut materials,
             objects,
         } = load_gltf("models/DamagedHelmet.glb").expect("Couldn't load gltf model");
 
@@ -437,16 +446,24 @@ impl App {
             let mut mesh_infos = Vec::new();
             let mut prim_infos = Vec::new();
             let mut prims_offset = 0;
+            let mut needs_default_mat = false;
             for mesh in meshes {
                 let prims_count = mesh.primitives.len();
                 for prim in mesh.primitives {
+                    let mat_idx = if let Some(idx) = prim.mat_idx {
+                        idx
+                    } else {
+                        needs_default_mat = true;
+                        materials.len()
+                    };
+
                     prim_infos.push(PrimitiveDrawInfo {
                         index_offset: combined_indices.len() as u32,
                         vertex_offset: combined_verts.len() as i32,
                         index_count: prim.indices.len() as u32,
-                        mat_idx: prim.mat_idx,
+                        mat_idx,
                         spec_const: prim.spec_const,
-                        transforms: Vec::new(),
+                        object_ids: Vec::new(),
                     });
 
                     combined_verts.extend(prim.vertices);
@@ -459,7 +476,11 @@ impl App {
                 prims_offset += prims_count;
             }
 
-            for object in objects {
+            if needs_default_mat {
+                materials.push(Material::default());
+            }
+
+            for (obj_idx, object) in objects.iter().enumerate() {
                 let mesh_idx = object.mesh_idx;
                 let mesh_info = &mesh_infos[mesh_idx];
                 for prim in prim_infos
@@ -467,7 +488,7 @@ impl App {
                     .skip(mesh_info.prims_offset)
                     .take(mesh_info.prims_count)
                 {
-                    prim.transforms.push(object.transform);
+                    prim.object_ids.push(obj_idx);
                 }
             }
 
@@ -502,8 +523,8 @@ impl App {
         let textures = {
             let timer = Instant::now();
 
-            let textures = texture_maps
-                .into_iter()
+            let textures: Vec<_> = texture_maps
+                .into_par_iter()
                 .map(|texture_map| {
                     let texture = &textures[texture_map.index];
                     let is_srgb = texture_map
@@ -513,6 +534,20 @@ impl App {
                         .unwrap_or(false);
 
                     let (pixels, format) = match texture.format {
+                        TextureFormat::R16 => {
+                            if is_srgb {
+                                let pixels = texture
+                                    .pixels
+                                    .chunks_exact(2)
+                                    .map(|chunk| {
+                                        (u16::from_le_bytes([chunk[0], chunk[1]]) / 257) as u8
+                                    })
+                                    .collect();
+                                (pixels, Format::R8_SRGB)
+                            } else {
+                                (texture.pixels.clone(), Format::R16_UNORM)
+                            }
+                        }
                         TextureFormat::R8G8B8A8 => (
                             texture.pixels.clone(),
                             match is_srgb {
@@ -547,18 +582,57 @@ impl App {
                                 false => Format::R8_UNORM,
                             },
                         ),
-                        TextureFormat::R16G16B16A16 => (
-                            texture.pixels.clone(),
-                            match is_srgb {
-                                true => Format::R16G16B16A16_SFLOAT,
-                                false => Format::R16G16B16A16_UNORM,
-                            },
-                        ),
+                        TextureFormat::R16G16B16A16 => {
+                            if is_srgb {
+                                let pixels = texture
+                                    .pixels
+                                    .chunks_exact(2)
+                                    .map(|chunk| {
+                                        (u16::from_le_bytes([chunk[0], chunk[1]]) / 257) as u8
+                                    })
+                                    .collect();
+                                (pixels, Format::R8G8B8A8_SRGB)
+                            } else {
+                                (texture.pixels.clone(), Format::R16G16B16A16_UNORM)
+                            }
+                        }
+                        TextureFormat::R16G16B16 => {
+                            let pixels = texture
+                                .pixels
+                                .chunks_exact(2)
+                                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                                .collect();
+                            let pixels = DynamicImage::ImageRgb16(
+                                ImageBuffer::from_raw(texture.width, texture.height, pixels)
+                                    .unwrap(),
+                            )
+                            .to_rgba16()
+                            .into_raw();
+
+                            if is_srgb {
+                                let pixels = pixels
+                                    .into_par_iter()
+                                    .map(|p16| (p16 / 257) as u8)
+                                    .collect();
+                                (pixels, Format::R8G8B8A8_SRGB)
+                            } else {
+                                let pixels = pixels
+                                    .into_par_iter()
+                                    .flat_map(|v| v.to_le_bytes())
+                                    .collect();
+                                (pixels, Format::R16G16B16A16_UNORM)
+                            }
+                        }
                         _ => panic!("unsupported texture format: {:?}", texture.format),
                     };
 
                     let extent: [u32; 3] = [texture.width, texture.height, 1];
 
+                    (pixels, extent, format)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(pixels, extent, format)| {
                     upload_image(
                         &mut image_builder,
                         pixels,
@@ -572,7 +646,7 @@ impl App {
                     )
                     .unwrap()
                 })
-                .collect::<Vec<_>>();
+                .collect();
 
             println!(
                 "Uploaded {} textures in {:?}",
@@ -756,6 +830,9 @@ impl App {
 
         let camera = FirstPersonCamera::new();
 
+        let mut imgui_ctx = imgui::Context::create();
+        imgui_ctx.io_mut().config_flags |= imgui::ConfigFlags::DOCKING_ENABLE;
+
         App {
             context,
             windows,
@@ -765,6 +842,7 @@ impl App {
             uniform_buffer_allocator,
             vertex_buffer,
             index_buffer,
+            objects,
             prim_infos,
             materials,
             textures,
@@ -773,6 +851,8 @@ impl App {
             samplers,
             camera,
             input_state: Default::default(),
+            imgui_ctx,
+            last_frame: Instant::now(),
             rcx: None,
         }
     }
@@ -860,8 +940,8 @@ fn build_pipeline(
         if specialization_constants.material_constants.render_type() == RenderType::Translucent {
             let depth_stencil_state = DepthStencilState {
                 depth: Some(DepthState {
-                    write_enable: false, // Prevent transparent objects from writing depth
-                    compare_op: CompareOp::LessOrEqual, // Keep depth test to allow occlusion
+                    write_enable: true,
+                    compare_op: CompareOp::LessOrEqual,
                 }),
                 ..Default::default()
             };
@@ -1034,6 +1114,7 @@ impl PipelineContext {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         pipeline_layout: Arc<PipelineLayout>,
         primitives: &[PrimitiveDrawInfo],
+        objects: &[Object],
     ) {
         builder
             .bind_pipeline_graphics(self.pipeline.clone())
@@ -1060,7 +1141,11 @@ impl PipelineContext {
                 )
                 .unwrap();
 
-            for transform in prim.transforms.iter().copied() {
+            for object in prim.object_ids.iter().filter_map(|idx| {
+                let object = &objects[*idx];
+                object.enabled.then_some(object)
+            }) {
+                let transform = object.transform;
                 let normal = transform.transpose().invert().unwrap();
                 let model: [[f32; 4]; 4] = transform.into();
                 #[allow(clippy::useless_conversion)]
@@ -1099,8 +1184,8 @@ impl ApplicationHandler for App {
             &self.context,
             &WindowDescriptor {
                 present_mode: PresentMode::Immediate,
-                width: 1024.,
-                height: 1024.,
+                width: 1920.,
+                height: 1080.,
                 scale_factor_override: Some(1.0),
                 ..Default::default()
             },
@@ -1626,6 +1711,21 @@ impl ApplicationHandler for App {
             }
         }
 
+        let mut imgui_platform = WinitPlatform::new(&mut self.imgui_ctx);
+        let imgui_io = self.imgui_ctx.io_mut();
+
+        imgui_platform.attach_window(imgui_io, window_renderer.window(), HiDpiMode::Default);
+
+        let imgui_renderer = Renderer::init(
+            &mut self.imgui_ctx,
+            self.context.device().clone(),
+            self.context.graphics_queue().clone(),
+            window_renderer.swapchain_format(),
+            None,
+            None,
+        )
+        .unwrap();
+
         self.rcx = Some(RenderContext {
             attachment_image_views,
             depth_image_view,
@@ -1642,6 +1742,8 @@ impl ApplicationHandler for App {
             framebuffer_set,
             viewport,
             frame_times,
+            imgui_platform,
+            imgui_renderer,
         });
     }
 
@@ -1666,12 +1768,22 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
         let window_renderer = self.windows.get_primary_renderer_mut().unwrap();
 
         let rcx = self.rcx.as_mut().unwrap();
+
+        let imgui_io = self.imgui_ctx.io_mut();
+        rcx.imgui_platform.handle_event::<()>(
+            imgui_io,
+            window_renderer.window(),
+            &Event::WindowEvent {
+                window_id,
+                event: event.clone(),
+            },
+        );
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -1680,9 +1792,15 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                if imgui_io.want_capture_mouse {
+                    return;
+                }
                 self.set_cursor_confinement(true);
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if imgui_io.want_capture_keyboard {
+                    return;
+                }
                 if self.input_state.cursor_confined {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         let pressed = match event.state {
@@ -1853,13 +1971,18 @@ impl ApplicationHandler for App {
                     let pcx = &rcx.pipelines[pcx_idx];
                     for prim_idx in pcx.prim_indices.iter().copied() {
                         let prim = &self.prim_infos[prim_idx];
-                        for transform in prim.transforms.iter() {
+                        for obj_idx in prim.object_ids.iter().copied() {
+                            let object = &self.objects[obj_idx];
+                            if !object.enabled {
+                                continue;
+                            }
+                            let transform = object.transform;
                             let dist = self
                                 .camera
                                 .position
                                 .to_vec()
                                 .distance2(transform.w.truncate());
-                            translucent_sorted.push((dist, *transform, prim_idx, pcx_idx));
+                            translucent_sorted.push((dist, obj_idx, prim_idx, pcx_idx));
                         }
                     }
                 }
@@ -2005,6 +2128,7 @@ impl ApplicationHandler for App {
                             &mut builder,
                             rcx.pipeline_layout.clone(),
                             &self.prim_infos,
+                            &self.objects,
                         );
                     }
                 }
@@ -2012,7 +2136,7 @@ impl ApplicationHandler for App {
                 if !translucent_sorted.is_empty() {
                     // Render translucent geometry
                     let mut curr_pcx = None;
-                    for (_, transform, prim_idx, pcx_idx) in translucent_sorted {
+                    for (_, obj_idx, prim_idx, pcx_idx) in translucent_sorted {
                         let prim = &self.prim_infos[prim_idx];
                         let pcx = &rcx.pipelines[pcx_idx];
                         if curr_pcx != Some(pcx_idx) {
@@ -2042,6 +2166,8 @@ impl ApplicationHandler for App {
                             )
                             .unwrap();
 
+                        let object = &self.objects[obj_idx];
+                        let transform = object.transform;
                         let normal = transform.transpose().invert().unwrap();
                         let model: [[f32; 4]; 4] = transform.into();
                         #[allow(clippy::useless_conversion)]
@@ -2138,6 +2264,7 @@ impl ApplicationHandler for App {
                             &mut builder,
                             rcx.pipeline_layout.clone(),
                             &self.prim_infos,
+                            &self.objects,
                         );
                     }
                     builder
@@ -2145,6 +2272,66 @@ impl ApplicationHandler for App {
                         .end_rendering()
                         .unwrap();
                 }
+
+                let ui = self.imgui_ctx.frame();
+
+                ui.dockspace_over_main_viewport();
+
+                ui.window("Objects").build(|| {
+                    if let Some(_token) = ui.begin_table_with_flags(
+                        "Objects",
+                        1,
+                        TableFlags::SORTABLE | TableFlags::SORT_MULTI,
+                    ) {
+                        ui.table_setup_column("Name");
+                        ui.table_headers_row();
+
+                        let mut object_order = (0..self.objects.len()).collect::<Vec<_>>();
+                        if let Some(sort_data) = ui.table_sort_specs_mut() {
+                            for spec in sort_data.specs().iter() {
+                                if let Some(direction) = spec.sort_direction() {
+                                    object_order.sort_by(|a, b| {
+                                        let mut ord = match spec.column_idx() {
+                                            0 => self.objects[*a].name.cmp(&self.objects[*b].name),
+                                            1 => self.objects[*a]
+                                                .enabled
+                                                .cmp(&self.objects[*b].enabled),
+                                            _ => Ordering::Equal,
+                                        };
+                                        if direction == TableSortDirection::Descending {
+                                            ord = ord.reverse();
+                                        }
+                                        ord
+                                    });
+                                }
+                            }
+                        }
+                        for obj_idx in object_order.iter().copied() {
+                            ui.table_next_row();
+                            ui.table_next_column();
+                            let obj = &mut self.objects[obj_idx];
+                            let name = if let Some(name) = &obj.name {
+                                name
+                            } else {
+                                "Unnamed"
+                            };
+                            ui.checkbox(format!("{}##enabled{}", name, obj_idx), &mut obj.enabled);
+                        }
+                    }
+                });
+
+                rcx.imgui_platform
+                    .prepare_render(ui, window_renderer.window());
+
+                let draw_data = self.imgui_ctx.render();
+
+                rcx.imgui_renderer
+                    .draw_commands(
+                        &mut builder,
+                        window_renderer.swapchain_image_view(),
+                        draw_data,
+                    )
+                    .unwrap();
 
                 // Finish recording the command buffer by calling `end`.
                 let command_buffer = builder.build().unwrap();
@@ -2162,7 +2349,19 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         let window_renderer = self.windows.get_primary_renderer_mut().unwrap();
+        let rcx = self.rcx.as_mut().unwrap();
+        rcx.imgui_platform
+            .prepare_frame(self.imgui_ctx.io_mut(), window_renderer.window())
+            .unwrap();
         window_renderer.window().request_redraw();
+    }
+
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: StartCause) {
+        let now = Instant::now();
+        self.imgui_ctx
+            .io_mut()
+            .update_delta_time(now - self.last_frame);
+        self.last_frame = now;
     }
 }
 
@@ -2173,7 +2372,7 @@ struct PrimitiveDrawInfo {
     pub index_count: u32,
     pub mat_idx: usize,
     pub spec_const: ObjectSpecializationConstants,
-    pub transforms: Vec<Matrix4<f32>>,
+    pub object_ids: Vec<usize>,
 }
 
 #[derive(Debug)]

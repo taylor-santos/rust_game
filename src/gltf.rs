@@ -49,17 +49,21 @@ impl From<[f32; 3]> for CubemapVertex {
 pub struct Primitive {
     pub vertices: Vec<CombinedVertex>,
     pub indices: Vec<u32>,
-    pub mat_idx: usize,
+    pub mat_idx: Option<usize>,
     pub spec_const: ObjectSpecializationConstants,
 }
 
+#[derive(Debug)]
 pub struct Mesh {
     pub primitives: Vec<Primitive>,
 }
 
+#[derive(Debug)]
 pub struct Object {
+    pub name: Option<String>,
     pub transform: Matrix4<f32>,
     pub mesh_idx: usize,
+    pub enabled: bool,
 }
 
 pub(crate) type TextureData = Data;
@@ -766,6 +770,7 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
         .nodes()
         .map(|node| {
             (
+                node.name(),
                 Matrix4::from(node.transform().matrix()),
                 node.mesh().map(|m| m.index()),
                 node.children()
@@ -787,14 +792,16 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
             .collect::<Vec<_>>();
 
         while let Some((node_id, parent_transform)) = stack.pop() {
-            let (node_transform, mesh_idx, children) = nodes[node_id].clone();
+            let (name, node_transform, mesh_idx, children) = nodes[node_id].clone();
 
             let transform = parent_transform * node_transform;
 
             if let Some(mesh_idx) = mesh_idx {
                 objects.push(Object {
+                    name: name.map(|s| s.to_owned()),
                     transform,
                     mesh_idx,
+                    enabled: true,
                 });
             }
 
@@ -813,7 +820,7 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
                 .primitives()
                 .collect::<Vec<_>>()
                 .par_iter()
-                .map(|prim| {
+                .filter_map(|prim| {
                     let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
 
                     let normals = reader.read_normals();
@@ -898,7 +905,7 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
                         )
                         .collect();
 
-                    let mat_idx = prim.material().index().unwrap();
+                    let mat_idx = prim.material().index();
 
                     let mut prim = Primitive {
                         vertices,
@@ -913,7 +920,7 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
                         println!("Generated {} tangents in {:?}", num_verts, timer.elapsed());
                     }
 
-                    prim
+                    Some(prim)
                 })
                 .collect();
             Mesh { primitives }

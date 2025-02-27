@@ -20,6 +20,9 @@ gltf = { version = "1.4.1", features = [
         "allow_empty_texture",
 ] }
 image = "0.25.5"
+imgui = { version = "0.12.0", features = ["docking", "tables-api"] }
+imgui-winit-support = "0.13.0"
+imgui-vulkano-renderer = { git = "https://github.com/taylor-santos/imgui-vulkano-renderer.git" }
 ktx2 = "0.3.0"
 mikktspace = "0.3.0"
 rayon = "1.10.0"
