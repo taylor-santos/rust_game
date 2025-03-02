@@ -18,8 +18,8 @@ pub struct FirstPersonCamera {
 }
 
 impl FirstPersonCamera {
-    pub fn new() -> FirstPersonCamera {
-        FirstPersonCamera::default()
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {

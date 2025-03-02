@@ -33,7 +33,7 @@ pub fn color_square(ui: &imgui::Ui, color: [f32; 4], label: &str) {
 }
 
 pub fn drag_vec3(
-    val: [&mut f32; 3],
+    val: &mut [&mut f32; 3],
     ui: &imgui::Ui,
     label: &str,
     fmt: impl Into<Vec<u8>> + Copy,
@@ -46,9 +46,9 @@ pub fn drag_vec3(
     let mut changed = false;
     for (i, &(axis, color)) in axes.iter().enumerate() {
         let color = [
-            color.0 as f32 / 255.0,
-            color.1 as f32 / 255.0,
-            color.2 as f32 / 255.0,
+            f32::from(color.0) / 255.0,
+            f32::from(color.1) / 255.0,
+            f32::from(color.2) / 255.0,
             1.0,
         ];
         color_square(ui, color, axis);

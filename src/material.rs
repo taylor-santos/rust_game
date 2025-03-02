@@ -30,7 +30,7 @@ pub struct Material {
 }
 
 impl Default for Material {
-    fn default() -> Material {
+    fn default() -> Self {
         Self {
             name: None,
             pbr_metallic_roughness: Default::default(),

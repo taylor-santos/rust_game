@@ -15,7 +15,7 @@ impl<T> From<Matrix4<T>> for Transform<T>
 where
     T: BaseFloat,
 {
-    fn from(matrix: Matrix4<T>) -> Transform<T> {
+    fn from(matrix: Matrix4<T>) -> Self {
         let position = matrix.w.truncate();
         let rzs = Matrix3::from_cols(
             matrix.x.truncate(),
@@ -50,7 +50,7 @@ impl<T> From<Transform<T>> for Matrix4<T>
 where
     T: BaseFloat,
 {
-    fn from(transform: Transform<T>) -> Matrix4<T> {
+    fn from(transform: Transform<T>) -> Self {
         let rot_mat: Matrix3<T> = Quaternion::from(transform.rotation).into();
         let mut skew_mat = Matrix3::identity();
         skew_mat.y.x = transform.skew.x;

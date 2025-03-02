@@ -1,5 +1,9 @@
-use crate::material::*;
-use crate::shader::*;
+use crate::material::{
+    AlphaMode, Anisotropy, Clearcoat, DiffuseTransmission, Dispersion, Iridescence, Material,
+    NormalTexture, OcclusionTexture, PbrMetallicRoughness, PbrSpecularGlossiness, Sheen, Specular,
+    Texture, TextureInfo, TextureTransform, Transmission, Volume,
+};
+use crate::shader::ObjectSpecializationConstants;
 use crate::transform::Transform;
 use cgmath::{Matrix4, SquareMatrix};
 use gltf::image::{Data, Format};
@@ -147,7 +151,7 @@ impl Scene {
             mat = self.objects[to]
                 .transform
                 .invert()
-                .unwrap_or(Matrix4::identity())
+                .unwrap_or_else(Matrix4::identity)
                 * mat;
         }
         self.objects[from].local_transform = mat.into();
@@ -164,12 +168,12 @@ impl Scene {
         self.objects[from].parent = to;
         self.change_parent_transform(from, to);
 
-        self.regenerate()
+        self.regenerate();
     }
 }
 
-pub(crate) type TextureData = Data;
-pub(crate) type TextureFormat = Format;
+pub type TextureData = Data;
+pub type TextureFormat = Format;
 
 pub struct Gltf {
     pub meshes: Vec<Mesh>,
@@ -203,11 +207,11 @@ impl mikktspace::Geometry for Primitive {
         self.vertices[tri].a_texcoord_0
     }
 
-    fn set_tangent_encoded(&mut self, mut _tangent: [f32; 4], _face: usize, _vert: usize) {
-        let tri = self.indices[_face * 3 + _vert] as usize;
+    fn set_tangent_encoded(&mut self, mut tangent: [f32; 4], face: usize, vert: usize) {
+        let tri = self.indices[face * 3 + vert] as usize;
         // convert coordinate system handedness to respect output format of MikkTSpace
-        _tangent[3] = -_tangent[3];
-        self.vertices[tri].a_tangent = _tangent;
+        tangent[3] = -tangent[3];
+        self.vertices[tri].a_tangent = tangent;
     }
 }
 
@@ -283,9 +287,9 @@ impl From<gltf::material::PbrMetallicRoughness<'_>> for PbrMetallicRoughness {
 impl From<gltf::material::AlphaMode> for AlphaMode {
     fn from(alpha_mode: gltf::material::AlphaMode) -> Self {
         match alpha_mode {
-            gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
-            gltf::material::AlphaMode::Mask => AlphaMode::Mask,
-            gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+            gltf::material::AlphaMode::Opaque => Self::Opaque,
+            gltf::material::AlphaMode::Mask => Self::Mask,
+            gltf::material::AlphaMode::Blend => Self::Blend,
         }
     }
 }
@@ -328,7 +332,7 @@ impl From<Value> for Sheen {
     fn from(value: Value) -> Self {
         let mut map = value.as_object().unwrap().clone();
 
-        let mut sheen = Sheen::default();
+        let mut sheen = Self::default();
 
         if let Some(color_factor) = map.remove("sheenColorFactor").map(to_array) {
             sheen.color_factor = color_factor;
@@ -354,7 +358,7 @@ impl From<Value> for Clearcoat {
     fn from(value: Value) -> Self {
         let mut map = value.as_object().unwrap().clone();
 
-        let mut clearcoat = Clearcoat::default();
+        let mut clearcoat = Self::default();
 
         if let Some(factor) = map
             .remove("clearcoatFactor")
@@ -384,7 +388,7 @@ impl From<Value> for Anisotropy {
     fn from(value: Value) -> Self {
         let mut map = value.as_object().unwrap().clone();
 
-        let mut anisotropy = Anisotropy::default();
+        let mut anisotropy = Self::default();
 
         if let Some(strength) = map
             .remove("anisotropyStrength")
@@ -415,7 +419,7 @@ impl From<Value> for Iridescence {
     fn from(value: Value) -> Self {
         let mut map = value.as_object().unwrap().clone();
 
-        let mut iridescence = Iridescence::default();
+        let mut iridescence = Self::default();
 
         if let Some(factor) = map
             .remove("iridescenceFactor")
@@ -459,7 +463,7 @@ impl From<Value> for Dispersion {
     fn from(value: Value) -> Self {
         let mut map = value.as_object().unwrap().clone();
 
-        let mut dispersion = Dispersion::default();
+        let mut dispersion = Self::default();
 
         if let Some(d) = map.remove("dispersion").map(|d| d.as_f64().unwrap() as f32) {
             dispersion = d.into();
@@ -480,7 +484,7 @@ impl From<Value> for DiffuseTransmission {
     fn from(value: Value) -> Self {
         let mut map = value.as_object().unwrap().clone();
 
-        let mut diffuse_transmission = DiffuseTransmission::default();
+        let mut diffuse_transmission = Self::default();
 
         if let Some(factor) = map
             .remove("diffuseTransmissionFactor")
@@ -511,7 +515,7 @@ impl From<Value> for TextureTransform {
     fn from(value: Value) -> Self {
         let mut map = value.as_object().unwrap().clone();
 
-        let mut texture_transform = TextureTransform::default();
+        let mut texture_transform = Self::default();
 
         if let Some(offset) = map.remove("offset").map(to_array) {
             texture_transform.offset = offset;
@@ -539,8 +543,7 @@ impl From<Value> for TextureInfo {
         let index = map.remove("index").unwrap().as_i64().unwrap() as usize;
         let tex_coord = map
             .remove("texCoord")
-            .map(|t| t.as_i64().unwrap() as u32)
-            .unwrap_or(0);
+            .map_or(0, |t| t.as_i64().unwrap() as u32);
         let mut extensions = map
             .remove("extensions")
             .map(|e| e.as_object().unwrap().clone());
@@ -560,7 +563,7 @@ impl From<Value> for TextureInfo {
             eprintln!("WARN: Unhandled texture values: {:?}", &map);
         }
 
-        TextureInfo {
+        Self {
             texture: Texture { index, tex_coord },
             transform,
         }
@@ -577,12 +580,10 @@ impl From<Value> for NormalTexture {
             .expect("Normal Texture requires index value") as usize;
         let tex_coord = map
             .remove("texCoord")
-            .map(|v| v.as_i64().unwrap() as u32)
-            .unwrap_or(0);
+            .map_or(0, |v| v.as_i64().unwrap() as u32);
         let scale = map
             .remove("scale")
-            .map(|v| v.as_f64().unwrap() as f32)
-            .unwrap_or(1.0);
+            .map_or(1.0, |v| v.as_f64().unwrap() as f32);
 
         let mut extensions = map
             .remove("extensions")
@@ -686,7 +687,7 @@ impl From<Info<'_>> for TextureInfo {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SrgbUsage {
     // glTF
     BaseColor,
@@ -701,7 +702,7 @@ pub enum SrgbUsage {
     SpecularColor,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum LinearUsage {
     // glTF
     Normal,
@@ -769,20 +770,23 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
         let tex = &mut texture_maps[idx];
         if let Some(old_usage) = &tex.usage {
             if old_usage.is_left() != usage.is_left() {
-                eprintln!(
-                    "WARN: Texture {} used in both sRGB and Linear contexts",
-                    idx
-                );
+                eprintln!("WARN: Texture {idx} used in both sRGB and Linear contexts");
             }
         } else {
             tex.usage = Some(usage);
         }
     };
 
-    materials.iter().for_each(|mat| {
-        use Either::*;
-        use LinearUsage::*;
-        use SrgbUsage::*;
+    for mat in &materials {
+        use Either::{Left, Right};
+        use LinearUsage::{
+            Anisotropy, Clearcoat, ClearcoatNormal, ClearcoatRoughness, DiffuseTransmission,
+            Iridescence, IridescenceThickness, MetallicRoughness, Normal, Occlusion,
+            SheenRoughness, Specular, SpecularGlossiness, Thickness, Transmission,
+        };
+        use SrgbUsage::{
+            BaseColor, Diffuse, DiffuseTransmissionColor, Emissive, SheenColor, SpecularColor,
+        };
         if let Some(t) = &mat.pbr_metallic_roughness.base_color_texture {
             add_texture_usage(t.texture.index, Left(BaseColor));
         }
@@ -858,7 +862,7 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
         if let Some(t) = &mat.volume.as_ref().and_then(|v| v.thickness_texture) {
             add_texture_usage(t.texture.index, Right(Thickness));
         }
-    });
+    }
 
     for texture in &texture_maps {
         if texture.usage.is_none() {
@@ -910,12 +914,12 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
 
                     let (color3, color4) = match colors {
                         None => (false, false),
-                        Some(ReadColors::RgbU8(_))
-                        | Some(ReadColors::RgbU16(_))
-                        | Some(ReadColors::RgbF32(_)) => (true, false),
-                        Some(ReadColors::RgbaU8(_))
-                        | Some(ReadColors::RgbaU16(_))
-                        | Some(ReadColors::RgbaF32(_)) => (false, true),
+                        Some(
+                            ReadColors::RgbU8(_) | ReadColors::RgbU16(_) | ReadColors::RgbF32(_),
+                        ) => (true, false),
+                        Some(
+                            ReadColors::RgbaU8(_) | ReadColors::RgbaU16(_) | ReadColors::RgbaF32(_),
+                        ) => (false, true),
                     };
 
                     // If tangents are not provided by the model, they can be generated using the MikkTSpace algorithm.
@@ -941,21 +945,26 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
 
                     let num_verts = positions.len();
 
-                    let normals = normals
-                        .map(|n| n.flatten().collect::<Vec<_>>())
-                        .unwrap_or_else(|| vec![0.; num_verts * 3]);
-                    let texcoords0 = texcoords0
-                        .map(|t| t.into_f32().flatten().collect::<Vec<_>>())
-                        .unwrap_or_else(|| vec![0.; num_verts * 2]);
-                    let texcoords1 = texcoords1
-                        .map(|t| t.into_f32().flatten().collect::<Vec<_>>())
-                        .unwrap_or_else(|| vec![0.; num_verts * 2]);
-                    let colors = colors
-                        .map(|c| c.into_rgba_f32().flatten().collect::<Vec<_>>())
-                        .unwrap_or_else(|| vec![0.; num_verts * 4]);
-                    let tangents = tangents
-                        .map(|t| t.flatten().collect::<Vec<_>>())
-                        .unwrap_or_else(|| vec![0.; num_verts * 4]);
+                    let normals = normals.map_or_else(
+                        || vec![0.; num_verts * 3],
+                        |n| n.flatten().collect::<Vec<_>>(),
+                    );
+                    let texcoords0 = texcoords0.map_or_else(
+                        || vec![0.; num_verts * 2],
+                        |t| t.into_f32().flatten().collect::<Vec<_>>(),
+                    );
+                    let texcoords1 = texcoords1.map_or_else(
+                        || vec![0.; num_verts * 2],
+                        |t| t.into_f32().flatten().collect::<Vec<_>>(),
+                    );
+                    let colors = colors.map_or_else(
+                        || vec![0.; num_verts * 4],
+                        |c| c.into_rgba_f32().flatten().collect::<Vec<_>>(),
+                    );
+                    let tangents = tangents.map_or_else(
+                        || vec![0.; num_verts * 4],
+                        |t| t.flatten().collect::<Vec<_>>(),
+                    );
 
                     let indices = reader
                         .read_indices()

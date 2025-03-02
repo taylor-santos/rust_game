@@ -15,7 +15,10 @@
 use crate::camera::FirstPersonCamera;
 use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, Object, Scene, TextureFormat};
 use crate::material::{AlphaMode, Material};
-use crate::shader::*;
+use crate::shader::{
+    cubemap_fs, cubemap_vs, fs, vs, MaterialSpecializationConstants, ObjectSpecializationConstants,
+    RenderType, SpecializationConstants,
+};
 use c_str_macro::c_str;
 use cgmath::num_traits::Float;
 use cgmath::{EuclideanSpace, Matrix, Matrix4, MetricSpace, SquareMatrix};
@@ -197,9 +200,9 @@ fn upload_image<T: BufferContents + Send + Sync, I: IntoIterator<Item = T>>(
     extent: [u32; 3],
     mip_levels: u32,
     array_layers: u32,
-    memory_allocator: Arc<StandardMemoryAllocator>,
-    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    queue: Arc<Queue>,
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
+    queue: &Arc<Queue>,
     format: Format,
 ) -> Result<Arc<ImageView>, impl Error>
 where
@@ -253,7 +256,7 @@ where
                 };
 
                 buffer_offset +=
-                    format.block_size() * (array_layers * mip_width * mip_height) as DeviceSize;
+                    format.block_size() * DeviceSize::from(array_layers * mip_width * mip_height);
                 // Each successive Mip level is 4x smaller than the last, each dimension must be divided by 2
                 mip_width /= 2;
                 mip_height /= 2;
@@ -285,9 +288,9 @@ where
 fn load_ktx2(
     path: &str,
     image_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    memory_allocator: Arc<StandardMemoryAllocator>,
-    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    queue: Arc<Queue>,
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
+    queue: &Arc<Queue>,
 ) -> Result<Arc<ImageView>, Box<dyn Error>> {
     let buf = std::fs::read(path)?;
     let reader = ktx2::Reader::new(buf)?;
@@ -316,7 +319,7 @@ fn load_ktx2(
             let data = match header.supercompression_scheme {
                 None => level.to_vec(),
                 Some(SupercompressionScheme::Zstandard) => zstd::decode_all(level).unwrap(),
-                Some(scheme) => panic!("Unsupported compression scheme: {:?}", scheme),
+                Some(scheme) => panic!("Unsupported compression scheme: {scheme:?}"),
             };
             bytes.extend(data);
             bytes
@@ -336,8 +339,8 @@ fn load_ktx2(
         extent,
         header.level_count,
         header.face_count,
-        memory_allocator.clone(),
-        command_buffer_allocator.clone(),
+        memory_allocator,
+        command_buffer_allocator,
         queue,
         Format::R16G16B16A16_SFLOAT,
     )?)
@@ -346,9 +349,9 @@ fn load_ktx2(
 fn load_png(
     path: &str,
     image_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    memory_allocator: Arc<StandardMemoryAllocator>,
-    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    queue: Arc<Queue>,
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
+    queue: &Arc<Queue>,
 ) -> Result<Arc<ImageView>, Box<dyn Error>> {
     let img = ImageReader::open(path)?.decode()?;
     let color = img.color();
@@ -363,8 +366,8 @@ fn load_png(
                 [width, height, 1],
                 1,
                 1,
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
+                memory_allocator,
+                command_buffer_allocator,
                 queue,
                 Format::R8G8B8A8_UNORM,
             )?)
@@ -377,13 +380,13 @@ fn load_png(
                 [width, height, 1],
                 1,
                 1,
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
+                memory_allocator,
+                command_buffer_allocator,
                 queue,
                 Format::R16G16B16A16_UNORM,
             )?)
         }
-        _ => panic!("Unsupported color type {:?}", color),
+        _ => panic!("Unsupported color type {color:?}"),
     }
 }
 
@@ -466,12 +469,13 @@ impl App {
             for mesh in meshes {
                 let prims_count = mesh.primitives.len();
                 for prim in mesh.primitives {
-                    let mat_idx = if let Some(idx) = prim.mat_idx {
-                        idx
-                    } else {
-                        needs_default_mat = true;
-                        materials.len()
-                    };
+                    let mat_idx = prim.mat_idx.map_or_else(
+                        || {
+                            needs_default_mat = true;
+                            materials.len()
+                        },
+                        |idx| idx,
+                    );
                     mat_prims[mat_idx].insert(prim_infos.len());
 
                     prim_infos.push(PrimitiveDrawInfo {
@@ -513,7 +517,7 @@ impl App {
             let vertex_buffer = create_buffer(
                 memory_allocator.clone(),
                 command_buffer_allocator.clone(),
-                context.graphics_queue().clone(),
+                context.graphics_queue(),
                 BufferUsage::VERTEX_BUFFER,
                 combined_verts,
             );
@@ -521,7 +525,7 @@ impl App {
             let index_buffer = create_buffer(
                 memory_allocator.clone(),
                 command_buffer_allocator.clone(),
-                context.graphics_queue().clone(),
+                context.graphics_queue(),
                 BufferUsage::INDEX_BUFFER,
                 combined_indices,
             );
@@ -551,11 +555,7 @@ impl App {
                 .into_par_iter()
                 .map(|texture_map| {
                     let texture = &textures[texture_map.index];
-                    let is_srgb = texture_map
-                        .usage
-                        .as_ref()
-                        .map(Either::is_left)
-                        .unwrap_or(false);
+                    let is_srgb = texture_map.usage.as_ref().is_some_and(Either::is_left);
 
                     let (pixels, format) = match texture.format {
                         TextureFormat::R16 => {
@@ -574,9 +574,10 @@ impl App {
                         }
                         TextureFormat::R8G8B8A8 => (
                             texture.pixels.clone(),
-                            match is_srgb {
-                                true => Format::R8G8B8A8_SRGB,
-                                false => Format::R8G8B8A8_UNORM,
+                            if is_srgb {
+                                Format::R8G8B8A8_SRGB
+                            } else {
+                                Format::R8G8B8A8_UNORM
                             },
                         ),
                         TextureFormat::R8G8B8 => {
@@ -593,17 +594,19 @@ impl App {
 
                             (
                                 pixels,
-                                match is_srgb {
-                                    true => Format::R8G8B8A8_SRGB,
-                                    false => Format::R8G8B8A8_UNORM,
+                                if is_srgb {
+                                    Format::R8G8B8A8_SRGB
+                                } else {
+                                    Format::R8G8B8A8_UNORM
                                 },
                             )
                         }
                         TextureFormat::R8 => (
                             texture.pixels.clone(),
-                            match is_srgb {
-                                true => Format::R8_SRGB,
-                                false => Format::R8_UNORM,
+                            if is_srgb {
+                                Format::R8_SRGB
+                            } else {
+                                Format::R8_UNORM
                             },
                         ),
                         TextureFormat::R16G16B16A16 => {
@@ -640,10 +643,8 @@ impl App {
                                     .collect();
                                 (pixels, Format::R8G8B8A8_SRGB)
                             } else {
-                                let pixels = pixels
-                                    .into_par_iter()
-                                    .flat_map(|v| v.to_le_bytes())
-                                    .collect();
+                                let pixels =
+                                    pixels.into_par_iter().flat_map(u16::to_le_bytes).collect();
                                 (pixels, Format::R16G16B16A16_UNORM)
                             }
                         }
@@ -663,9 +664,9 @@ impl App {
                         extent,
                         1,
                         1,
-                        memory_allocator.clone(),
-                        command_buffer_allocator.clone(),
-                        context.graphics_queue().clone(),
+                        &memory_allocator,
+                        &command_buffer_allocator,
+                        context.graphics_queue(),
                         format,
                     )
                     .unwrap()
@@ -691,9 +692,9 @@ impl App {
                 extent,
                 1,
                 1,
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                context.graphics_queue().clone(),
+                &memory_allocator,
+                &command_buffer_allocator,
+                context.graphics_queue(),
                 Format::R8G8B8A8_UNORM,
             )
             .unwrap()
@@ -705,26 +706,26 @@ impl App {
             let lambertian = load_ktx2(
                 format!("textures/{env}/lambertian/diffuse.ktx2").as_str(),
                 &mut image_builder,
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                context.graphics_queue().clone(),
+                &memory_allocator,
+                &command_buffer_allocator,
+                context.graphics_queue(),
             )
             .unwrap();
             let ggx = load_ktx2(
                 format!("textures/{env}/ggx/specular.ktx2").as_str(),
                 &mut image_builder,
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                context.graphics_queue().clone(),
+                &memory_allocator,
+                &command_buffer_allocator,
+                context.graphics_queue(),
             )
             .unwrap();
 
             let charlie = load_ktx2(
                 format!("textures/{env}/charlie/sheen.ktx2").as_str(),
                 &mut image_builder,
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                context.graphics_queue().clone(),
+                &memory_allocator,
+                &command_buffer_allocator,
+                context.graphics_queue(),
             )
             .unwrap();
 
@@ -760,9 +761,9 @@ impl App {
                     [1024, 1024, 1],
                     1,
                     1,
-                    memory_allocator.clone(),
-                    command_buffer_allocator.clone(),
-                    context.graphics_queue().clone(),
+                    &memory_allocator,
+                    &command_buffer_allocator,
+                    context.graphics_queue(),
                     Format::R16G16B16A16_SFLOAT,
                 )
                 .unwrap()
@@ -782,9 +783,9 @@ impl App {
                     [1024, 1024, 1],
                     1,
                     1,
-                    memory_allocator.clone(),
-                    command_buffer_allocator.clone(),
-                    context.graphics_queue().clone(),
+                    &memory_allocator,
+                    &command_buffer_allocator,
+                    context.graphics_queue(),
                     Format::R16G16B16A16_SFLOAT,
                 )
                 .unwrap()
@@ -793,9 +794,9 @@ impl App {
             let lut_sheen_e = load_png(
                 "textures/lut_sheen_E.png",
                 &mut image_builder,
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                context.graphics_queue().clone(),
+                &memory_allocator,
+                &command_buffer_allocator,
+                context.graphics_queue(),
             )
             .unwrap();
 
@@ -860,7 +861,7 @@ impl App {
 
         let scene = Scene::new(objects);
 
-        App {
+        Self {
             context,
             windows,
             memory_allocator,
@@ -879,7 +880,7 @@ impl App {
             skyboxes,
             samplers,
             camera,
-            input_state: Default::default(),
+            input_state: InputState::default(),
             imgui_ctx,
             last_frame: Instant::now(),
             rcx: None,
@@ -903,7 +904,7 @@ impl App {
 
 impl Default for InputState {
     fn default() -> Self {
-        InputState {
+        Self {
             forward: false,
             backward: false,
             left: false,
@@ -916,10 +917,10 @@ impl Default for InputState {
 }
 
 fn build_pipeline(
-    device: Arc<Device>,
+    device: &Arc<Device>,
     swapchain_format: Format,
-    vert: Arc<ShaderModule>,
-    frag: Arc<ShaderModule>,
+    vert: &Arc<ShaderModule>,
+    frag: &Arc<ShaderModule>,
     specialization_constants: SpecializationConstants,
     double_sided: bool,
     layout: Arc<PipelineLayout>,
@@ -1039,7 +1040,7 @@ fn build_pipeline(
             // Dynamic states allows us to specify parts of the pipeline settings when
             // recording the command buffer, before we perform drawing. Here, we specify
             // that the viewport should be dynamic.
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            dynamic_state: std::iter::once(DynamicState::Viewport).collect(),
             subpass: Some(subpass.into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
@@ -1048,10 +1049,10 @@ fn build_pipeline(
 }
 
 fn build_cubemap_pipeline(
-    device: Arc<Device>,
+    device: &Arc<Device>,
     swapchain_format: Format,
-    vert: Arc<ShaderModule>,
-    frag: Arc<ShaderModule>,
+    vert: &Arc<ShaderModule>,
+    frag: &Arc<ShaderModule>,
     layout: Arc<PipelineLayout>,
 ) -> Arc<GraphicsPipeline> {
     // First, we load the shaders that the pipeline will use: the vertex shader and the
@@ -1123,7 +1124,7 @@ fn build_cubemap_pipeline(
             // Dynamic states allows us to specify parts of the pipeline settings when
             // recording the command buffer, before we perform drawing. Here, we specify
             // that the viewport should be dynamic.
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            dynamic_state: std::iter::once(DynamicState::Viewport).collect(),
             subpass: Some(subpass.into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
@@ -1134,11 +1135,11 @@ fn build_cubemap_pipeline(
 fn build_material_texture_sets(
     mat: &Material,
     uniform_buffer_allocator: &SubbufferAllocator,
-    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
-    pipeline_layout: Arc<PipelineLayout>,
+    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+    pipeline_layout: &Arc<PipelineLayout>,
     textures: &[Arc<ImageView>],
-    null_texture: Arc<ImageView>,
-    sampler: Arc<Sampler>,
+    null_texture: &Arc<ImageView>,
+    sampler: &Arc<Sampler>,
 ) -> (Arc<DescriptorSet>, Arc<DescriptorSet>) {
     let material_set = {
         let mat_uniform: fs::Material = mat.into();
@@ -1224,7 +1225,7 @@ fn build_material_texture_sets(
     let material_set = DescriptorSet::new(
         descriptor_set_allocator.clone(),
         pipeline_layout.set_layouts().get(3).unwrap().clone(),
-        [material_set.clone(), mat_sampler_set.clone()],
+        [material_set, mat_sampler_set],
         [],
     )
     .unwrap();
@@ -1234,7 +1235,7 @@ fn build_material_texture_sets(
         pipeline_layout.set_layouts().get(4).unwrap().clone(),
         textures
             .into_iter()
-            .map(|t| t.unwrap_or(&null_texture))
+            .map(|t| t.unwrap_or(null_texture))
             .enumerate()
             .map(|(idx, texture)| {
                 WriteDescriptorSet::image_view_sampler(idx as u32, texture.clone(), sampler.clone())
@@ -1256,7 +1257,7 @@ impl PipelineContext {
     pub fn render(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        pipeline_layout: Arc<PipelineLayout>,
+        pipeline_layout: &Arc<PipelineLayout>,
         primitives: &[PrimitiveDrawInfo],
         objects: &[Object],
     ) {
@@ -1293,7 +1294,7 @@ impl PipelineContext {
                 let normal = transform
                     .transpose()
                     .invert()
-                    .unwrap_or(Matrix4::identity());
+                    .unwrap_or_else(Matrix4::identity);
                 let model: [[f32; 4]; 4] = transform.into();
                 #[allow(clippy::useless_conversion)]
                 let data = fs::Object {
@@ -1382,7 +1383,7 @@ impl ApplicationHandler for App {
         .expect("Failed to create depth image");
 
         let depth_image_view =
-            ImageView::new_default(depth_image.clone()).expect("Failed to create depth image view");
+            ImageView::new_default(depth_image).expect("Failed to create depth image view");
 
         let vertex_shader = vs::load(self.context.device().clone()).unwrap();
         let fragment_shader = fs::load(self.context.device().clone()).unwrap();
@@ -1554,11 +1555,11 @@ impl ApplicationHandler for App {
                     let (material_set, texture_set) = build_material_texture_sets(
                         mat,
                         &self.uniform_buffer_allocator,
-                        self.descriptor_set_allocator.clone(),
-                        pipeline_layout.clone(),
+                        &self.descriptor_set_allocator,
+                        &pipeline_layout,
                         &self.textures,
-                        self.null_texture.clone(),
-                        self.samplers.wrap_sampler_mipmap.clone(),
+                        &self.null_texture,
+                        &self.samplers.wrap_sampler_mipmap,
                     );
 
                     for prim_idx in mat_prim_map[mat_idx].iter().copied() {
@@ -1574,10 +1575,10 @@ impl ApplicationHandler for App {
                                     material_constants: mat_const,
                                 };
                                 let pipeline = build_pipeline(
-                                    self.context.device().clone(),
+                                    self.context.device(),
                                     window_renderer.swapchain_format(),
-                                    vertex_shader.clone(),
-                                    fragment_shader.clone(),
+                                    &vertex_shader,
+                                    &fragment_shader,
                                     spec_constants,
                                     mat.double_sided,
                                     pipeline_layout.clone(),
@@ -1614,7 +1615,7 @@ impl ApplicationHandler for App {
             self.descriptor_set_allocator.clone(),
             #[allow(clippy::get_first)]
             pipeline_layout.set_layouts().get(0).unwrap().clone(),
-            [const_set.clone()],
+            [const_set],
             [],
         )
         .unwrap();
@@ -1699,10 +1700,10 @@ impl ApplicationHandler for App {
             };
 
             build_cubemap_pipeline(
-                self.context.device().clone(),
+                self.context.device(),
                 window_renderer.swapchain_format(),
-                vertex_shader,
-                fragment_shader,
+                &vertex_shader,
+                &fragment_shader,
                 cubemap_layout,
             )
         };
@@ -1734,7 +1735,7 @@ impl ApplicationHandler for App {
             let vertex_buffer = create_buffer(
                 self.memory_allocator.clone(),
                 self.command_buffer_allocator.clone(),
-                self.context.graphics_queue().clone(),
+                self.context.graphics_queue(),
                 BufferUsage::VERTEX_BUFFER,
                 vertices,
             );
@@ -1742,7 +1743,7 @@ impl ApplicationHandler for App {
             let index_buffer = create_buffer(
                 self.memory_allocator.clone(),
                 self.command_buffer_allocator.clone(),
-                self.context.graphics_queue().clone(),
+                self.context.graphics_queue(),
                 BufferUsage::INDEX_BUFFER,
                 indices,
             );
@@ -1782,8 +1783,8 @@ impl ApplicationHandler for App {
             fragment_shader,
             pipelines,
             cubemap_pipeline,
-            cubemap_vertex_buffer,
             cubemap_index_buffer,
+            cubemap_vertex_buffer,
             cubemap_index_count,
             pipeline_map,
             intermediate_image_view,
@@ -1957,7 +1958,7 @@ impl ApplicationHandler for App {
                         )
                         .expect("Failed to create depth image");
 
-                        rcx.depth_image_view = ImageView::new_default(depth_image.clone())
+                        rcx.depth_image_view = ImageView::new_default(depth_image)
                             .expect("Failed to create depth image view");
                         rcx.viewport.extent = window_size.into();
                     })
@@ -2008,16 +2009,16 @@ impl ApplicationHandler for App {
                     match mat_specs.render_type() {
                         RenderType::Opaque => opaque_objects.extend(obj_pipelines.values()),
                         RenderType::Translucent => {
-                            translucent_objects.extend(obj_pipelines.values())
+                            translucent_objects.extend(obj_pipelines.values());
                         }
                         RenderType::Transmissive => {
-                            transmissive_objects.extend(obj_pipelines.values())
+                            transmissive_objects.extend(obj_pipelines.values());
                         }
                     }
                 }
 
                 let mut translucent_sorted = Vec::new();
-                for pcx_idx in translucent_objects.iter().cloned() {
+                for pcx_idx in translucent_objects.iter().copied() {
                     let pcx = &rcx.pipelines[pcx_idx];
                     for prim_idx in pcx.prim_indices.iter().copied() {
                         let prim = &self.prim_infos[prim_idx];
@@ -2061,14 +2062,14 @@ impl ApplicationHandler for App {
                     DescriptorSet::new(
                         self.descriptor_set_allocator.clone(),
                         rcx.pipeline_layout.set_layouts().get(1).unwrap().clone(),
-                        [write_set.clone()],
+                        [write_set],
                         [],
                     )
                     .unwrap()
                 };
 
                 builder
-                    .set_viewport(0, [rcx.viewport.clone()].into_iter().collect())
+                    .set_viewport(0, std::iter::once(rcx.viewport.clone()).collect())
                     .unwrap();
 
                 builder
@@ -2176,7 +2177,7 @@ impl ApplicationHandler for App {
                     for pcx_idx in opaque_objects {
                         rcx.pipelines[pcx_idx].render(
                             &mut builder,
-                            rcx.pipeline_layout.clone(),
+                            &rcx.pipeline_layout,
                             &self.prim_infos,
                             &self.scene.objects,
                         );
@@ -2221,7 +2222,7 @@ impl ApplicationHandler for App {
                         let normal = transform
                             .transpose()
                             .invert()
-                            .unwrap_or(Matrix4::identity());
+                            .unwrap_or_else(Matrix4::identity);
                         let model: [[f32; 4]; 4] = transform.into();
                         #[allow(clippy::useless_conversion)]
                         let data = fs::Object {
@@ -2315,7 +2316,7 @@ impl ApplicationHandler for App {
                     for pcx_idx in transmissive_objects {
                         rcx.pipelines[pcx_idx].render(
                             &mut builder,
-                            rcx.pipeline_layout.clone(),
+                            &rcx.pipeline_layout,
                             &self.prim_infos,
                             &self.scene.objects,
                         );
@@ -2337,7 +2338,10 @@ impl ApplicationHandler for App {
                 };
 
                 unsafe {
-                    use imgui::sys::*;
+                    use imgui::sys::{
+                        igDockBuilderDockWindow, igDockBuilderRemoveNodeChildNodes,
+                        igDockBuilderSplitNode, ImGuiDir_Left, ImGuiDir_Up,
+                    };
                     static mut INIT: bool = true;
                     if INIT {
                         INIT = false;
@@ -2376,7 +2380,7 @@ impl ApplicationHandler for App {
                         let name = object.name.as_deref().unwrap_or("Unnamed");
 
                         let builder = ui
-                            .tree_node_config(format!("{}##object{}", name, idx))
+                            .tree_node_config(format!("{name}##object{idx}"))
                             .opened(true, Condition::Once)
                             .framed(true)
                             .allow_item_overlap(true) // Make the checkbox clickable when overlaid
@@ -2422,15 +2426,12 @@ impl ApplicationHandler for App {
 
                         let checkbox_size = ui.frame_height();
                         ui.same_line_with_pos(ui.content_region_max()[0] - checkbox_size);
-                        ui.checkbox(
-                            format!("##checkbox{}", idx),
-                            &mut scene.objects[idx].enabled,
-                        );
+                        ui.checkbox(format!("##checkbox{idx}"), &mut scene.objects[idx].enabled);
 
                         if let Some(_token) = token {
                             let mut children: Vec<_> =
                                 scene.children[idx].clone().into_iter().collect();
-                            children.sort();
+                            children.sort_unstable();
                             for child in children.iter().copied() {
                                 object_tree_builder(child, ui, scene);
                             }
@@ -2468,7 +2469,7 @@ impl ApplicationHandler for App {
                         let mut transform = object.local_transform;
                         if ui.collapsing_header("Position", TreeNodeFlags::DEFAULT_OPEN)
                             && gui::drag_vec3(
-                                [
+                                &mut [
                                     &mut transform.position.x,
                                     &mut transform.position.y,
                                     &mut transform.position.z,
@@ -2482,7 +2483,7 @@ impl ApplicationHandler for App {
                         }
                         if ui.collapsing_header("Rotation", TreeNodeFlags::empty())
                             && gui::drag_vec3(
-                                [
+                                &mut [
                                     &mut transform.rotation.x.0,
                                     &mut transform.rotation.y.0,
                                     &mut transform.rotation.z.0,
@@ -2496,7 +2497,7 @@ impl ApplicationHandler for App {
                         }
                         if ui.collapsing_header("Scale", TreeNodeFlags::empty())
                             && gui::drag_vec3(
-                                [
+                                &mut [
                                     &mut transform.scale.x,
                                     &mut transform.scale.y,
                                     &mut transform.scale.z,
@@ -2510,7 +2511,7 @@ impl ApplicationHandler for App {
                         }
                         if ui.collapsing_header("Skew", TreeNodeFlags::empty())
                             && gui::drag_vec3(
-                                [
+                                &mut [
                                     &mut transform.skew.x,
                                     &mut transform.skew.y,
                                     &mut transform.skew.z,
@@ -2580,7 +2581,7 @@ impl ApplicationHandler for App {
                     ui.window("Material").build(|| {
                         let mat = &mut self.materials[mat_idx];
                         let old_mat_cons: MaterialSpecializationConstants = (&*mat).into();
-                        let mut name = mat.name.clone().unwrap_or("".to_owned());
+                        let mut name = mat.name.clone().unwrap_or_default();
                         if ui.input_text("Name", &mut name)
                             .build() {
                             if name.is_empty() {
@@ -2774,11 +2775,11 @@ impl ApplicationHandler for App {
                             let (material_set, texture_set) = build_material_texture_sets(
                                 mat,
                                 &self.uniform_buffer_allocator,
-                                self.descriptor_set_allocator.clone(),
-                                rcx.pipeline_layout.clone(),
+                                &self.descriptor_set_allocator,
+                                &rcx.pipeline_layout,
                                 &self.textures,
-                                self.null_texture.clone(),
-                                self.samplers.wrap_sampler_mipmap.clone(),
+                                &self.null_texture,
+                                &self.samplers.wrap_sampler_mipmap,
                             );
                             for prim_idx in self.mat_prims[mat_idx].iter().copied() {
                                 let prim = &self.prim_infos[prim_idx];
@@ -2790,10 +2791,10 @@ impl ApplicationHandler for App {
                                             material_constants,
                                         };
                                         let pipeline = build_pipeline(
-                                            self.context.device().clone(),
+                                            self.context.device(),
                                             window_renderer.swapchain_format(),
-                                            rcx.vertex_shader.clone(),
-                                            rcx.fragment_shader.clone(),
+                                            &rcx.vertex_shader,
+                                            &rcx.fragment_shader,
                                             spec_constants,
                                             mat.double_sided, // TODO: maybe this needs to be a specialization constant
                                                               // TODO: if two materials are the same except for their sidedness,
@@ -2887,7 +2888,7 @@ struct MeshDrawInfo {
 fn create_buffer<T: BufferContents + Send + Sync, I: IntoIterator<Item = T>>(
     allocator: Arc<StandardMemoryAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    queue: Arc<Queue>,
+    queue: &Arc<Queue>,
     usage: BufferUsage,
     data: I,
 ) -> Subbuffer<[T]>
@@ -2929,7 +2930,7 @@ where
     .unwrap();
     builder
         .copy_buffer(CopyBufferInfo::buffers(
-            staging_buffer.clone(),
+            staging_buffer,
             device_local_buffer.clone(),
         ))
         .unwrap();
