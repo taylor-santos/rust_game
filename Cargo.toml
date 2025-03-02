@@ -24,7 +24,6 @@ imgui = { version = "0.12.0", features = ["docking", "tables-api"] }
 imgui-winit-support = "0.13.0"
 imgui-vulkano-renderer = { git = "https://github.com/taylor-santos/imgui-vulkano-renderer.git" }
 ktx2 = "0.3.0"
-mikktspace = "0.3.0"
 rayon = "1.10.0"
 vulkano = "0.35.1"
 vulkano-shaders = "0.35"
@@ -33,6 +32,7 @@ winit = "0.30"
 zstd = "0.13.2"
 hsv = "0.1.1"
 c_str_macro = "1.0.3"
+mikktspace = { package = "bevy_mikktspace", version = "0.15.3" }
 
 [profile.dev]
 opt-level = 0
