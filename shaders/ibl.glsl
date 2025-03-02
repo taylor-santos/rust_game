@@ -55,7 +55,7 @@ vec3 getIBLRadianceGGX(vec3 n, vec3 v, float roughness)
 
 vec3 getTransmissionSample(vec2 fragCoord, float roughness, float ior)
 {
-    float framebufferLod = c.u_FramebufferMipCount * applyIorToRoughness(roughness, ior);
+    float framebufferLod = (c.u_FramebufferMipCount-1) * applyIorToRoughness(roughness, ior);
     vec3 transmittedLight = textureLod(u_TransmissionFramebufferSampler, fragCoord.xy, framebufferLod).rgb;
 
     return transmittedLight;

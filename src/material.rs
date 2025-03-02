@@ -172,7 +172,7 @@ impl Default for DiffuseTransmission {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct AlphaCutoff(f32);
+pub struct AlphaCutoff(pub f32);
 
 impl Default for AlphaCutoff {
     fn default() -> Self {
@@ -226,7 +226,7 @@ impl<const N: usize> From<Dispersion> for Padded<f32, N> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct EmissiveStrength(f32);
+pub struct EmissiveStrength(pub f32);
 
 impl Default for EmissiveStrength {
     fn default() -> Self {
@@ -253,7 +253,7 @@ impl<const N: usize> From<EmissiveStrength> for Padded<f32, N> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Ior(f32);
+pub struct Ior(pub f32);
 
 impl Default for Ior {
     fn default() -> Self {

@@ -1,5 +1,6 @@
 use crate::material::*;
 use crate::shader::*;
+use crate::transform::Transform;
 use cgmath::{Matrix4, SquareMatrix};
 use gltf::image::{Data, Format};
 use gltf::json::Value;
@@ -8,6 +9,7 @@ use gltf::texture::Info;
 use gltf::Error;
 use rayon::iter::Either;
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -60,10 +62,110 @@ pub struct Mesh {
 
 #[derive(Debug)]
 pub struct Object {
+    pub index: usize,
     pub name: Option<String>,
+    pub parent: Option<usize>,
+    pub local_transform: Transform<f32>,
     pub transform: Matrix4<f32>,
-    pub mesh_idx: usize,
+    pub mesh_idx: Option<usize>,
     pub enabled: bool,
+}
+
+#[derive(Debug)]
+pub struct Scene {
+    pub objects: Vec<Object>,
+    pub children: Vec<HashSet<usize>>,
+    pub selected_object: Option<usize>,
+    pub selected_material: Option<usize>,
+}
+
+impl Scene {
+    pub fn new(mut objects: Vec<Object>) -> Self {
+        let selected_object = (!objects.is_empty()).then_some(0);
+        let selected_material = None;
+        let children = Self::gen_children(&objects);
+        Self::recalculate_transforms(&mut objects, &children);
+        Self {
+            objects,
+            children,
+            selected_object,
+            selected_material,
+        }
+    }
+
+    fn gen_children(objects: &[Object]) -> Vec<HashSet<usize>> {
+        let mut children: Vec<_> = std::iter::repeat(HashSet::new())
+            .take(objects.len())
+            .collect();
+        for obj in objects {
+            if let Some(parent) = obj.parent {
+                children[parent].insert(obj.index);
+            }
+        }
+        children
+    }
+
+    fn recalculate_transforms(objects: &mut [Object], children: &[HashSet<usize>]) {
+        let mut queue: Vec<_> = objects
+            .iter_mut()
+            .filter(|obj| obj.parent.is_none())
+            .map(|root| {
+                root.transform = root.local_transform.into();
+                root.index
+            })
+            .collect();
+
+        while let Some(parent) = queue.pop() {
+            for child in children[parent].iter().copied() {
+                objects[child].transform =
+                    objects[parent].transform * Matrix4::from(objects[child].local_transform);
+                queue.push(child);
+            }
+        }
+    }
+
+    pub fn regenerate(&mut self) {
+        self.children = Self::gen_children(&self.objects);
+        Self::recalculate_transforms(&mut self.objects, &self.children);
+    }
+
+    // Check if `descendant` is actually a descendant of `ancestor`.
+    // If so, return the first child of `ancestor` on the path to `descendant`.
+    fn is_descendant(&self, ancestor: usize, descendant: usize) -> Option<usize> {
+        if self.children[ancestor].contains(&descendant) {
+            return Some(descendant);
+        }
+        self.children[ancestor]
+            .iter()
+            .copied()
+            .find(|&child| self.is_descendant(child, descendant).is_some())
+    }
+
+    fn change_parent_transform(&mut self, from: usize, to: Option<usize>) {
+        let mut mat = self.objects[from].transform;
+        if let Some(to) = to {
+            mat = self.objects[to]
+                .transform
+                .invert()
+                .unwrap_or(Matrix4::identity())
+                * mat;
+        }
+        self.objects[from].local_transform = mat.into();
+    }
+
+    pub fn change_parent(&mut self, from: usize, to: Option<usize>) {
+        if let Some(to) = to {
+            if let Some(child) = self.is_descendant(from, to) {
+                let parent = self.objects[from].parent;
+                self.objects[child].parent = parent;
+                self.change_parent_transform(child, parent);
+            }
+        }
+        self.objects[from].parent = to;
+        self.change_parent_transform(from, to);
+
+        self.regenerate()
+    }
 }
 
 pub(crate) type TextureData = Data;
@@ -766,48 +868,25 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
 
     start_time = Instant::now();
 
-    let nodes = document
+    let mut objects: Vec<_> = document
         .nodes()
         .map(|node| {
-            (
-                node.name(),
-                Matrix4::from(node.transform().matrix()),
-                node.mesh().map(|m| m.index()),
-                node.children()
-                    .map(|child| child.index())
-                    .collect::<Vec<_>>(),
-            )
+            let transform = Matrix4::from(node.transform().matrix());
+            Object {
+                index: node.index(),
+                name: node.name().map(String::from),
+                parent: None,
+                local_transform: transform.into(),
+                transform,
+                mesh_idx: node.mesh().map(|m| m.index()),
+                enabled: node.mesh().is_some(),
+            }
         })
-        .collect::<Vec<_>>();
+        .collect();
 
-    let mut objects = Vec::new();
-    {
-        let mut stack = document
-            .scenes()
-            .flat_map(|scene| {
-                scene
-                    .nodes()
-                    .map(|node| (node.index(), Matrix4::identity()))
-            })
-            .collect::<Vec<_>>();
-
-        while let Some((node_id, parent_transform)) = stack.pop() {
-            let (name, node_transform, mesh_idx, children) = nodes[node_id].clone();
-
-            let transform = parent_transform * node_transform;
-
-            if let Some(mesh_idx) = mesh_idx {
-                objects.push(Object {
-                    name: name.map(|s| s.to_owned()),
-                    transform,
-                    mesh_idx,
-                    enabled: true,
-                });
-            }
-
-            for child_id in children {
-                stack.push((child_id, transform));
-            }
+    for obj in document.nodes() {
+        for child in obj.children() {
+            objects[child.index()].parent = Some(obj.index());
         }
     }
 

@@ -132,8 +132,8 @@ void main()
         materialInfo = getVolumeInfo(materialInfo);
     } else {
         materialInfo.thickness = 0.0;
-        materialInfo.attenuationColor = vec3(0.0);
-        materialInfo.attenuationDistance = 0.0;
+        materialInfo.attenuationColor = vec3(1.0);
+        materialInfo.attenuationDistance = 1./0.;
     }
 
     if (MATERIAL_IRIDESCENCE) {
@@ -199,10 +199,11 @@ void main()
 
     // Calculate lighting contribution from image based lighting source (IBL)
 #ifdef USE_IBL
-    {
+    const bool use_ibl = true;
 #else
-    if (MATERIAL_TRANSMISSION) {
+    const bool use_ibl = false;
 #endif
+    if (use_ibl || MATERIAL_TRANSMISSION) {
         f_diffuse = getDiffuseLight(n) * baseColor.rgb ;
 
         if (MATERIAL_DIFFUSE_TRANSMISSION) {

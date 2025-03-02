@@ -13,19 +13,26 @@
 // original triangle example.
 
 use crate::camera::FirstPersonCamera;
-use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, Object, TextureFormat};
-use crate::material::Material;
+use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, Object, Scene, TextureFormat};
+use crate::material::{AlphaMode, Material};
 use crate::shader::*;
-use cgmath::{EuclideanSpace, Matrix, MetricSpace, SquareMatrix};
+use c_str_macro::c_str;
+use cgmath::num_traits::Float;
+use cgmath::{EuclideanSpace, Matrix, Matrix4, MetricSpace, SquareMatrix};
 use image::{ColorType, DynamicImage, ImageBuffer, ImageReader};
-use imgui::{TableFlags, TableSortDirection};
+use imgui::sys::{
+    igDockSpaceOverViewport, igGetMainViewport, ImGuiDockNodeFlags_PassthruCentralNode,
+};
+use imgui::{Condition, DragDropFlags, StyleColor, TableFlags, TreeNodeFlags, WindowFlags};
 use imgui_vulkano_renderer::Renderer;
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use ktx2::SupercompressionScheme;
 use rayon::iter::Either;
 use rayon::prelude::*;
-use std::cmp::{min, Ordering};
-use std::collections::{HashMap, VecDeque};
+use std::cmp::min;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::f32::consts::PI;
+use std::ptr::null;
 use std::time::{Duration, Instant};
 use std::{error::Error, sync::Arc};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
@@ -98,8 +105,10 @@ use winit::{
 
 mod camera;
 mod gltf;
+mod gui;
 mod material;
 mod shader;
+mod transform;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -132,9 +141,11 @@ struct App {
     uniform_buffer_allocator: SubbufferAllocator,
     vertex_buffer: Subbuffer<[CombinedVertex]>,
     index_buffer: Subbuffer<[u32]>,
-    objects: Vec<Object>,
+    scene: Scene,
+    mesh_infos: Vec<MeshDrawInfo>,
     prim_infos: Vec<PrimitiveDrawInfo>,
     materials: Vec<Material>,
+    mat_prims: Vec<HashSet<usize>>,
     textures: Vec<Arc<ImageView>>,
     null_texture: Arc<ImageView>,
     skyboxes: Skybox,
@@ -160,6 +171,8 @@ struct RenderContext {
     attachment_image_views: Vec<Arc<ImageView>>,
     depth_image_view: Arc<ImageView>,
     pipeline_layout: Arc<PipelineLayout>,
+    vertex_shader: Arc<ShaderModule>,
+    fragment_shader: Arc<ShaderModule>,
     pipelines: Vec<PipelineContext>,
     cubemap_pipeline: Arc<GraphicsPipeline>,
     cubemap_index_buffer: Subbuffer<[u32]>,
@@ -429,7 +442,7 @@ impl App {
             texture_maps,
             mut materials,
             objects,
-        } = load_gltf("models/DamagedHelmet.glb").expect("Couldn't load gltf model");
+        } = load_gltf("models/DragonDispersion.glb").expect("Couldn't load gltf model");
 
         let timer = Instant::now();
 
@@ -440,13 +453,16 @@ impl App {
             .reduce(|(v1, i1), (v2, i2)| (v1 + v2, i1 + i2))
             .unwrap();
 
-        let (vertex_buffer, index_buffer, prim_infos) = {
+        let (vertex_buffer, index_buffer, mesh_infos, prim_infos, mat_prims) = {
             let mut combined_verts = Vec::with_capacity(vert_count / 3);
             let mut combined_indices = Vec::with_capacity(index_count);
             let mut mesh_infos = Vec::new();
             let mut prim_infos = Vec::new();
             let mut prims_offset = 0;
             let mut needs_default_mat = false;
+            let mut mat_prims: Vec<_> = std::iter::repeat(HashSet::new())
+                .take(materials.len() + 1 /* add 1 for default mat */)
+                .collect();
             for mesh in meshes {
                 let prims_count = mesh.primitives.len();
                 for prim in mesh.primitives {
@@ -456,6 +472,7 @@ impl App {
                         needs_default_mat = true;
                         materials.len()
                     };
+                    mat_prims[mat_idx].insert(prim_infos.len());
 
                     prim_infos.push(PrimitiveDrawInfo {
                         index_offset: combined_indices.len() as u32,
@@ -463,7 +480,7 @@ impl App {
                         index_count: prim.indices.len() as u32,
                         mat_idx,
                         spec_const: prim.spec_const,
-                        object_ids: Vec::new(),
+                        object_ids: HashSet::new(),
                     });
 
                     combined_verts.extend(prim.vertices);
@@ -481,14 +498,15 @@ impl App {
             }
 
             for (obj_idx, object) in objects.iter().enumerate() {
-                let mesh_idx = object.mesh_idx;
-                let mesh_info = &mesh_infos[mesh_idx];
-                for prim in prim_infos
-                    .iter_mut()
-                    .skip(mesh_info.prims_offset)
-                    .take(mesh_info.prims_count)
-                {
-                    prim.object_ids.push(obj_idx);
+                if let Some(mesh_idx) = object.mesh_idx {
+                    let mesh_info = &mesh_infos[mesh_idx];
+                    for prim in prim_infos
+                        .iter_mut()
+                        .skip(mesh_info.prims_offset)
+                        .take(mesh_info.prims_count)
+                    {
+                        prim.object_ids.insert(obj_idx);
+                    }
                 }
             }
 
@@ -510,7 +528,13 @@ impl App {
 
             println!("Combined vertex data in {:?}", timer.elapsed());
 
-            (vertex_buffer, index_buffer, prim_infos)
+            (
+                vertex_buffer,
+                index_buffer,
+                mesh_infos,
+                prim_infos,
+                mat_prims,
+            )
         };
 
         let mut image_builder = AutoCommandBufferBuilder::primary(
@@ -831,7 +855,10 @@ impl App {
         let camera = FirstPersonCamera::new();
 
         let mut imgui_ctx = imgui::Context::create();
-        imgui_ctx.io_mut().config_flags |= imgui::ConfigFlags::DOCKING_ENABLE;
+        imgui_ctx.io_mut().config_flags |=
+            imgui::ConfigFlags::DOCKING_ENABLE | imgui::ConfigFlags::VIEWPORTS_ENABLE;
+
+        let scene = Scene::new(objects);
 
         App {
             context,
@@ -842,9 +869,11 @@ impl App {
             uniform_buffer_allocator,
             vertex_buffer,
             index_buffer,
-            objects,
+            scene,
+            mesh_infos,
             prim_infos,
             materials,
+            mat_prims,
             textures,
             null_texture,
             skyboxes,
@@ -1102,10 +1131,125 @@ fn build_cubemap_pipeline(
     .unwrap()
 }
 
+fn build_material_texture_sets(
+    mat: &Material,
+    uniform_buffer_allocator: &SubbufferAllocator,
+    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+    pipeline_layout: Arc<PipelineLayout>,
+    textures: &[Arc<ImageView>],
+    null_texture: Arc<ImageView>,
+    sampler: Arc<Sampler>,
+) -> (Arc<DescriptorSet>, Arc<DescriptorSet>) {
+    let material_set = {
+        let mat_uniform: fs::Material = mat.into();
+        let subbuffer = uniform_buffer_allocator.allocate_sized().unwrap();
+        *subbuffer.write().unwrap() = mat_uniform;
+        WriteDescriptorSet::buffer(0, subbuffer)
+    };
+
+    let mat_sampler_set = {
+        let mat_samplers: fs::MatSamplers = mat.into();
+        let subbuffer = uniform_buffer_allocator.allocate_sized().unwrap();
+        *subbuffer.write().unwrap() = mat_samplers;
+        WriteDescriptorSet::buffer(1, subbuffer)
+    };
+
+    let textures = [
+        // (set = 4, binding = 0) u_NormalSampler
+        mat.normal_texture.as_ref().map(|t| &t.info),
+        // (set = 4, binding = 1) u_EmissiveSampler
+        mat.emissive_texture.as_ref(),
+        // (set = 4, binding = 2) u_OcclusionSampler
+        mat.occlusion_texture.as_ref().map(|t| &t.info),
+        // (set = 4, binding = 3) u_BaseColorSampler
+        mat.pbr_metallic_roughness.base_color_texture.as_ref(),
+        // (set = 4, binding = 4) u_MetallicRoughnessSampler
+        mat.pbr_metallic_roughness
+            .metallic_roughness_texture
+            .as_ref(),
+        // (set = 4, binding = 5) u_DiffuseSampler
+        mat.pbr_specular_glossiness
+            .as_ref()
+            .and_then(|t| t.diffuse_texture.as_ref()),
+        // (set = 4, binding = 6) u_SpecularGlossinessSampler
+        mat.pbr_specular_glossiness
+            .as_ref()
+            .and_then(|t| t.specular_glossiness_texture.as_ref()),
+        // (set = 4, binding = 7) u_ClearcoatSampler
+        mat.clearcoat.as_ref().and_then(|c| c.texture.as_ref()),
+        // (set = 4, binding = 8) u_ClearcoatRoughnessSampler
+        mat.clearcoat
+            .as_ref()
+            .and_then(|c| c.roughness_texture.as_ref()),
+        // (set = 4, binding = 9) u_ClearcoatNormalSampler
+        mat.clearcoat
+            .as_ref()
+            .and_then(|c| c.normal_texture.as_ref())
+            .map(|t| &t.info),
+        // (set = 4, binding = 10) u_SheenColorSampler
+        mat.sheen.as_ref().and_then(|s| s.color_texture.as_ref()),
+        // (set = 4, binding = 11) u_SheenRoughnessSampler
+        mat.sheen
+            .as_ref()
+            .and_then(|s| s.roughness_texture.as_ref()),
+        // (set = 4, binding = 12) u_SpecularSampler
+        mat.specular.as_ref().and_then(|s| s.texture.as_ref()),
+        // (set = 4, binding = 13) u_SpecularColorSampler
+        mat.specular.as_ref().and_then(|s| s.color_texture.as_ref()),
+        // (set = 4, binding = 14) u_TransmissionSampler
+        mat.transmission.as_ref().and_then(|t| t.texture.as_ref()),
+        // (set = 4, binding = 15) u_ThicknessSampler
+        mat.volume
+            .as_ref()
+            .and_then(|v| v.thickness_texture.as_ref()),
+        // (set = 4, binding = 16) u_IridescenceSampler
+        mat.iridescence.as_ref().and_then(|i| i.texture.as_ref()),
+        // (set = 4, binding = 17) u_IridescenceThicknessSampler
+        mat.iridescence
+            .as_ref()
+            .and_then(|i| i.thickness_texture.as_ref()),
+        // (set = 4, binding = 18) u_DiffuseTransmissionSampler
+        mat.diffuse_transmission
+            .as_ref()
+            .and_then(|d| d.texture.as_ref()),
+        // (set = 4, binding = 19) u_DiffuseTransmissionColorSampler
+        mat.diffuse_transmission
+            .as_ref()
+            .and_then(|d| d.color_texture.as_ref()),
+        // (set = 4, binding = 20) u_AnisotropySampler
+        mat.anisotropy.as_ref().and_then(|a| a.texture.as_ref()),
+    ]
+    .map(|opt_t| opt_t.map(|t| &textures[t.texture.index]));
+
+    let material_set = DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        pipeline_layout.set_layouts().get(3).unwrap().clone(),
+        [material_set.clone(), mat_sampler_set.clone()],
+        [],
+    )
+    .unwrap();
+
+    let texture_set = DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        pipeline_layout.set_layouts().get(4).unwrap().clone(),
+        textures
+            .into_iter()
+            .map(|t| t.unwrap_or(&null_texture))
+            .enumerate()
+            .map(|(idx, texture)| {
+                WriteDescriptorSet::image_view_sampler(idx as u32, texture.clone(), sampler.clone())
+            }),
+        [],
+    )
+    .unwrap();
+
+    (material_set, texture_set)
+}
+
 struct PipelineContext {
     pipeline: Arc<GraphicsPipeline>,
     material_sets: HashMap<usize, (Arc<DescriptorSet>, Arc<DescriptorSet>)>,
-    prim_indices: Vec<usize>,
+    prim_indices: HashSet<usize>,
 }
 
 impl PipelineContext {
@@ -1146,7 +1290,10 @@ impl PipelineContext {
                 object.enabled.then_some(object)
             }) {
                 let transform = object.transform;
-                let normal = transform.transpose().invert().unwrap();
+                let normal = transform
+                    .transpose()
+                    .invert()
+                    .unwrap_or(Matrix4::identity());
                 let model: [[f32; 4]; 4] = transform.into();
                 #[allow(clippy::useless_conversion)]
                 let data = fs::Object {
@@ -1404,86 +1551,15 @@ impl ApplicationHandler for App {
                 .iter()
                 .enumerate()
                 .for_each(|(mat_idx, mat)| {
-                    let material_set = {
-                        let mat_uniform: fs::Material = mat.into();
-                        let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
-                        *subbuffer.write().unwrap() = mat_uniform;
-                        WriteDescriptorSet::buffer(0, subbuffer)
-                    };
-
-                    let mat_sampler_set = {
-                        let mat_samplers: fs::MatSamplers = mat.into();
-                        let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
-                        *subbuffer.write().unwrap() = mat_samplers;
-                        WriteDescriptorSet::buffer(1, subbuffer)
-                    };
-
-                    let textures = [
-                        // (set = 4, binding = 0) u_NormalSampler
-                        mat.normal_texture.as_ref().map(|t| &t.info),
-                        // (set = 4, binding = 1) u_EmissiveSampler
-                        mat.emissive_texture.as_ref(),
-                        // (set = 4, binding = 2) u_OcclusionSampler
-                        mat.occlusion_texture.as_ref().map(|t| &t.info),
-                        // (set = 4, binding = 3) u_BaseColorSampler
-                        mat.pbr_metallic_roughness.base_color_texture.as_ref(),
-                        // (set = 4, binding = 4) u_MetallicRoughnessSampler
-                        mat.pbr_metallic_roughness
-                            .metallic_roughness_texture
-                            .as_ref(),
-                        // (set = 4, binding = 5) u_DiffuseSampler
-                        mat.pbr_specular_glossiness
-                            .as_ref()
-                            .and_then(|t| t.diffuse_texture.as_ref()),
-                        // (set = 4, binding = 6) u_SpecularGlossinessSampler
-                        mat.pbr_specular_glossiness
-                            .as_ref()
-                            .and_then(|t| t.specular_glossiness_texture.as_ref()),
-                        // (set = 4, binding = 7) u_ClearcoatSampler
-                        mat.clearcoat.as_ref().and_then(|c| c.texture.as_ref()),
-                        // (set = 4, binding = 8) u_ClearcoatRoughnessSampler
-                        mat.clearcoat
-                            .as_ref()
-                            .and_then(|c| c.roughness_texture.as_ref()),
-                        // (set = 4, binding = 9) u_ClearcoatNormalSampler
-                        mat.clearcoat
-                            .as_ref()
-                            .and_then(|c| c.normal_texture.as_ref())
-                            .map(|t| &t.info),
-                        // (set = 4, binding = 10) u_SheenColorSampler
-                        mat.sheen.as_ref().and_then(|s| s.color_texture.as_ref()),
-                        // (set = 4, binding = 11) u_SheenRoughnessSampler
-                        mat.sheen
-                            .as_ref()
-                            .and_then(|s| s.roughness_texture.as_ref()),
-                        // (set = 4, binding = 12) u_SpecularSampler
-                        mat.specular.as_ref().and_then(|s| s.texture.as_ref()),
-                        // (set = 4, binding = 13) u_SpecularColorSampler
-                        mat.specular.as_ref().and_then(|s| s.color_texture.as_ref()),
-                        // (set = 4, binding = 14) u_TransmissionSampler
-                        mat.transmission.as_ref().and_then(|t| t.texture.as_ref()),
-                        // (set = 4, binding = 15) u_ThicknessSampler
-                        mat.volume
-                            .as_ref()
-                            .and_then(|v| v.thickness_texture.as_ref()),
-                        // (set = 4, binding = 16) u_IridescenceSampler
-                        mat.iridescence.as_ref().and_then(|i| i.texture.as_ref()),
-                        // (set = 4, binding = 17) u_IridescenceThicknessSampler
-                        mat.iridescence
-                            .as_ref()
-                            .and_then(|i| i.thickness_texture.as_ref()),
-                        // (set = 4, binding = 18) u_DiffuseTransmissionSampler
-                        mat.diffuse_transmission
-                            .as_ref()
-                            .and_then(|d| d.texture.as_ref()),
-                        // (set = 4, binding = 19) u_DiffuseTransmissionColorSampler
-                        mat.diffuse_transmission
-                            .as_ref()
-                            .and_then(|d| d.color_texture.as_ref()),
-                        // (set = 4, binding = 20) u_AnisotropySampler
-                        mat.anisotropy.as_ref().and_then(|a| a.texture.as_ref()),
-                    ]
-                    .map(|opt_t| opt_t.map(|t| &self.textures[t.texture.index]));
+                    let (material_set, texture_set) = build_material_texture_sets(
+                        mat,
+                        &self.uniform_buffer_allocator,
+                        self.descriptor_set_allocator.clone(),
+                        pipeline_layout.clone(),
+                        &self.textures,
+                        self.null_texture.clone(),
+                        self.samplers.wrap_sampler_mipmap.clone(),
+                    );
 
                     for prim_idx in mat_prim_map[mat_idx].iter().copied() {
                         let mat_const = mat.into();
@@ -1509,53 +1585,25 @@ impl ApplicationHandler for App {
 
                                 let material_sets = HashMap::new();
 
-                                let prim_indices = Vec::new();
+                                let prim_indices = HashSet::new();
 
                                 let pipeline = PipelineContext {
                                     pipeline,
                                     material_sets,
                                     prim_indices,
                                 };
-                                let pipeline_idx = pipelines.len();
+                                let pcx_idx = pipelines.len();
                                 pipelines.push(pipeline);
 
-                                pipeline_idx
+                                pcx_idx
                             });
 
-                        pipelines[pcx_idx].prim_indices.push(prim_idx);
+                        pipelines[pcx_idx].prim_indices.insert(prim_idx);
 
                         pipelines[pcx_idx]
                             .material_sets
                             .entry(mat_idx)
-                            .or_insert_with(|| {
-                                let material_set = DescriptorSet::new(
-                                    self.descriptor_set_allocator.clone(),
-                                    pipeline_layout.set_layouts().get(3).unwrap().clone(),
-                                    [material_set.clone(), mat_sampler_set.clone()].into_iter(),
-                                    [],
-                                )
-                                .unwrap();
-
-                                let texture_set = DescriptorSet::new(
-                                    self.descriptor_set_allocator.clone(),
-                                    pipeline_layout.set_layouts().get(4).unwrap().clone(),
-                                    textures
-                                        .into_iter()
-                                        .map(|t| t.unwrap_or(&self.null_texture))
-                                        .enumerate()
-                                        .map(|(idx, texture)| {
-                                            WriteDescriptorSet::image_view_sampler(
-                                                idx as u32,
-                                                texture.clone(),
-                                                self.samplers.wrap_sampler_mipmap.clone(),
-                                            )
-                                        }),
-                                    [],
-                                )
-                                .unwrap();
-
-                                (material_set, texture_set)
-                            });
+                            .or_insert_with(|| (material_set.clone(), texture_set.clone()));
                     }
                 });
 
@@ -1730,6 +1778,8 @@ impl ApplicationHandler for App {
             attachment_image_views,
             depth_image_view,
             pipeline_layout,
+            vertex_shader,
+            fragment_shader,
             pipelines,
             cubemap_pipeline,
             cubemap_vertex_buffer,
@@ -1972,7 +2022,7 @@ impl ApplicationHandler for App {
                     for prim_idx in pcx.prim_indices.iter().copied() {
                         let prim = &self.prim_infos[prim_idx];
                         for obj_idx in prim.object_ids.iter().copied() {
-                            let object = &self.objects[obj_idx];
+                            let object = &self.scene.objects[obj_idx];
                             if !object.enabled {
                                 continue;
                             }
@@ -2128,7 +2178,7 @@ impl ApplicationHandler for App {
                             &mut builder,
                             rcx.pipeline_layout.clone(),
                             &self.prim_infos,
-                            &self.objects,
+                            &self.scene.objects,
                         );
                     }
                 }
@@ -2166,9 +2216,12 @@ impl ApplicationHandler for App {
                             )
                             .unwrap();
 
-                        let object = &self.objects[obj_idx];
+                        let object = &self.scene.objects[obj_idx];
                         let transform = object.transform;
-                        let normal = transform.transpose().invert().unwrap();
+                        let normal = transform
+                            .transpose()
+                            .invert()
+                            .unwrap_or(Matrix4::identity());
                         let model: [[f32; 4]; 4] = transform.into();
                         #[allow(clippy::useless_conversion)]
                         let data = fs::Object {
@@ -2264,7 +2317,7 @@ impl ApplicationHandler for App {
                             &mut builder,
                             rcx.pipeline_layout.clone(),
                             &self.prim_infos,
-                            &self.objects,
+                            &self.scene.objects,
                         );
                     }
                     builder
@@ -2275,50 +2328,500 @@ impl ApplicationHandler for App {
 
                 let ui = self.imgui_ctx.frame();
 
-                ui.dockspace_over_main_viewport();
+                let viewport_dockspace_id = unsafe {
+                    igDockSpaceOverViewport(
+                        igGetMainViewport(),
+                        ImGuiDockNodeFlags_PassthruCentralNode as i32,
+                        null(),
+                    )
+                };
+
+                unsafe {
+                    use imgui::sys::*;
+                    static mut INIT: bool = true;
+                    if INIT {
+                        INIT = false;
+
+                        igDockBuilderRemoveNodeChildNodes(viewport_dockspace_id);
+
+                        let mut left = 0;
+                        let mut rest = 0;
+                        igDockBuilderSplitNode(
+                            viewport_dockspace_id,
+                            ImGuiDir_Left,
+                            0.2,
+                            &mut left,
+                            &mut rest,
+                        );
+
+                        let mut top_left = 0;
+                        let mut bottom_left = 0;
+                        igDockBuilderSplitNode(
+                            left,
+                            ImGuiDir_Up,
+                            0.75,
+                            &mut top_left,
+                            &mut bottom_left,
+                        );
+
+                        igDockBuilderDockWindow(c_str!("Objects").as_ptr(), top_left);
+                        igDockBuilderDockWindow(c_str!("Primitives").as_ptr(), bottom_left);
+                        igDockBuilderDockWindow(c_str!("Transform").as_ptr(), bottom_left);
+                    }
+                }
 
                 ui.window("Objects").build(|| {
-                    if let Some(_token) = ui.begin_table_with_flags(
-                        "Objects",
-                        1,
-                        TableFlags::SORTABLE | TableFlags::SORT_MULTI,
-                    ) {
-                        ui.table_setup_column("Name");
-                        ui.table_headers_row();
+                    fn object_tree_builder(idx: usize, ui: &imgui::Ui, scene: &mut Scene) {
+                        let object = &scene.objects[idx];
+                        let name = object.name.as_deref().unwrap_or("Unnamed");
 
-                        let mut object_order = (0..self.objects.len()).collect::<Vec<_>>();
-                        if let Some(sort_data) = ui.table_sort_specs_mut() {
-                            for spec in sort_data.specs().iter() {
-                                if let Some(direction) = spec.sort_direction() {
-                                    object_order.sort_by(|a, b| {
-                                        let mut ord = match spec.column_idx() {
-                                            0 => self.objects[*a].name.cmp(&self.objects[*b].name),
-                                            1 => self.objects[*a]
-                                                .enabled
-                                                .cmp(&self.objects[*b].enabled),
-                                            _ => Ordering::Equal,
-                                        };
-                                        if direction == TableSortDirection::Descending {
-                                            ord = ord.reverse();
-                                        }
-                                        ord
-                                    });
-                                }
+                        let builder = ui
+                            .tree_node_config(format!("{}##object{}", name, idx))
+                            .opened(true, Condition::Once)
+                            .framed(true)
+                            .allow_item_overlap(true) // Make the checkbox clickable when overlaid
+                            .open_on_arrow(true)
+                            .leaf(scene.children[idx].is_empty());
+
+                        let token = {
+                            let _color_token = (scene.selected_object == Some(idx)).then(|| {
+                                ui.push_style_color(
+                                    StyleColor::Header,
+                                    ui.style_color(StyleColor::HeaderActive),
+                                )
+                            });
+                            builder.push()
+                        };
+
+                        if ui.is_item_clicked() {
+                            scene.selected_object = Some(idx);
+                        }
+
+                        if scene.selected_object == Some(idx)
+                            && ui.is_item_clicked_with_button(imgui::MouseButton::Right)
+                        {
+                            scene.selected_object = None;
+                        }
+
+                        if let Some(_token) = ui
+                            .drag_drop_source_config("OBJECT_TREE_DRAG")
+                            .flags(DragDropFlags::empty())
+                            .begin_payload(idx)
+                        {
+                            object_tree_builder(idx, ui, scene);
+                        }
+
+                        if let Some(target) = ui.drag_drop_target() {
+                            if let Some(payload) = target.accept_payload::<usize, &str>(
+                                "OBJECT_TREE_DRAG",
+                                DragDropFlags::empty(),
+                            ) {
+                                scene.change_parent(payload.unwrap().data, Some(idx));
                             }
                         }
-                        for obj_idx in object_order.iter().copied() {
-                            ui.table_next_row();
-                            ui.table_next_column();
-                            let obj = &mut self.objects[obj_idx];
-                            let name = if let Some(name) = &obj.name {
-                                name
-                            } else {
-                                "Unnamed"
-                            };
-                            ui.checkbox(format!("{}##enabled{}", name, obj_idx), &mut obj.enabled);
+
+                        let checkbox_size = ui.frame_height();
+                        ui.same_line_with_pos(ui.content_region_max()[0] - checkbox_size);
+                        ui.checkbox(
+                            format!("##checkbox{}", idx),
+                            &mut scene.objects[idx].enabled,
+                        );
+
+                        if let Some(_token) = token {
+                            let mut children: Vec<_> =
+                                scene.children[idx].clone().into_iter().collect();
+                            children.sort();
+                            for child in children.iter().copied() {
+                                object_tree_builder(child, ui, scene);
+                            }
+                        }
+                    }
+
+                    let roots: Vec<_> = self
+                        .scene
+                        .objects
+                        .iter()
+                        .filter(|o| o.parent.is_none())
+                        .map(|r| r.index)
+                        .collect();
+
+                    for root in roots {
+                        object_tree_builder(root, ui, &mut self.scene);
+                    }
+
+                    ui.invisible_button("root_drop_region", ui.content_region_avail());
+                    if let Some(target) = ui.drag_drop_target() {
+                        if let Some(payload) = target.accept_payload::<usize, &str>(
+                            "OBJECT_TREE_DRAG",
+                            DragDropFlags::empty(),
+                        ) {
+                            let from = payload.unwrap().data;
+                            self.scene.change_parent(from, None);
                         }
                     }
                 });
+
+                if let Some(selected) = self.scene.selected_object {
+                    ui.window("Transform").build(|| {
+                        let object = &mut self.scene.objects[selected];
+                        let mut changed = false;
+                        let mut transform = object.local_transform;
+                        if ui.collapsing_header("Position", TreeNodeFlags::DEFAULT_OPEN)
+                            && gui::drag_vec3(
+                                [
+                                    &mut transform.position.x,
+                                    &mut transform.position.y,
+                                    &mut transform.position.z,
+                                ],
+                                ui,
+                                "position",
+                                "%.2f",
+                            )
+                        {
+                            changed = true;
+                        }
+                        if ui.collapsing_header("Rotation", TreeNodeFlags::empty())
+                            && gui::drag_vec3(
+                                [
+                                    &mut transform.rotation.x.0,
+                                    &mut transform.rotation.y.0,
+                                    &mut transform.rotation.z.0,
+                                ],
+                                ui,
+                                "rotation",
+                                "%.2f",
+                            )
+                        {
+                            changed = true;
+                        }
+                        if ui.collapsing_header("Scale", TreeNodeFlags::empty())
+                            && gui::drag_vec3(
+                                [
+                                    &mut transform.scale.x,
+                                    &mut transform.scale.y,
+                                    &mut transform.scale.z,
+                                ],
+                                ui,
+                                "scale",
+                                "%.2f",
+                            )
+                        {
+                            changed = true;
+                        }
+                        if ui.collapsing_header("Skew", TreeNodeFlags::empty())
+                            && gui::drag_vec3(
+                                [
+                                    &mut transform.skew.x,
+                                    &mut transform.skew.y,
+                                    &mut transform.skew.z,
+                                ],
+                                ui,
+                                "skew",
+                                "%.2f",
+                            )
+                        {
+                            changed = true;
+                        }
+                        if changed {
+                            object.local_transform = transform;
+                            self.scene.regenerate();
+                        }
+                    });
+
+                    let object = &mut self.scene.objects[selected];
+                    if let Some(mesh_idx) = object.mesh_idx {
+                        ui.window("Primitives")
+                            .flags(WindowFlags::NO_FOCUS_ON_APPEARING)
+                            .build(|| {
+                                let mesh = &self.mesh_infos[mesh_idx];
+                                if let Some(_token) = ui.begin_table_with_flags(
+                                    "Primitives",
+                                    2,
+                                    TableFlags::SIZING_FIXED_FIT,
+                                ) {
+                                    ui.table_setup_column("Vertices");
+                                    ui.table_setup_column("Material");
+                                    ui.table_headers_row();
+                                    for prim in self
+                                        .prim_infos
+                                        .iter()
+                                        .skip(mesh.prims_offset)
+                                        .take(mesh.prims_count)
+                                    {
+                                        ui.table_next_row();
+
+                                        ui.table_next_column();
+                                        ui.text(format!("{}", prim.index_count));
+
+                                        ui.table_next_column();
+                                        let mat = &self.materials[prim.mat_idx];
+                                        let color = mat.pbr_metallic_roughness.base_color_factor;
+                                        gui::color_square(ui, color, "");
+                                        ui.same_line();
+                                        let name =
+                                            mat.name.as_deref().unwrap_or("Unnamed Material");
+                                        let selected =
+                                            Some(prim.mat_idx) == self.scene.selected_material;
+                                        if ui
+                                            .selectable_config(name)
+                                            .selected(selected)
+                                            .span_all_columns(true)
+                                            .build()
+                                        {
+                                            self.scene.selected_material = Some(prim.mat_idx);
+                                        }
+                                    }
+                                }
+                            });
+                    }
+                }
+
+                if let Some(mat_idx) = self.scene.selected_material {
+                    ui.window("Material").build(|| {
+                        let mat = &mut self.materials[mat_idx];
+                        let old_mat_cons: MaterialSpecializationConstants = (&*mat).into();
+                        let mut name = mat.name.clone().unwrap_or("".to_owned());
+                        if ui.input_text("Name", &mut name)
+                            .build() {
+                            if name.is_empty() {
+                                mat.name = None;
+                            } else {
+                                mat.name = Some(name);
+                            }
+                        }
+                        let mut changed = false;
+                        if ui.color_edit4("Base Color Factor", &mut mat.pbr_metallic_roughness.base_color_factor) { changed = true; }
+                        // TODO: base_color_texture
+                        if ui.slider("Metallic Factor", 0.0, 1.0, &mut mat.pbr_metallic_roughness.metallic_factor) { changed = true; }
+                        if ui.slider("Roughness Factor", 0.0, 1.0, &mut mat.pbr_metallic_roughness.roughness_factor) { changed = true; }
+                        // TODO: metallic_roughness_texture
+                        // TODO: normal_texture
+                        // TODO: occlusion_texture
+                        // TODO: emissive_texture
+                        if ui.color_edit3("Emissive Factor", &mut mat.emissive_factor) { changed = true; }
+
+                        {
+                            let choices = ["Opaque", "Mask", "Blend"];
+                            let mut selected = match mat.alpha_mode {
+                                AlphaMode::Opaque => 0,
+                                AlphaMode::Mask => 1,
+                                AlphaMode::Blend => 2,
+                            };
+                            if ui.combo_simple_string("Alpha Mode", &mut selected, &choices) {
+                                mat.alpha_mode = match selected {
+                                    1 => AlphaMode::Mask,
+                                    2 => AlphaMode::Blend,
+                                    _ => AlphaMode::Opaque,
+                                };
+                                changed = true;
+                            }
+                        }
+
+                        if ui.slider("Alpha Cutoff", 0.0, 1.0, &mut mat.alpha_cutoff.0) { changed = true; }
+                        if ui.checkbox("Double Sided", &mut mat.double_sided) { changed = true; }
+                        if ui.checkbox("Unlit", &mut mat.unlit) { changed = true; }
+
+                        changed |= gui::material_property(
+                            &mut mat.pbr_specular_glossiness,
+                            "PBR Specular Glossiness",
+                            ui,
+                            |spec_gloss| {
+                                ui.color_edit4("Diffuse Factor", &mut spec_gloss.diffuse_factor) |
+                                // TODO: diffuse_texture
+                                ui.color_edit3("Specular Factor", &mut spec_gloss.specular_factor) |
+                                ui.slider("Glossiness Factor", 0.0, 1.0, &mut spec_gloss.glossiness_factor)
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.anisotropy,
+                            "Anisotropy",
+                            ui,
+                            |anisotropy| {
+                                ui.slider("Anisotropy Strength", 0.0, 1.0, &mut anisotropy.strength) |
+                                ui.slider("Anisotropy Rotation", 0.0, 2. * PI, &mut anisotropy.rotation)
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.clearcoat,
+                            "Clearcoat",
+                            ui,
+                            |clearcoat| {
+                                ui.slider("Clearcoat Factor", 0.0, 1.0, &mut clearcoat.factor) |
+                                // TODO: texture
+                                ui.slider("Clearcoat Roughness factor", 0.0, 1.0, &mut clearcoat.roughness_factor)
+                                // TODO: roughness_texture
+                                // TODO: normal_texture
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.diffuse_transmission,
+                            "Diffuse Transmission",
+                            ui,
+                            |diffuse_transmission| {
+                                ui.slider("Diffuse Transmission Factor", 0.0, 1.0, &mut diffuse_transmission.factor) |
+                                // TODO: texture
+                                ui.color_edit3("Diffuse Transmission Color Factor", &mut diffuse_transmission.color_factor)
+                                // TODO: color_texture
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.dispersion,
+                            "Dispersion",
+                            ui,
+                            |dispersion| {
+                                gui::drag_float(&mut dispersion.0, 0.0, f32::infinity(), "Dispersion", "%0.2f")
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.emissive_strength,
+                            "Emissive Strength",
+                            ui,
+                            |emissive_strength| {
+                                gui::drag_float(&mut emissive_strength.0, 0.0, f32::infinity(), "Emissive Strength", "%0.2f")
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.ior,
+                            "IOR",
+                            ui,
+                            |ior| {
+                                gui::drag_float(&mut ior.0, 1.0, f32::infinity(), "IOR", "%0.2f")
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.iridescence,
+                            "Iridescence",
+                            ui,
+                            |iridescence| {
+                                ui.slider("Iridescence Factor", 0.0, 1.0, &mut iridescence.factor) |
+                                // TODO: texture
+                                gui::drag_float(&mut iridescence.thickness_minimum, 0.0, f32::infinity(), "Thickness Minimum", "%0.1f") |
+                                gui::drag_float(&mut iridescence.thickness_maximum, 0.0, f32::infinity(), "Thickness Maximum", "%0.1f")
+                                // TODO: thickness texture
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.sheen,
+                            "Sheen",
+                            ui,
+                            |sheen| {
+                                ui.color_edit3("Sheen Color Factor", &mut sheen.color_factor) |
+                                // TODO: color texture
+                                ui.slider("Sheen Roughness Factor", 0.0, 1.0, &mut sheen.roughness_factor)
+                                // TODO: roughness texture
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.specular,
+                            "Specular",
+                            ui,
+                            |specular| {
+                                ui.slider("Specular Factor", 0.0, 1.0, &mut specular.factor) |
+                                // TODO: texture
+                                ui.color_edit3("Specular Color Factor", &mut specular.color_factor)
+                                // TODO: color texture
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.transmission,
+                            "Transmission",
+                            ui,
+                            |transmission| {
+                                ui.slider("Transmission Factor", 0.0, 1.0, &mut transmission.factor)
+                            }
+                        );
+
+                        changed |= gui::material_property(
+                            &mut mat.volume,
+                            "Volume",
+                            ui,
+                            |volume| {
+                                gui::drag_float(&mut volume.thickness_factor, 0.0, f32::infinity(), "Thickness Factor", "%0.2f") |
+                                // TODO: thickness_texture
+                                gui::drag_float(&mut volume.attenuation_distance, 0.0, f32::infinity(), "Attenuation Distance", "%0.2f") |
+                                ui.color_edit3("Attenuation Color", &mut volume.attenuation_color)
+                            }
+                        );
+
+                        if changed {
+                            // TODO: as an optimization, check if the new spec constants differ from the old ones. If they don't, the pipeline
+                            // doesn't need to change, only the material sets.
+                            let material_constants: MaterialSpecializationConstants = (&*mat).into();
+                            // Material might have changed its specialization constants, meaning it needs to get rendered by a different pipeline.
+                            // First, remove the material's descriptor sets from its current pipeline, and remove any primitve that uses this mat
+                            // from the pipeline's primitives list.
+                            // TODO: maybe delete the pipeline if the primitive list becomes empty, although this might not be worth it
+                            for &pcx_idx in rcx.pipeline_map[&old_mat_cons].values() {
+                                let pcx = &mut rcx.pipelines[pcx_idx];
+                                pcx.material_sets.remove(&mat_idx);
+                                pcx.prim_indices.retain(|idx| !self.mat_prims[mat_idx].contains(idx));
+                            }
+                            // Once the material's old pipeline bindings have been removed, determine which pipeline it now belongs to after the change,
+                            // or create a new one if none exists.
+                            let pipeline_map = rcx.pipeline_map
+                                .entry(material_constants)
+                                .or_default();
+                            let (material_set, texture_set) = build_material_texture_sets(
+                                mat,
+                                &self.uniform_buffer_allocator,
+                                self.descriptor_set_allocator.clone(),
+                                rcx.pipeline_layout.clone(),
+                                &self.textures,
+                                self.null_texture.clone(),
+                                self.samplers.wrap_sampler_mipmap.clone(),
+                            );
+                            for prim_idx in self.mat_prims[mat_idx].iter().copied() {
+                                let prim = &self.prim_infos[prim_idx];
+                                let pcx_idx = *pipeline_map
+                                    .entry(prim.spec_const)
+                                    .or_insert_with(|| {
+                                        let spec_constants = SpecializationConstants {
+                                            object_constants: prim.spec_const,
+                                            material_constants,
+                                        };
+                                        let pipeline = build_pipeline(
+                                            self.context.device().clone(),
+                                            window_renderer.swapchain_format(),
+                                            rcx.vertex_shader.clone(),
+                                            rcx.fragment_shader.clone(),
+                                            spec_constants,
+                                            mat.double_sided, // TODO: maybe this needs to be a specialization constant
+                                                              // TODO: if two materials are the same except for their sidedness,
+                                                              // TODO: they still need to be in different pipelines.
+                                            rcx.pipeline_layout.clone(),
+                                        );
+                                        let material_sets = HashMap::new();
+                                        let prim_indices = HashSet::new();
+                                        let pipeline = PipelineContext {
+                                            pipeline,
+                                            material_sets,
+                                            prim_indices,
+                                        };
+                                        let pcx_idx = rcx.pipelines.len();
+                                        rcx.pipelines.push(pipeline);
+
+                                        pcx_idx
+                                    });
+                                rcx.pipelines[pcx_idx].prim_indices.insert(prim_idx);
+
+                                rcx.pipelines[pcx_idx]
+                                    .material_sets
+                                    .entry(mat_idx)
+                                    .or_insert_with(|| (material_set.clone(), texture_set.clone()));
+                            }
+                        }
+                    });
+                }
 
                 rcx.imgui_platform
                     .prepare_render(ui, window_renderer.window());
@@ -2372,7 +2875,7 @@ struct PrimitiveDrawInfo {
     pub index_count: u32,
     pub mat_idx: usize,
     pub spec_const: ObjectSpecializationConstants,
-    pub object_ids: Vec<usize>,
+    pub object_ids: HashSet<usize>,
 }
 
 #[derive(Debug)]
