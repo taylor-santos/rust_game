@@ -15,8 +15,9 @@
 use crate::camera::FirstPersonCamera;
 use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, Object, Scene, TextureFormat};
 use crate::material::{AlphaMode, Material};
+use crate::renderer::{Renderer, RendererContext};
 use crate::shader::{
-    cubemap_fs, cubemap_vs, fs, vs, MaterialSpecializationConstants, ObjectSpecializationConstants,
+    cubemap_fs, cubemap_vs, fs, MaterialSpecializationConstants, ObjectSpecializationConstants,
     RenderType, SpecializationConstants,
 };
 use c_str_macro::c_str;
@@ -27,7 +28,6 @@ use imgui::sys::{
     igDockSpaceOverViewport, igGetMainViewport, ImGuiDockNodeFlags_PassthruCentralNode,
 };
 use imgui::{Condition, DragDropFlags, StyleColor, TableFlags, TreeNodeFlags, WindowFlags};
-use imgui_vulkano_renderer::Renderer;
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use ktx2::SupercompressionScheme;
 use rayon::iter::Either;
@@ -38,7 +38,7 @@ use std::f32::consts::PI;
 use std::ptr::null;
 use std::time::{Duration, Instant};
 use std::{error::Error, sync::Arc};
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::allocator::SubbufferAllocator;
 use vulkano::command_buffer::{
     BlitImageInfo, BufferImageCopy, CopyBufferInfo, CopyBufferToImageInfo, ImageBlit,
     PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract,
@@ -64,7 +64,7 @@ use vulkano::pipeline::graphics::color_blend::{
 };
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::CullMode;
-use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
+use vulkano::pipeline::layout::PipelineLayoutCreateInfo;
 use vulkano::pipeline::{Pipeline, PipelineBindPoint};
 use vulkano::shader::{DescriptorBindingRequirements, ShaderModule, ShaderStages};
 use vulkano::swapchain::PresentMode;
@@ -74,7 +74,7 @@ use vulkano::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
         RenderingAttachmentInfo, RenderingInfo,
     },
-    device::{DeviceExtensions, DeviceFeatures, Queue},
+    device::Queue,
     image::{view::ImageView, Image, ImageUsage},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
@@ -94,8 +94,7 @@ use vulkano::{
     sync::{self, GpuFuture},
     DeviceSize,
 };
-use vulkano_util::context::{VulkanoConfig, VulkanoContext};
-use vulkano_util::window::{VulkanoWindows, WindowDescriptor};
+use vulkano_util::window::WindowDescriptor;
 use winit::event::{DeviceEvent, DeviceId, ElementState, Event, MouseButton, StartCause};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::CursorGrabMode;
@@ -110,6 +109,7 @@ mod camera;
 mod gltf;
 mod gui;
 mod material;
+mod renderer;
 mod shader;
 mod transform;
 
@@ -136,12 +136,7 @@ struct Samplers {
 }
 
 struct App {
-    context: VulkanoContext,
-    windows: VulkanoWindows,
-    memory_allocator: Arc<StandardMemoryAllocator>,
-    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
-    command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    uniform_buffer_allocator: SubbufferAllocator,
+    renderer: Renderer,
     vertex_buffer: Subbuffer<[CombinedVertex]>,
     index_buffer: Subbuffer<[u32]>,
     scene: Scene,
@@ -171,11 +166,6 @@ struct InputState {
 }
 
 struct RenderContext {
-    attachment_image_views: Vec<Arc<ImageView>>,
-    depth_image_view: Arc<ImageView>,
-    pipeline_layout: Arc<PipelineLayout>,
-    vertex_shader: Arc<ShaderModule>,
-    fragment_shader: Arc<ShaderModule>,
     pipelines: Vec<PipelineContext>,
     cubemap_pipeline: Arc<GraphicsPipeline>,
     cubemap_index_buffer: Subbuffer<[u32]>,
@@ -190,7 +180,7 @@ struct RenderContext {
     viewport: Viewport,
     frame_times: VecDeque<Instant>,
     imgui_platform: WinitPlatform,
-    imgui_renderer: Renderer,
+    imgui_renderer: imgui_vulkano_renderer::Renderer,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -392,52 +382,7 @@ fn load_png(
 
 impl App {
     fn new() -> Self {
-        let context = VulkanoContext::new(VulkanoConfig {
-            device_features: DeviceFeatures {
-                dynamic_rendering: true,
-                ..Default::default()
-            },
-            device_extensions: DeviceExtensions {
-                khr_swapchain: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        let windows = VulkanoWindows::default();
-
-        // Some little debug infos.
-        println!(
-            "Using device: {} (type: {:?})",
-            context.device().physical_device().properties().device_name,
-            context.device().physical_device().properties().device_type,
-        );
-
-        let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(
-            context.device().clone(),
-        ));
-
-        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-            context.device().clone(),
-            Default::default(),
-        ));
-
-        // Before we can start creating and recording command buffers, we need a way of allocating
-        // them. Vulkano provides a command buffer allocator, which manages raw Vulkan command
-        // pools underneath and provides a safe interface for them.
-        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            context.device().clone(),
-            Default::default(),
-        ));
-
-        let uniform_buffer_allocator = SubbufferAllocator::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+        let renderer = Renderer::new();
 
         let Gltf {
             meshes,
@@ -515,17 +460,17 @@ impl App {
             }
 
             let vertex_buffer = create_buffer(
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                context.graphics_queue(),
+                renderer.allocators.memory.clone(),
+                renderer.allocators.command_buffer.clone(),
+                renderer.context.graphics_queue(),
                 BufferUsage::VERTEX_BUFFER,
                 combined_verts,
             );
 
             let index_buffer = create_buffer(
-                memory_allocator.clone(),
-                command_buffer_allocator.clone(),
-                context.graphics_queue(),
+                renderer.allocators.memory.clone(),
+                renderer.allocators.command_buffer.clone(),
+                renderer.context.graphics_queue(),
                 BufferUsage::INDEX_BUFFER,
                 combined_indices,
             );
@@ -542,8 +487,8 @@ impl App {
         };
 
         let mut image_builder = AutoCommandBufferBuilder::primary(
-            command_buffer_allocator.clone(),
-            context.graphics_queue().queue_family_index(),
+            renderer.allocators.command_buffer.clone(),
+            renderer.context.graphics_queue().queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
@@ -664,9 +609,9 @@ impl App {
                         extent,
                         1,
                         1,
-                        &memory_allocator,
-                        &command_buffer_allocator,
-                        context.graphics_queue(),
+                        &renderer.allocators.memory,
+                        &renderer.allocators.command_buffer,
+                        renderer.context.graphics_queue(),
                         format,
                     )
                     .unwrap()
@@ -692,9 +637,9 @@ impl App {
                 extent,
                 1,
                 1,
-                &memory_allocator,
-                &command_buffer_allocator,
-                context.graphics_queue(),
+                &renderer.allocators.memory,
+                &renderer.allocators.command_buffer,
+                renderer.context.graphics_queue(),
                 Format::R8G8B8A8_UNORM,
             )
             .unwrap()
@@ -706,44 +651,44 @@ impl App {
             let lambertian = load_ktx2(
                 format!("textures/{env}/lambertian/diffuse.ktx2").as_str(),
                 &mut image_builder,
-                &memory_allocator,
-                &command_buffer_allocator,
-                context.graphics_queue(),
+                &renderer.allocators.memory,
+                &renderer.allocators.command_buffer,
+                renderer.context.graphics_queue(),
             )
             .unwrap();
             let ggx = load_ktx2(
                 format!("textures/{env}/ggx/specular.ktx2").as_str(),
                 &mut image_builder,
-                &memory_allocator,
-                &command_buffer_allocator,
-                context.graphics_queue(),
+                &renderer.allocators.memory,
+                &renderer.allocators.command_buffer,
+                renderer.context.graphics_queue(),
             )
             .unwrap();
 
             let charlie = load_ktx2(
                 format!("textures/{env}/charlie/sheen.ktx2").as_str(),
                 &mut image_builder,
-                &memory_allocator,
-                &command_buffer_allocator,
-                context.graphics_queue(),
+                &renderer.allocators.memory,
+                &renderer.allocators.command_buffer,
+                renderer.context.graphics_queue(),
             )
             .unwrap();
 
             // let lut_charlie = load_png(
             //     "textures/lut_charlie.png",
             //     &mut image_builder,
-            //     memory_allocator.clone(),
-            //     command_buffer_allocator.clone(),
-            //     context.graphics_queue().clone(),
+            //     renderer.allocators.memory.clone(),
+            //     renderer.allocators.command_buffer.clone(),
+            //     renderer.context.graphics_queue().clone(),
             // )
             // .unwrap();
 
             // let lut_ggx = load_png(
             //     "textures/lut_ggx.png",
             //     &mut image_builder,
-            //     memory_allocator.clone(),
-            //     command_buffer_allocator.clone(),
-            //     context.graphics_queue().clone(),
+            //     renderer.allocators.memory.clone(),
+            //     renderer.allocators.command_buffer.clone(),
+            //     renderer.context.graphics_queue().clone(),
             // )
             // .unwrap();
 
@@ -761,9 +706,9 @@ impl App {
                     [1024, 1024, 1],
                     1,
                     1,
-                    &memory_allocator,
-                    &command_buffer_allocator,
-                    context.graphics_queue(),
+                    &renderer.allocators.memory,
+                    &renderer.allocators.command_buffer,
+                    renderer.context.graphics_queue(),
                     Format::R16G16B16A16_SFLOAT,
                 )
                 .unwrap()
@@ -783,9 +728,9 @@ impl App {
                     [1024, 1024, 1],
                     1,
                     1,
-                    &memory_allocator,
-                    &command_buffer_allocator,
-                    context.graphics_queue(),
+                    &renderer.allocators.memory,
+                    &renderer.allocators.command_buffer,
+                    renderer.context.graphics_queue(),
                     Format::R16G16B16A16_SFLOAT,
                 )
                 .unwrap()
@@ -794,9 +739,9 @@ impl App {
             let lut_sheen_e = load_png(
                 "textures/lut_sheen_E.png",
                 &mut image_builder,
-                &memory_allocator,
-                &command_buffer_allocator,
-                context.graphics_queue(),
+                &renderer.allocators.memory,
+                &renderer.allocators.command_buffer,
+                renderer.context.graphics_queue(),
             )
             .unwrap();
 
@@ -813,7 +758,7 @@ impl App {
         image_builder
             .build()
             .unwrap()
-            .execute(context.graphics_queue().clone())
+            .execute(renderer.context.graphics_queue().clone())
             .unwrap()
             .then_signal_fence_and_flush()
             .unwrap()
@@ -821,7 +766,7 @@ impl App {
             .unwrap();
 
         let clamp_sampler_no_mipmap = Sampler::new(
-            context.device().clone(),
+            renderer.context.device().clone(),
             SamplerCreateInfo {
                 address_mode: [ClampToEdge, ClampToEdge, Repeat],
                 ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
@@ -830,7 +775,7 @@ impl App {
         .expect("Couldn't create sampler");
 
         let mirror_sampler_mipmap = Sampler::new(
-            context.device().clone(),
+            renderer.context.device().clone(),
             SamplerCreateInfo {
                 address_mode: [MirroredRepeat, MirroredRepeat, Repeat],
                 ..SamplerCreateInfo::simple_repeat_linear()
@@ -839,7 +784,7 @@ impl App {
         .expect("Couldn't create sampler");
 
         let wrap_sampler_mipmap = Sampler::new(
-            context.device().clone(),
+            renderer.context.device().clone(),
             SamplerCreateInfo {
                 address_mode: [Repeat; 3],
                 ..SamplerCreateInfo::simple_repeat_linear()
@@ -862,12 +807,7 @@ impl App {
         let scene = Scene::new(objects);
 
         Self {
-            context,
-            windows,
-            memory_allocator,
-            descriptor_set_allocator,
-            command_buffer_allocator,
-            uniform_buffer_allocator,
+            renderer,
             vertex_buffer,
             index_buffer,
             scene,
@@ -888,7 +828,7 @@ impl App {
     }
 
     fn set_cursor_confinement(&mut self, confined: bool) {
-        let window = self.windows.get_primary_window().unwrap();
+        let window = self.renderer.windows.get_primary_window().unwrap();
         if confined {
             window
                 .set_cursor_grab(CursorGrabMode::Confined)
@@ -1323,13 +1263,13 @@ impl PipelineContext {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(primary_window_id) = self.windows.primary_window_id() {
-            self.windows.remove_renderer(primary_window_id);
+        if let Some(primary_window_id) = self.renderer.windows.primary_window_id() {
+            self.renderer.windows.remove_renderer(primary_window_id);
         }
 
-        self.windows.create_window(
+        let window_id = self.renderer.windows.create_window(
             event_loop,
-            &self.context,
+            &self.renderer.context,
             &WindowDescriptor {
                 present_mode: PresentMode::Immediate,
                 width: 1920.,
@@ -1342,16 +1282,16 @@ impl ApplicationHandler for App {
                 info.image_usage |= ImageUsage::TRANSFER_SRC;
             },
         );
-        let window_renderer = self.windows.get_primary_renderer_mut().unwrap();
+
+        let new_rcx = RendererContext::new(&mut self.renderer, window_id);
+
+        let window_renderer = self.renderer.windows.get_primary_renderer_mut().unwrap();
 
         let window_size = window_renderer.window().inner_size();
 
-        // Create image views from the current swapchain images.
-        let attachment_image_views = window_renderer.swapchain_image_views().to_vec();
-
         let mip_levels = max_mip_levels([window_size.width, window_size.height, 1]);
         let intermediate_image = Image::new(
-            self.memory_allocator.clone(),
+            self.renderer.allocators.memory.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: window_renderer.swapchain_format(),
@@ -1368,101 +1308,6 @@ impl ApplicationHandler for App {
         .unwrap();
 
         let intermediate_image_view = ImageView::new_default(intermediate_image).unwrap();
-
-        let depth_image = Image::new(
-            self.memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: Format::D32_SFLOAT,
-                extent: [window_size.width, window_size.height, 1],
-                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .expect("Failed to create depth image");
-
-        let depth_image_view =
-            ImageView::new_default(depth_image).expect("Failed to create depth image view");
-
-        let vertex_shader = vs::load(self.context.device().clone()).unwrap();
-        let fragment_shader = fs::load(self.context.device().clone()).unwrap();
-
-        let pipeline_layout = {
-            // We must now create a **pipeline layout** object, which describes the locations and
-            // types of descriptor sets and push constants used by the shaders in the pipeline.
-            //
-            // Multiple pipelines can share a common layout object, which is more efficient. The
-            // shaders in a pipeline must use a subset of the resources described in its pipeline
-            // layout, but the pipeline layout is allowed to contain resources that are not present
-            // in the shaders; they can be used by shaders in other pipelines that share the same
-            // layout. Thus, it is a good idea to design shaders so that many pipelines have common
-            // resource locations, which allows them to share pipeline layouts.
-            let bindings = [
-                // set = 0
-                vec![
-                    DescriptorType::UniformBuffer, // binding = 0 uniform Constants
-                ],
-                // set = 1
-                vec![
-                    DescriptorType::UniformBuffer, // binding = 0 uniform Camera
-                ],
-                // set = 2
-                vec![DescriptorType::CombinedImageSampler; 6], // IBL Samplers
-                // set = 3
-                vec![
-                    DescriptorType::UniformBuffer, // binding = 0 uniform Material
-                    DescriptorType::UniformBuffer, // binding = 1 uniform MatSamplers
-                ],
-                // set = 4
-                vec![DescriptorType::CombinedImageSampler; 21], // Texture Samplers
-                // set = 5
-                vec![DescriptorType::CombinedImageSampler], // Framebuffer Sampler
-            ];
-
-            let push_constant_ranges = vec![PushConstantRange {
-                stages: ShaderStages::all_graphics(),
-                offset: 0,
-                size: size_of::<fs::Object>() as u32,
-            }];
-
-            PipelineLayout::new(
-                self.context.device().clone(),
-                PipelineLayoutCreateInfo {
-                    set_layouts: bindings
-                        .into_iter()
-                        .map(|set| {
-                            DescriptorSetLayout::new(
-                                self.context.device().clone(),
-                                DescriptorSetLayoutCreateInfo {
-                                    bindings: set
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(idx, binding)| {
-                                            (
-                                                idx as u32,
-                                                (&DescriptorBindingRequirements {
-                                                    descriptor_types: vec![binding],
-                                                    descriptor_count: Some(1),
-                                                    stages: ShaderStages::all_graphics(),
-                                                    ..Default::default()
-                                                })
-                                                    .into(),
-                                            )
-                                        })
-                                        .collect(),
-                                    ..Default::default()
-                                },
-                            )
-                            .unwrap()
-                        })
-                        .collect::<Vec<_>>(),
-                    push_constant_ranges,
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-        };
 
         // Dynamic viewports allow us to recreate just the viewport when the window is resized.
         // Otherwise we would have to recreate the whole pipeline.
@@ -1507,7 +1352,12 @@ impl ApplicationHandler for App {
                 u_EnvIntensity: 1.0.into(),
                 u_Exposure: 1.0.into(),
             };
-            let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+            let subbuffer = self
+                .renderer
+                .allocators
+                .uniform_buffer
+                .allocate_sized()
+                .unwrap();
             *subbuffer.write().unwrap() = uniform;
 
             WriteDescriptorSet::buffer(0, subbuffer)
@@ -1554,9 +1404,9 @@ impl ApplicationHandler for App {
                 .for_each(|(mat_idx, mat)| {
                     let (material_set, texture_set) = build_material_texture_sets(
                         mat,
-                        &self.uniform_buffer_allocator,
-                        &self.descriptor_set_allocator,
-                        &pipeline_layout,
+                        &self.renderer.allocators.uniform_buffer,
+                        &self.renderer.allocators.descriptor_set,
+                        &new_rcx.pipeline_layout,
                         &self.textures,
                         &self.null_texture,
                         &self.samplers.wrap_sampler_mipmap,
@@ -1575,13 +1425,13 @@ impl ApplicationHandler for App {
                                     material_constants: mat_const,
                                 };
                                 let pipeline = build_pipeline(
-                                    self.context.device(),
+                                    self.renderer.context.device(),
                                     window_renderer.swapchain_format(),
-                                    &vertex_shader,
-                                    &fragment_shader,
+                                    &new_rcx.vertex_shader,
+                                    &new_rcx.fragment_shader,
                                     spec_constants,
                                     mat.double_sided,
-                                    pipeline_layout.clone(),
+                                    new_rcx.pipeline_layout.clone(),
                                 );
 
                                 let material_sets = HashMap::new();
@@ -1612,16 +1462,26 @@ impl ApplicationHandler for App {
         };
 
         let const_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
+            self.renderer.allocators.descriptor_set.clone(),
             #[allow(clippy::get_first)]
-            pipeline_layout.set_layouts().get(0).unwrap().clone(),
+            new_rcx
+                .pipeline_layout
+                .set_layouts()
+                .get(0)
+                .unwrap()
+                .clone(),
             [const_set],
             [],
         )
         .unwrap();
         let skybox_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            pipeline_layout.set_layouts().get(2).unwrap().clone(),
+            self.renderer.allocators.descriptor_set.clone(),
+            new_rcx
+                .pipeline_layout
+                .set_layouts()
+                .get(2)
+                .unwrap()
+                .clone(),
             skybox_set.clone(),
             [],
         )
@@ -1629,14 +1489,19 @@ impl ApplicationHandler for App {
 
         // Create descriptor set for the intermediate image (set 5)
         let framebuffer_set = {
-            let layout = pipeline_layout.set_layouts().get(5).unwrap().clone();
+            let layout = new_rcx
+                .pipeline_layout
+                .set_layouts()
+                .get(5)
+                .unwrap()
+                .clone();
             let write_set = WriteDescriptorSet::image_view_sampler(
                 0,
                 intermediate_image_view.clone(),
                 self.samplers.mirror_sampler_mipmap.clone(),
             );
             DescriptorSet::new(
-                self.descriptor_set_allocator.clone(),
+                self.renderer.allocators.descriptor_set.clone(),
                 layout,
                 [write_set],
                 [],
@@ -1645,8 +1510,8 @@ impl ApplicationHandler for App {
         };
 
         let cubemap_pipeline = {
-            let vertex_shader = cubemap_vs::load(self.context.device().clone()).unwrap();
-            let fragment_shader = cubemap_fs::load(self.context.device().clone()).unwrap();
+            let vertex_shader = cubemap_vs::load(self.renderer.context.device().clone()).unwrap();
+            let fragment_shader = cubemap_fs::load(self.renderer.context.device().clone()).unwrap();
 
             let cubemap_layout = {
                 let bindings = [
@@ -1663,13 +1528,13 @@ impl ApplicationHandler for App {
                 ];
 
                 PipelineLayout::new(
-                    self.context.device().clone(),
+                    self.renderer.context.device().clone(),
                     PipelineLayoutCreateInfo {
                         set_layouts: bindings
                             .into_iter()
                             .map(|set| {
                                 DescriptorSetLayout::new(
-                                    self.context.device().clone(),
+                                    self.renderer.context.device().clone(),
                                     DescriptorSetLayoutCreateInfo {
                                         bindings: set
                                             .into_iter()
@@ -1700,7 +1565,7 @@ impl ApplicationHandler for App {
             };
 
             build_cubemap_pipeline(
-                self.context.device(),
+                self.renderer.context.device(),
                 window_renderer.swapchain_format(),
                 &vertex_shader,
                 &fragment_shader,
@@ -1733,17 +1598,17 @@ impl ApplicationHandler for App {
             let index_count = indices.len() as u32;
 
             let vertex_buffer = create_buffer(
-                self.memory_allocator.clone(),
-                self.command_buffer_allocator.clone(),
-                self.context.graphics_queue(),
+                self.renderer.allocators.memory.clone(),
+                self.renderer.allocators.command_buffer.clone(),
+                self.renderer.context.graphics_queue(),
                 BufferUsage::VERTEX_BUFFER,
                 vertices,
             );
 
             let index_buffer = create_buffer(
-                self.memory_allocator.clone(),
-                self.command_buffer_allocator.clone(),
-                self.context.graphics_queue(),
+                self.renderer.allocators.memory.clone(),
+                self.renderer.allocators.command_buffer.clone(),
+                self.renderer.context.graphics_queue(),
                 BufferUsage::INDEX_BUFFER,
                 indices,
             );
@@ -1765,22 +1630,19 @@ impl ApplicationHandler for App {
 
         imgui_platform.attach_window(imgui_io, window_renderer.window(), HiDpiMode::Default);
 
-        let imgui_renderer = Renderer::init(
+        let imgui_renderer = imgui_vulkano_renderer::Renderer::init(
             &mut self.imgui_ctx,
-            self.context.device().clone(),
-            self.context.graphics_queue().clone(),
+            self.renderer.context.device().clone(),
+            self.renderer.context.graphics_queue().clone(),
             window_renderer.swapchain_format(),
             None,
             None,
         )
         .unwrap();
 
+        self.renderer.rcx = Some(new_rcx);
+
         self.rcx = Some(RenderContext {
-            attachment_image_views,
-            depth_image_view,
-            pipeline_layout,
-            vertex_shader,
-            fragment_shader,
             pipelines,
             cubemap_pipeline,
             cubemap_index_buffer,
@@ -1822,9 +1684,10 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let window_renderer = self.windows.get_primary_renderer_mut().unwrap();
+        let window_renderer = self.renderer.windows.get_primary_renderer_mut().unwrap();
 
         let rcx = self.rcx.as_mut().unwrap();
+        let new_rcx = self.renderer.rcx.as_mut().unwrap();
 
         let imgui_io = self.imgui_ctx.io_mut();
         rcx.imgui_platform.handle_event::<()>(
@@ -1902,14 +1765,14 @@ impl ApplicationHandler for App {
                         // on the window size. In this example that
                         // includes the swapchain, the framebuffers
                         // and the dynamic state viewport.
-                        rcx.attachment_image_views = swapchain_images
+                        new_rcx.attachment_image_views = swapchain_images
                             .iter()
                             .map(|image| ImageView::new_default(image.image().clone()).unwrap())
                             .collect();
 
                         let mip_levels = max_mip_levels([window_size.width, window_size.height, 1]);
                         let intermediate_image = Image::new(
-                            self.memory_allocator.clone(),
+                            self.renderer.allocators.memory.clone(),
                             ImageCreateInfo {
                                 image_type: ImageType::Dim2d,
                                 format: swapchain_format,
@@ -1930,14 +1793,19 @@ impl ApplicationHandler for App {
 
                         // Update framebuffer descriptor set with new intermediate image
                         rcx.framebuffer_set = {
-                            let layout = rcx.pipeline_layout.set_layouts().get(5).unwrap().clone();
+                            let layout = new_rcx
+                                .pipeline_layout
+                                .set_layouts()
+                                .get(5)
+                                .unwrap()
+                                .clone();
                             let write_set = WriteDescriptorSet::image_view_sampler(
                                 0,
                                 rcx.intermediate_image_view.clone(),
                                 self.samplers.mirror_sampler_mipmap.clone(),
                             );
                             DescriptorSet::new(
-                                self.descriptor_set_allocator.clone(),
+                                self.renderer.allocators.descriptor_set.clone(),
                                 layout,
                                 [write_set],
                                 [],
@@ -1946,7 +1814,7 @@ impl ApplicationHandler for App {
                         };
 
                         let depth_image = Image::new(
-                            self.memory_allocator.clone(),
+                            self.renderer.allocators.memory.clone(),
                             ImageCreateInfo {
                                 image_type: ImageType::Dim2d,
                                 format: Format::D32_SFLOAT,
@@ -1958,7 +1826,7 @@ impl ApplicationHandler for App {
                         )
                         .expect("Failed to create depth image");
 
-                        rcx.depth_image_view = ImageView::new_default(depth_image)
+                        new_rcx.depth_image_view = ImageView::new_default(depth_image)
                             .expect("Failed to create depth image view");
                         rcx.viewport.extent = window_size.into();
                     })
@@ -1995,8 +1863,8 @@ impl ApplicationHandler for App {
                 // Note that we have to pass a queue family when we create the command buffer. The
                 // command buffer will only be executable on that given queue family.
                 let mut builder = AutoCommandBufferBuilder::primary(
-                    self.command_buffer_allocator.clone(),
-                    self.context.graphics_queue().queue_family_index(),
+                    self.renderer.allocators.command_buffer.clone(),
+                    self.renderer.context.graphics_queue().queue_family_index(),
                     CommandBufferUsage::OneTimeSubmit,
                 )
                 .unwrap();
@@ -2055,13 +1923,23 @@ impl ApplicationHandler for App {
                         u_Camera: position.into(),
                     };
 
-                    let subbuffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+                    let subbuffer = self
+                        .renderer
+                        .allocators
+                        .uniform_buffer
+                        .allocate_sized()
+                        .unwrap();
                     *subbuffer.write().unwrap() = cam_uniform;
                     let write_set = WriteDescriptorSet::buffer(0, subbuffer);
 
                     DescriptorSet::new(
-                        self.descriptor_set_allocator.clone(),
-                        rcx.pipeline_layout.set_layouts().get(1).unwrap().clone(),
+                        self.renderer.allocators.descriptor_set.clone(),
+                        new_rcx
+                            .pipeline_layout
+                            .set_layouts()
+                            .get(1)
+                            .unwrap()
+                            .clone(),
                         [write_set],
                         [],
                     )
@@ -2079,7 +1957,8 @@ impl ApplicationHandler for App {
                             store_op: AttachmentStoreOp::Store,
                             clear_value: Some(ClearValue::Float([1.0, 0.0, 1.0, 1.0])),
                             ..RenderingAttachmentInfo::image_view(
-                                rcx.attachment_image_views[window_renderer.image_index() as usize]
+                                new_rcx.attachment_image_views
+                                    [window_renderer.image_index() as usize]
                                     .clone(),
                             )
                         })],
@@ -2087,7 +1966,7 @@ impl ApplicationHandler for App {
                             load_op: AttachmentLoadOp::Clear,
                             store_op: AttachmentStoreOp::Store,
                             clear_value: Some(1.0f32.into()),
-                            ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
+                            ..RenderingAttachmentInfo::image_view(new_rcx.depth_image_view.clone())
                         }),
                         ..Default::default()
                     })
@@ -2141,7 +2020,7 @@ impl ApplicationHandler for App {
                 builder
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
-                        rcx.pipeline_layout.clone(),
+                        new_rcx.pipeline_layout.clone(),
                         0,
                         rcx.const_set.clone(),
                     )
@@ -2149,7 +2028,7 @@ impl ApplicationHandler for App {
                 builder
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
-                        rcx.pipeline_layout.clone(),
+                        new_rcx.pipeline_layout.clone(),
                         1,
                         cam_set,
                     )
@@ -2157,7 +2036,7 @@ impl ApplicationHandler for App {
                 builder
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
-                        rcx.pipeline_layout.clone(),
+                        new_rcx.pipeline_layout.clone(),
                         2,
                         rcx.skybox_set.clone(),
                     )
@@ -2166,7 +2045,7 @@ impl ApplicationHandler for App {
                 builder
                     .bind_descriptor_sets(
                         PipelineBindPoint::Graphics,
-                        rcx.pipeline_layout.clone(),
+                        new_rcx.pipeline_layout.clone(),
                         5,
                         rcx.framebuffer_set.clone(),
                     )
@@ -2177,7 +2056,7 @@ impl ApplicationHandler for App {
                     for pcx_idx in opaque_objects {
                         rcx.pipelines[pcx_idx].render(
                             &mut builder,
-                            &rcx.pipeline_layout,
+                            &new_rcx.pipeline_layout,
                             &self.prim_infos,
                             &self.scene.objects,
                         );
@@ -2202,7 +2081,7 @@ impl ApplicationHandler for App {
                         builder
                             .bind_descriptor_sets(
                                 PipelineBindPoint::Graphics,
-                                rcx.pipeline_layout.clone(),
+                                new_rcx.pipeline_layout.clone(),
                                 3,
                                 mat_set,
                             )
@@ -2211,7 +2090,7 @@ impl ApplicationHandler for App {
                         builder
                             .bind_descriptor_sets(
                                 PipelineBindPoint::Graphics,
-                                rcx.pipeline_layout.clone(),
+                                new_rcx.pipeline_layout.clone(),
                                 4,
                                 tex_set,
                             )
@@ -2230,7 +2109,7 @@ impl ApplicationHandler for App {
                             u_NormalMatrix: normal.into(),
                         };
                         builder
-                            .push_constants(rcx.pipeline_layout.clone(), 0, data)
+                            .push_constants(new_rcx.pipeline_layout.clone(), 0, data)
                             .unwrap();
                         unsafe {
                             // We add a draw command.
@@ -2253,8 +2132,9 @@ impl ApplicationHandler for App {
 
                 if !transmissive_objects.is_empty() {
                     // Render transmissive geometry
-                    let src_image =
-                        rcx.attachment_image_views[window_renderer.image_index() as usize].image();
+                    let src_image = new_rcx.attachment_image_views
+                        [window_renderer.image_index() as usize]
+                        .image();
                     let dst_image = rcx.intermediate_image_view.image();
                     builder
                         .blit_image(BlitImageInfo::images(src_image.clone(), dst_image.clone()))
@@ -2299,7 +2179,7 @@ impl ApplicationHandler for App {
                                 load_op: AttachmentLoadOp::Load, // Load previous contents
                                 store_op: AttachmentStoreOp::Store,
                                 ..RenderingAttachmentInfo::image_view(
-                                    rcx.attachment_image_views
+                                    new_rcx.attachment_image_views
                                         [window_renderer.image_index() as usize]
                                         .clone(),
                                 )
@@ -2307,7 +2187,9 @@ impl ApplicationHandler for App {
                             depth_attachment: Some(RenderingAttachmentInfo {
                                 load_op: AttachmentLoadOp::Load, // Keep depth buffer
                                 store_op: AttachmentStoreOp::Store,
-                                ..RenderingAttachmentInfo::image_view(rcx.depth_image_view.clone())
+                                ..RenderingAttachmentInfo::image_view(
+                                    new_rcx.depth_image_view.clone(),
+                                )
                             }),
                             ..Default::default()
                         })
@@ -2316,7 +2198,7 @@ impl ApplicationHandler for App {
                     for pcx_idx in transmissive_objects {
                         rcx.pipelines[pcx_idx].render(
                             &mut builder,
-                            &rcx.pipeline_layout,
+                            &new_rcx.pipeline_layout,
                             &self.prim_infos,
                             &self.scene.objects,
                         );
@@ -2774,9 +2656,9 @@ impl ApplicationHandler for App {
                                 .or_default();
                             let (material_set, texture_set) = build_material_texture_sets(
                                 mat,
-                                &self.uniform_buffer_allocator,
-                                &self.descriptor_set_allocator,
-                                &rcx.pipeline_layout,
+                                &self.renderer.allocators.uniform_buffer,
+                                &self.renderer.allocators.descriptor_set,
+                                &new_rcx.pipeline_layout,
                                 &self.textures,
                                 &self.null_texture,
                                 &self.samplers.wrap_sampler_mipmap,
@@ -2791,15 +2673,15 @@ impl ApplicationHandler for App {
                                             material_constants,
                                         };
                                         let pipeline = build_pipeline(
-                                            self.context.device(),
+                                            self.renderer.context.device(),
                                             window_renderer.swapchain_format(),
-                                            &rcx.vertex_shader,
-                                            &rcx.fragment_shader,
+                                            &new_rcx.vertex_shader,
+                                            &new_rcx.fragment_shader,
                                             spec_constants,
                                             mat.double_sided, // TODO: maybe this needs to be a specialization constant
                                                               // TODO: if two materials are the same except for their sidedness,
                                                               // TODO: they still need to be in different pipelines.
-                                            rcx.pipeline_layout.clone(),
+                                            new_rcx.pipeline_layout.clone(),
                                         );
                                         let material_sets = HashMap::new();
                                         let prim_indices = HashSet::new();
@@ -2841,7 +2723,10 @@ impl ApplicationHandler for App {
                 let command_buffer = builder.build().unwrap();
 
                 let future = previous_frame_end
-                    .then_execute(self.context.graphics_queue().clone(), command_buffer)
+                    .then_execute(
+                        self.renderer.context.graphics_queue().clone(),
+                        command_buffer,
+                    )
                     .unwrap()
                     .boxed();
 
@@ -2852,7 +2737,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        let window_renderer = self.windows.get_primary_renderer_mut().unwrap();
+        let window_renderer = self.renderer.windows.get_primary_renderer_mut().unwrap();
         let rcx = self.rcx.as_mut().unwrap();
         rcx.imgui_platform
             .prepare_frame(self.imgui_ctx.io_mut(), window_renderer.window())
