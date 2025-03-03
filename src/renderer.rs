@@ -1,4 +1,5 @@
-use crate::shader::{fs, vs};
+use crate::gltf::CombinedVertex;
+use crate::shader::{fs, vs, MaterialSpecializationConstants, RenderType, SpecializationConstants};
 use std::sync::Arc;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::BufferUsage;
@@ -12,9 +13,23 @@ use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::pipeline::graphics::color_blend::{
+    AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
+    ColorComponents,
+};
+use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
+use vulkano::pipeline::graphics::multisample::MultisampleState;
+use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
+use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
+use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
+use vulkano::pipeline::graphics::viewport::ViewportState;
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
-use vulkano::pipeline::PipelineLayout;
-use vulkano::shader::{DescriptorBindingRequirements, ShaderModule, ShaderStages};
+use vulkano::pipeline::{
+    DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+};
+use vulkano::shader::{DescriptorBindingRequirements, EntryPoint, ShaderModule, ShaderStages};
 use vulkano_util::context::{VulkanoConfig, VulkanoContext};
 use vulkano_util::window::VulkanoWindows;
 use winit::window::WindowId;
@@ -37,8 +52,6 @@ pub struct RendererContext {
     pub attachment_image_views: Vec<Arc<ImageView>>,
     pub depth_image_view: Arc<ImageView>,
     pub pipeline_layout: Arc<PipelineLayout>,
-    pub vertex_shader: Arc<ShaderModule>,
-    pub fragment_shader: Arc<ShaderModule>,
 }
 
 impl Renderer {
@@ -125,6 +138,119 @@ impl Renderer {
         )
         .unwrap()
     }
+
+    pub fn build_pipeline(
+        &self,
+        swapchain_format: Format,
+        layout: Arc<PipelineLayout>,
+        vs: EntryPoint,
+        fs: EntryPoint,
+        is_translucent: bool,
+    ) -> Arc<GraphicsPipeline> {
+        // Automatically generate a vertex input state from the vertex shader's input
+        // interface, that takes a single vertex buffer containing `Vertex` structs.
+        let vertex_input_state = CombinedVertex::per_vertex().definition(&vs).unwrap();
+
+        // Make a list of the shader stages that the pipeline will have.
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs),
+            PipelineShaderStageCreateInfo::new(fs),
+        ];
+
+        // We describe the formats of attachment images where the colors, depth and/or stencil
+        // information will be written. The pipeline will only be usable with this particular
+        // configuration of the attachment images.
+        let subpass = PipelineRenderingCreateInfo {
+            // We specify a single color attachment that will be rendered to. When we begin
+            // rendering, we will specify a swapchain image to be used as this attachment, so
+            // here we set its format to be the same format as the swapchain.
+            color_attachment_formats: vec![Some(swapchain_format)],
+            depth_attachment_format: Some(Format::D32_SFLOAT),
+            ..Default::default()
+        };
+
+        let (depth_stencil_state, color_blend_state) = if is_translucent {
+            let depth_stencil_state = DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: true,
+                    compare_op: CompareOp::LessOrEqual,
+                }),
+                ..Default::default()
+            };
+            let color_blend_state = ColorBlendState::with_attachment_states(
+                1,
+                ColorBlendAttachmentState {
+                    blend: Some(AttachmentBlend {
+                        src_color_blend_factor: BlendFactor::SrcAlpha,
+                        dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
+                        color_blend_op: BlendOp::Add,
+                        src_alpha_blend_factor: BlendFactor::One,
+                        dst_alpha_blend_factor: BlendFactor::OneMinusSrcAlpha,
+                        alpha_blend_op: BlendOp::Add,
+                    }),
+                    color_write_mask: ColorComponents::all(),
+                    color_write_enable: true,
+                },
+            );
+
+            (depth_stencil_state, color_blend_state)
+        } else {
+            let depth_stencil_state = DepthStencilState {
+                depth: Some(DepthState::simple()),
+                ..Default::default()
+            };
+            let color_blend_state = ColorBlendState::with_attachment_states(
+                subpass.color_attachment_formats.len() as u32,
+                ColorBlendAttachmentState::default(),
+            );
+
+            (depth_stencil_state, color_blend_state)
+        };
+
+        let cull_mode = if is_translucent {
+            CullMode::None
+        } else {
+            CullMode::Back
+        };
+
+        // Finally, create the pipeline.
+        GraphicsPipeline::new(
+            self.context.device().clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                // How vertex data is read from the vertex buffers into the vertex shader.
+                vertex_input_state: Some(vertex_input_state),
+                // How vertices are arranged into primitive shapes. The default primitive shape
+                // is a triangle.
+                input_assembly_state: Some(InputAssemblyState::default()),
+                // How primitives are transformed and clipped to fit the framebuffer. We use a
+                // resizable viewport, set to draw over the entire window.
+                viewport_state: Some(ViewportState::default()),
+                // How polygons are culled and converted into a raster of pixels. The default
+                // value does not perform any culling.
+                rasterization_state: Some(RasterizationState {
+                    cull_mode,
+                    ..Default::default()
+                }),
+                // How multiple fragment shader samples are converted to a single pixel value.
+                // The default value does not perform any multisampling.
+                multisample_state: Some(MultisampleState::default()),
+                // How pixel values are combined with the values already present in the
+                // framebuffer. The default value overwrites the old value with the new one,
+                // without any blending.
+                color_blend_state: Some(color_blend_state),
+                depth_stencil_state: Some(depth_stencil_state),
+                // Dynamic states allows us to specify parts of the pipeline settings when
+                // recording the command buffer, before we perform drawing. Here, we specify
+                // that the viewport should be dynamic.
+                dynamic_state: std::iter::once(DynamicState::Viewport).collect(),
+                subpass: Some(subpass.into()),
+                ..GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )
+        .unwrap()
+    }
 }
 
 impl Allocators {
@@ -207,16 +333,10 @@ impl RendererContext {
             size_of::<fs::Object>() as u32,
         );
 
-        let vertex_shader = vs::load(renderer.context.device().clone()).unwrap();
-
-        let fragment_shader = fs::load(renderer.context.device().clone()).unwrap();
-
         Self {
             attachment_image_views,
             depth_image_view,
             pipeline_layout,
-            vertex_shader,
-            fragment_shader,
         }
     }
 }

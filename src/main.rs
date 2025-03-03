@@ -17,7 +17,7 @@ use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, Object, Scene,
 use crate::material::{AlphaMode, Material};
 use crate::renderer::{Renderer, RendererContext};
 use crate::shader::{
-    cubemap_fs, cubemap_vs, fs, MaterialSpecializationConstants, ObjectSpecializationConstants,
+    cubemap_fs, cubemap_vs, fs, vs, MaterialSpecializationConstants, ObjectSpecializationConstants,
     RenderType, SpecializationConstants,
 };
 use c_str_macro::c_str;
@@ -59,9 +59,6 @@ use vulkano::image::{
     ImageSubresourceLayers, ImageType,
 };
 use vulkano::padded::Padded;
-use vulkano::pipeline::graphics::color_blend::{
-    AttachmentBlend, BlendFactor, BlendOp, ColorComponents,
-};
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::CullMode;
 use vulkano::pipeline::layout::PipelineLayoutCreateInfo;
@@ -856,138 +853,6 @@ impl Default for InputState {
     }
 }
 
-fn build_pipeline(
-    device: &Arc<Device>,
-    swapchain_format: Format,
-    vert: &Arc<ShaderModule>,
-    frag: &Arc<ShaderModule>,
-    specialization_constants: SpecializationConstants,
-    double_sided: bool,
-    layout: Arc<PipelineLayout>,
-) -> Arc<GraphicsPipeline> {
-    // First, we load the shaders that the pipeline will use: the vertex shader and the
-    // fragment shader.
-    //
-    // A Vulkan shader can in theory contain multiple entry points, so we have to specify
-    // which one.
-
-    let constants: Vec<_> = specialization_constants.into();
-
-    let vs = vert
-        .specialize(constants.clone().into_iter().collect())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let fs = frag
-        .specialize(constants.into_iter().collect())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-
-    // Automatically generate a vertex input state from the vertex shader's input
-    // interface, that takes a single vertex buffer containing `Vertex` structs.
-    let vertex_input_state = CombinedVertex::per_vertex().definition(&vs).unwrap();
-
-    // Make a list of the shader stages that the pipeline will have.
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-
-    // We describe the formats of attachment images where the colors, depth and/or stencil
-    // information will be written. The pipeline will only be usable with this particular
-    // configuration of the attachment images.
-    let subpass = PipelineRenderingCreateInfo {
-        // We specify a single color attachment that will be rendered to. When we begin
-        // rendering, we will specify a swapchain image to be used as this attachment, so
-        // here we set its format to be the same format as the swapchain.
-        color_attachment_formats: vec![Some(swapchain_format)],
-        depth_attachment_format: Some(Format::D32_SFLOAT),
-        ..Default::default()
-    };
-
-    let (depth_stencil_state, color_blend_state) =
-        if specialization_constants.material_constants.render_type() == RenderType::Translucent {
-            let depth_stencil_state = DepthStencilState {
-                depth: Some(DepthState {
-                    write_enable: true,
-                    compare_op: CompareOp::LessOrEqual,
-                }),
-                ..Default::default()
-            };
-            let color_blend_state = ColorBlendState::with_attachment_states(
-                1,
-                ColorBlendAttachmentState {
-                    blend: Some(AttachmentBlend {
-                        src_color_blend_factor: BlendFactor::SrcAlpha,
-                        dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
-                        color_blend_op: BlendOp::Add,
-                        src_alpha_blend_factor: BlendFactor::One,
-                        dst_alpha_blend_factor: BlendFactor::OneMinusSrcAlpha,
-                        alpha_blend_op: BlendOp::Add,
-                    }),
-                    color_write_mask: ColorComponents::all(),
-                    color_write_enable: true,
-                },
-            );
-
-            (depth_stencil_state, color_blend_state)
-        } else {
-            let depth_stencil_state = DepthStencilState {
-                depth: Some(DepthState::simple()),
-                ..Default::default()
-            };
-            let color_blend_state = ColorBlendState::with_attachment_states(
-                subpass.color_attachment_formats.len() as u32,
-                ColorBlendAttachmentState::default(),
-            );
-
-            (depth_stencil_state, color_blend_state)
-        };
-
-    // Finally, create the pipeline.
-    GraphicsPipeline::new(
-        device.clone(),
-        None,
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            // How vertex data is read from the vertex buffers into the vertex shader.
-            vertex_input_state: Some(vertex_input_state),
-            // How vertices are arranged into primitive shapes. The default primitive shape
-            // is a triangle.
-            input_assembly_state: Some(InputAssemblyState::default()),
-            // How primitives are transformed and clipped to fit the framebuffer. We use a
-            // resizable viewport, set to draw over the entire window.
-            viewport_state: Some(ViewportState::default()),
-            // How polygons are culled and converted into a raster of pixels. The default
-            // value does not perform any culling.
-            rasterization_state: Some(RasterizationState {
-                cull_mode: if double_sided {
-                    CullMode::None
-                } else {
-                    CullMode::Back
-                },
-                ..Default::default()
-            }),
-            // How multiple fragment shader samples are converted to a single pixel value.
-            // The default value does not perform any multisampling.
-            multisample_state: Some(MultisampleState::default()),
-            // How pixel values are combined with the values already present in the
-            // framebuffer. The default value overwrites the old value with the new one,
-            // without any blending.
-            color_blend_state: Some(color_blend_state),
-            depth_stencil_state: Some(depth_stencil_state),
-            // Dynamic states allows us to specify parts of the pipeline settings when
-            // recording the command buffer, before we perform drawing. Here, we specify
-            // that the viewport should be dynamic.
-            dynamic_state: std::iter::once(DynamicState::Viewport).collect(),
-            subpass: Some(subpass.into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
 fn build_cubemap_pipeline(
     device: &Arc<Device>,
     swapchain_format: Format,
@@ -1289,6 +1154,21 @@ impl ApplicationHandler for App {
 
         let window_size = window_renderer.window().inner_size();
 
+        let mut imgui_platform = WinitPlatform::new(&mut self.imgui_ctx);
+        let imgui_io = self.imgui_ctx.io_mut();
+
+        imgui_platform.attach_window(imgui_io, window_renderer.window(), HiDpiMode::Default);
+
+        let imgui_renderer = imgui_vulkano_renderer::Renderer::init(
+            &mut self.imgui_ctx,
+            self.renderer.context.device().clone(),
+            self.renderer.context.graphics_queue().clone(),
+            window_renderer.swapchain_format(),
+            None,
+            None,
+        )
+        .unwrap();
+
         let mip_levels = max_mip_levels([window_size.width, window_size.height, 1]);
         let intermediate_image = Image::new(
             self.renderer.allocators.memory.clone(),
@@ -1391,6 +1271,11 @@ impl ApplicationHandler for App {
             })
         };
 
+        let swapchain_format = window_renderer.swapchain_format();
+
+        let vertex_shader = vs::load(self.renderer.context.device().clone()).unwrap();
+        let fragment_shader = fs::load(self.renderer.context.device().clone()).unwrap();
+
         let (pipelines, pipeline_map) = {
             let mut pipelines = Vec::new();
             let mut pipeline_map = HashMap::<
@@ -1424,14 +1309,23 @@ impl ApplicationHandler for App {
                                     object_constants: prim.spec_const,
                                     material_constants: mat_const,
                                 };
-                                let pipeline = build_pipeline(
-                                    self.renderer.context.device(),
-                                    window_renderer.swapchain_format(),
-                                    &new_rcx.vertex_shader,
-                                    &new_rcx.fragment_shader,
-                                    spec_constants,
-                                    mat.double_sided,
+                                let constants: Vec<_> = spec_constants.into();
+                                let vs = vertex_shader
+                                    .specialize(constants.clone().into_iter().collect())
+                                    .unwrap()
+                                    .entry_point("main")
+                                    .unwrap();
+                                let fs = fragment_shader
+                                    .specialize(constants.clone().into_iter().collect())
+                                    .unwrap()
+                                    .entry_point("main")
+                                    .unwrap();
+                                let pipeline = self.renderer.build_pipeline(
+                                    swapchain_format,
                                     new_rcx.pipeline_layout.clone(),
+                                    vs,
+                                    fs,
+                                    mat_const.render_type() == RenderType::Translucent,
                                 );
 
                                 let material_sets = HashMap::new();
@@ -1510,9 +1404,6 @@ impl ApplicationHandler for App {
         };
 
         let cubemap_pipeline = {
-            let vertex_shader = cubemap_vs::load(self.renderer.context.device().clone()).unwrap();
-            let fragment_shader = cubemap_fs::load(self.renderer.context.device().clone()).unwrap();
-
             let cubemap_layout = {
                 let bindings = [
                     // set = 0
@@ -1563,14 +1454,17 @@ impl ApplicationHandler for App {
                 )
                 .unwrap()
             };
+            let vs = cubemap_vs::load(self.renderer.context.device().clone())
+                .unwrap()
+                .entry_point("main")
+                .unwrap();
+            let fs = cubemap_fs::load(self.renderer.context.device().clone())
+                .unwrap()
+                .entry_point("main")
+                .unwrap();
 
-            build_cubemap_pipeline(
-                self.renderer.context.device(),
-                window_renderer.swapchain_format(),
-                &vertex_shader,
-                &fragment_shader,
-                cubemap_layout,
-            )
+            self.renderer
+                .build_pipeline(swapchain_format, cubemap_layout, vs, fs, false)
         };
 
         let (cubemap_vertex_buffer, cubemap_index_buffer, cubemap_index_count) = {
@@ -1624,21 +1518,6 @@ impl ApplicationHandler for App {
                 println!("\t {}) {}", idx + 1, k);
             }
         }
-
-        let mut imgui_platform = WinitPlatform::new(&mut self.imgui_ctx);
-        let imgui_io = self.imgui_ctx.io_mut();
-
-        imgui_platform.attach_window(imgui_io, window_renderer.window(), HiDpiMode::Default);
-
-        let imgui_renderer = imgui_vulkano_renderer::Renderer::init(
-            &mut self.imgui_ctx,
-            self.renderer.context.device().clone(),
-            self.renderer.context.graphics_queue().clone(),
-            window_renderer.swapchain_format(),
-            None,
-            None,
-        )
-        .unwrap();
 
         self.renderer.rcx = Some(new_rcx);
 
@@ -2460,9 +2339,10 @@ impl ApplicationHandler for App {
                 }
 
                 if let Some(mat_idx) = self.scene.selected_material {
-                    ui.window("Material").build(|| {
-                        let mat = &mut self.materials[mat_idx];
-                        let old_mat_cons: MaterialSpecializationConstants = (&*mat).into();
+                    let mat = &mut self.materials[mat_idx];
+                    let old_mat_cons: MaterialSpecializationConstants = (&*mat).into();
+
+                    let changed = ui.window("Material").build(|| {
                         let mut name = mat.name.clone().unwrap_or_default();
                         if ui.input_text("Name", &mut name)
                             .build() {
@@ -2510,9 +2390,9 @@ impl ApplicationHandler for App {
                             ui,
                             |spec_gloss| {
                                 ui.color_edit4("Diffuse Factor", &mut spec_gloss.diffuse_factor) |
-                                // TODO: diffuse_texture
-                                ui.color_edit3("Specular Factor", &mut spec_gloss.specular_factor) |
-                                ui.slider("Glossiness Factor", 0.0, 1.0, &mut spec_gloss.glossiness_factor)
+                                    // TODO: diffuse_texture
+                                    ui.color_edit3("Specular Factor", &mut spec_gloss.specular_factor) |
+                                    ui.slider("Glossiness Factor", 0.0, 1.0, &mut spec_gloss.glossiness_factor)
                             }
                         );
 
@@ -2522,7 +2402,7 @@ impl ApplicationHandler for App {
                             ui,
                             |anisotropy| {
                                 ui.slider("Anisotropy Strength", 0.0, 1.0, &mut anisotropy.strength) |
-                                ui.slider("Anisotropy Rotation", 0.0, 2. * PI, &mut anisotropy.rotation)
+                                    ui.slider("Anisotropy Rotation", 0.0, 2. * PI, &mut anisotropy.rotation)
                             }
                         );
 
@@ -2532,8 +2412,8 @@ impl ApplicationHandler for App {
                             ui,
                             |clearcoat| {
                                 ui.slider("Clearcoat Factor", 0.0, 1.0, &mut clearcoat.factor) |
-                                // TODO: texture
-                                ui.slider("Clearcoat Roughness factor", 0.0, 1.0, &mut clearcoat.roughness_factor)
+                                    // TODO: texture
+                                    ui.slider("Clearcoat Roughness factor", 0.0, 1.0, &mut clearcoat.roughness_factor)
                                 // TODO: roughness_texture
                                 // TODO: normal_texture
                             }
@@ -2545,8 +2425,8 @@ impl ApplicationHandler for App {
                             ui,
                             |diffuse_transmission| {
                                 ui.slider("Diffuse Transmission Factor", 0.0, 1.0, &mut diffuse_transmission.factor) |
-                                // TODO: texture
-                                ui.color_edit3("Diffuse Transmission Color Factor", &mut diffuse_transmission.color_factor)
+                                    // TODO: texture
+                                    ui.color_edit3("Diffuse Transmission Color Factor", &mut diffuse_transmission.color_factor)
                                 // TODO: color_texture
                             }
                         );
@@ -2584,9 +2464,9 @@ impl ApplicationHandler for App {
                             ui,
                             |iridescence| {
                                 ui.slider("Iridescence Factor", 0.0, 1.0, &mut iridescence.factor) |
-                                // TODO: texture
-                                gui::drag_float(&mut iridescence.thickness_minimum, 0.0, f32::infinity(), "Thickness Minimum", "%0.1f") |
-                                gui::drag_float(&mut iridescence.thickness_maximum, 0.0, f32::infinity(), "Thickness Maximum", "%0.1f")
+                                    // TODO: texture
+                                    gui::drag_float(&mut iridescence.thickness_minimum, 0.0, f32::infinity(), "Thickness Minimum", "%0.1f") |
+                                    gui::drag_float(&mut iridescence.thickness_maximum, 0.0, f32::infinity(), "Thickness Maximum", "%0.1f")
                                 // TODO: thickness texture
                             }
                         );
@@ -2597,8 +2477,8 @@ impl ApplicationHandler for App {
                             ui,
                             |sheen| {
                                 ui.color_edit3("Sheen Color Factor", &mut sheen.color_factor) |
-                                // TODO: color texture
-                                ui.slider("Sheen Roughness Factor", 0.0, 1.0, &mut sheen.roughness_factor)
+                                    // TODO: color texture
+                                    ui.slider("Sheen Roughness Factor", 0.0, 1.0, &mut sheen.roughness_factor)
                                 // TODO: roughness texture
                             }
                         );
@@ -2609,8 +2489,8 @@ impl ApplicationHandler for App {
                             ui,
                             |specular| {
                                 ui.slider("Specular Factor", 0.0, 1.0, &mut specular.factor) |
-                                // TODO: texture
-                                ui.color_edit3("Specular Color Factor", &mut specular.color_factor)
+                                    // TODO: texture
+                                    ui.color_edit3("Specular Color Factor", &mut specular.color_factor)
                                 // TODO: color texture
                             }
                         );
@@ -2630,82 +2510,94 @@ impl ApplicationHandler for App {
                             ui,
                             |volume| {
                                 gui::drag_float(&mut volume.thickness_factor, 0.0, f32::infinity(), "Thickness Factor", "%0.2f") |
-                                // TODO: thickness_texture
-                                gui::drag_float(&mut volume.attenuation_distance, 0.0, f32::infinity(), "Attenuation Distance", "%0.2f") |
-                                ui.color_edit3("Attenuation Color", &mut volume.attenuation_color)
+                                    // TODO: thickness_texture
+                                    gui::drag_float(&mut volume.attenuation_distance, 0.0, f32::infinity(), "Attenuation Distance", "%0.2f") |
+                                    ui.color_edit3("Attenuation Color", &mut volume.attenuation_color)
                             }
                         );
 
-                        if changed {
-                            // TODO: as an optimization, check if the new spec constants differ from the old ones. If they don't, the pipeline
-                            // doesn't need to change, only the material sets.
-                            let material_constants: MaterialSpecializationConstants = (&*mat).into();
-                            // Material might have changed its specialization constants, meaning it needs to get rendered by a different pipeline.
-                            // First, remove the material's descriptor sets from its current pipeline, and remove any primitve that uses this mat
-                            // from the pipeline's primitives list.
-                            // TODO: maybe delete the pipeline if the primitive list becomes empty, although this might not be worth it
-                            for &pcx_idx in rcx.pipeline_map[&old_mat_cons].values() {
-                                let pcx = &mut rcx.pipelines[pcx_idx];
-                                pcx.material_sets.remove(&mat_idx);
-                                pcx.prim_indices.retain(|idx| !self.mat_prims[mat_idx].contains(idx));
-                            }
-                            // Once the material's old pipeline bindings have been removed, determine which pipeline it now belongs to after the change,
-                            // or create a new one if none exists.
-                            let pipeline_map = rcx.pipeline_map
-                                .entry(material_constants)
-                                .or_default();
-                            let (material_set, texture_set) = build_material_texture_sets(
-                                mat,
-                                &self.renderer.allocators.uniform_buffer,
-                                &self.renderer.allocators.descriptor_set,
-                                &new_rcx.pipeline_layout,
-                                &self.textures,
-                                &self.null_texture,
-                                &self.samplers.wrap_sampler_mipmap,
-                            );
-                            for prim_idx in self.mat_prims[mat_idx].iter().copied() {
-                                let prim = &self.prim_infos[prim_idx];
-                                let pcx_idx = *pipeline_map
-                                    .entry(prim.spec_const)
-                                    .or_insert_with(|| {
-                                        let spec_constants = SpecializationConstants {
-                                            object_constants: prim.spec_const,
-                                            material_constants,
-                                        };
-                                        let pipeline = build_pipeline(
-                                            self.renderer.context.device(),
-                                            window_renderer.swapchain_format(),
-                                            &new_rcx.vertex_shader,
-                                            &new_rcx.fragment_shader,
-                                            spec_constants,
-                                            mat.double_sided, // TODO: maybe this needs to be a specialization constant
-                                                              // TODO: if two materials are the same except for their sidedness,
-                                                              // TODO: they still need to be in different pipelines.
-                                            new_rcx.pipeline_layout.clone(),
-                                        );
-                                        let material_sets = HashMap::new();
-                                        let prim_indices = HashSet::new();
-                                        let pipeline = PipelineContext {
-                                            pipeline,
-                                            material_sets,
-                                            prim_indices,
-                                        };
-                                        let pcx_idx = rcx.pipelines.len();
-                                        rcx.pipelines.push(pipeline);
-
-                                        pcx_idx
-                                    });
-                                rcx.pipelines[pcx_idx].prim_indices.insert(prim_idx);
-
-                                rcx.pipelines[pcx_idx]
-                                    .material_sets
-                                    .entry(mat_idx)
-                                    .or_insert_with(|| (material_set.clone(), texture_set.clone()));
-                            }
-                        }
+                        changed
                     });
+
+                    let pipeline_layout = new_rcx.pipeline_layout.clone();
+
+                    if let Some(true) = changed {
+                        // TODO: as an optimization, check if the new spec constants differ from the old ones. If they don't, the pipeline
+                        // doesn't need to change, only the material sets.
+                        let material_constants: MaterialSpecializationConstants = (&*mat).into();
+                        // Material might have changed its specialization constants, meaning it needs to get rendered by a different pipeline.
+                        // First, remove the material's descriptor sets from its current pipeline, and remove any primitve that uses this mat
+                        // from the pipeline's primitives list.
+                        // TODO: maybe delete the pipeline if the primitive list becomes empty, although this might not be worth it
+                        for &pcx_idx in rcx.pipeline_map[&old_mat_cons].values() {
+                            let pcx = &mut rcx.pipelines[pcx_idx];
+                            pcx.material_sets.remove(&mat_idx);
+                            pcx.prim_indices
+                                .retain(|idx| !self.mat_prims[mat_idx].contains(idx));
+                        }
+                        // Once the material's old pipeline bindings have been removed, determine which pipeline it now belongs to after the change,
+                        // or create a new one if none exists.
+                        let pipeline_map = rcx.pipeline_map.entry(material_constants).or_default();
+                        let (material_set, texture_set) = build_material_texture_sets(
+                            mat,
+                            &self.renderer.allocators.uniform_buffer,
+                            &self.renderer.allocators.descriptor_set,
+                            &new_rcx.pipeline_layout,
+                            &self.textures,
+                            &self.null_texture,
+                            &self.samplers.wrap_sampler_mipmap,
+                        );
+                        for prim_idx in self.mat_prims[mat_idx].iter().copied() {
+                            let prim = &self.prim_infos[prim_idx];
+                            let pcx_idx =
+                                *pipeline_map.entry(prim.spec_const).or_insert_with(|| {
+                                    let spec_constants = SpecializationConstants {
+                                        object_constants: prim.spec_const,
+                                        material_constants,
+                                    };
+                                    let constants: Vec<_> = spec_constants.into();
+                                    let vs = vs::load(self.renderer.context.device().clone())
+                                        .unwrap()
+                                        .specialize(constants.clone().into_iter().collect())
+                                        .unwrap()
+                                        .entry_point("main")
+                                        .unwrap();
+                                    let fs = fs::load(self.renderer.context.device().clone())
+                                        .unwrap()
+                                        .specialize(constants.clone().into_iter().collect())
+                                        .unwrap()
+                                        .entry_point("main")
+                                        .unwrap();
+                                    let pipeline = self.renderer.build_pipeline(
+                                        swapchain_format,
+                                        pipeline_layout.clone(),
+                                        vs,
+                                        fs,
+                                        material_constants.render_type() == RenderType::Translucent,
+                                    );
+                                    let material_sets = HashMap::new();
+                                    let prim_indices = HashSet::new();
+                                    let pipeline = PipelineContext {
+                                        pipeline,
+                                        material_sets,
+                                        prim_indices,
+                                    };
+                                    let pcx_idx = rcx.pipelines.len();
+                                    rcx.pipelines.push(pipeline);
+
+                                    pcx_idx
+                                });
+                            rcx.pipelines[pcx_idx].prim_indices.insert(prim_idx);
+
+                            rcx.pipelines[pcx_idx]
+                                .material_sets
+                                .entry(mat_idx)
+                                .or_insert_with(|| (material_set.clone(), texture_set.clone()));
+                        }
+                    }
                 }
 
+                let window_renderer = self.renderer.windows.get_primary_renderer_mut().unwrap();
                 rcx.imgui_platform
                     .prepare_render(ui, window_renderer.window());
 

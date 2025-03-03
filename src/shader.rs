@@ -273,6 +273,7 @@ pub struct ObjectSpecializationConstants {
 #[allow(non_snake_case)]
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct MaterialSpecializationConstants {
+    pub DOUBLE_SIDED: bool,
     pub ALPHAMODE_OPAQUE: bool,
     pub ALPHAMODE_MASK: bool,
     pub ALPHAMODE_BLEND: bool,
@@ -758,6 +759,7 @@ impl From<&Material> for MaterialSpecializationConstants {
         let MATERIAL_METALLICROUGHNESS = !MATERIAL_SPECULARGLOSSINESS;
 
         Self {
+            DOUBLE_SIDED: mat.double_sided,
             ALPHAMODE_OPAQUE: mat.alpha_mode == AlphaMode::Opaque,
             ALPHAMODE_MASK: mat.alpha_mode == AlphaMode::Mask,
             ALPHAMODE_BLEND: mat.alpha_mode == AlphaMode::Blend,
