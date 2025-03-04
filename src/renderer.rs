@@ -139,17 +139,19 @@ impl Renderer {
         .unwrap()
     }
 
-    pub fn build_pipeline(
+    pub fn build_pipeline<V: Vertex>(
         &self,
         swapchain_format: Format,
         layout: Arc<PipelineLayout>,
         vs: EntryPoint,
         fs: EntryPoint,
-        is_translucent: bool,
+        color_blend_state: ColorBlendState,
+        depth_stencil_state: DepthStencilState,
+        cull_mode: CullMode,
     ) -> Arc<GraphicsPipeline> {
         // Automatically generate a vertex input state from the vertex shader's input
         // interface, that takes a single vertex buffer containing `Vertex` structs.
-        let vertex_input_state = CombinedVertex::per_vertex().definition(&vs).unwrap();
+        let vertex_input_state = V::per_vertex().definition(&vs).unwrap();
 
         // Make a list of the shader stages that the pipeline will have.
         let stages = [
@@ -167,50 +169,6 @@ impl Renderer {
             color_attachment_formats: vec![Some(swapchain_format)],
             depth_attachment_format: Some(Format::D32_SFLOAT),
             ..Default::default()
-        };
-
-        let (depth_stencil_state, color_blend_state) = if is_translucent {
-            let depth_stencil_state = DepthStencilState {
-                depth: Some(DepthState {
-                    write_enable: true,
-                    compare_op: CompareOp::LessOrEqual,
-                }),
-                ..Default::default()
-            };
-            let color_blend_state = ColorBlendState::with_attachment_states(
-                1,
-                ColorBlendAttachmentState {
-                    blend: Some(AttachmentBlend {
-                        src_color_blend_factor: BlendFactor::SrcAlpha,
-                        dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
-                        color_blend_op: BlendOp::Add,
-                        src_alpha_blend_factor: BlendFactor::One,
-                        dst_alpha_blend_factor: BlendFactor::OneMinusSrcAlpha,
-                        alpha_blend_op: BlendOp::Add,
-                    }),
-                    color_write_mask: ColorComponents::all(),
-                    color_write_enable: true,
-                },
-            );
-
-            (depth_stencil_state, color_blend_state)
-        } else {
-            let depth_stencil_state = DepthStencilState {
-                depth: Some(DepthState::simple()),
-                ..Default::default()
-            };
-            let color_blend_state = ColorBlendState::with_attachment_states(
-                subpass.color_attachment_formats.len() as u32,
-                ColorBlendAttachmentState::default(),
-            );
-
-            (depth_stencil_state, color_blend_state)
-        };
-
-        let cull_mode = if is_translucent {
-            CullMode::None
-        } else {
-            CullMode::Back
         };
 
         // Finally, create the pipeline.

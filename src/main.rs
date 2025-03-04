@@ -59,6 +59,9 @@ use vulkano::image::{
     ImageSubresourceLayers, ImageType,
 };
 use vulkano::padded::Padded;
+use vulkano::pipeline::graphics::color_blend::{
+    AttachmentBlend, BlendFactor, BlendOp, ColorComponents,
+};
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::rasterization::CullMode;
 use vulkano::pipeline::layout::PipelineLayoutCreateInfo;
@@ -1298,16 +1301,16 @@ impl ApplicationHandler for App {
                     );
 
                     for prim_idx in mat_prim_map[mat_idx].iter().copied() {
-                        let mat_const = mat.into();
+                        let material_constants = mat.into();
                         let prim = &self.prim_infos[prim_idx];
                         let pcx_idx = *pipeline_map
-                            .entry(mat_const)
+                            .entry(material_constants)
                             .or_default()
                             .entry(prim.spec_const)
                             .or_insert_with(|| {
                                 let spec_constants = SpecializationConstants {
                                     object_constants: prim.spec_const,
-                                    material_constants: mat_const,
+                                    material_constants,
                                 };
                                 let constants: Vec<_> = spec_constants.into();
                                 let vs = vertex_shader
@@ -1320,12 +1323,44 @@ impl ApplicationHandler for App {
                                     .unwrap()
                                     .entry_point("main")
                                     .unwrap();
-                                let pipeline = self.renderer.build_pipeline(
+                                let (color_blend_state, depth_stencil_state, cull_mode) =
+                                    if material_constants.render_type() == RenderType::Translucent {
+                                        let color_blend_state =
+                                            ColorBlendState::with_attachment_states(
+                                                1,
+                                                ColorBlendAttachmentState {
+                                                    blend: Some(AttachmentBlend::alpha()),
+                                                    color_write_mask: ColorComponents::all(),
+                                                    color_write_enable: true,
+                                                },
+                                            );
+                                        let depth_stencil_state = DepthStencilState {
+                                            depth: Some(DepthState::default()),
+                                            ..Default::default()
+                                        };
+
+                                        (color_blend_state, depth_stencil_state, CullMode::None)
+                                    } else {
+                                        let color_blend_state =
+                                            ColorBlendState::with_attachment_states(
+                                                1,
+                                                ColorBlendAttachmentState::default(),
+                                            );
+                                        let depth_stencil_state = DepthStencilState {
+                                            depth: Some(DepthState::simple()),
+                                            ..Default::default()
+                                        };
+
+                                        (color_blend_state, depth_stencil_state, CullMode::Back)
+                                    };
+                                let pipeline = self.renderer.build_pipeline::<CombinedVertex>(
                                     swapchain_format,
                                     new_rcx.pipeline_layout.clone(),
                                     vs,
                                     fs,
-                                    mat_const.render_type() == RenderType::Translucent,
+                                    color_blend_state,
+                                    depth_stencil_state,
+                                    cull_mode,
                                 );
 
                                 let material_sets = HashMap::new();
@@ -1463,8 +1498,18 @@ impl ApplicationHandler for App {
                 .entry_point("main")
                 .unwrap();
 
-            self.renderer
-                .build_pipeline(swapchain_format, cubemap_layout, vs, fs, false)
+            let color_blend_state = ColorBlendState::with_attachment_states(1, Default::default());
+            let depth_stencil_state = DepthStencilState::default();
+
+            self.renderer.build_pipeline::<CubemapVertex>(
+                swapchain_format,
+                cubemap_layout,
+                vs,
+                fs,
+                color_blend_state,
+                depth_stencil_state,
+                CullMode::None,
+            )
         };
 
         let (cubemap_vertex_buffer, cubemap_index_buffer, cubemap_index_count) = {
@@ -2568,12 +2613,48 @@ impl ApplicationHandler for App {
                                         .unwrap()
                                         .entry_point("main")
                                         .unwrap();
-                                    let pipeline = self.renderer.build_pipeline(
+
+                                    let (color_blend_state, depth_stencil_state, cull_mode) =
+                                        if material_constants.render_type()
+                                            == RenderType::Translucent
+                                        {
+                                            let color_blend_state =
+                                                ColorBlendState::with_attachment_states(
+                                                    1,
+                                                    ColorBlendAttachmentState {
+                                                        blend: Some(AttachmentBlend::alpha()),
+                                                        color_write_mask: ColorComponents::all(),
+                                                        color_write_enable: true,
+                                                    },
+                                                );
+                                            let depth_stencil_state = DepthStencilState {
+                                                depth: Some(DepthState::default()),
+                                                ..Default::default()
+                                            };
+
+                                            (color_blend_state, depth_stencil_state, CullMode::None)
+                                        } else {
+                                            let color_blend_state =
+                                                ColorBlendState::with_attachment_states(
+                                                    1,
+                                                    ColorBlendAttachmentState::default(),
+                                                );
+                                            let depth_stencil_state = DepthStencilState {
+                                                depth: Some(DepthState::simple()),
+                                                ..Default::default()
+                                            };
+
+                                            (color_blend_state, depth_stencil_state, CullMode::Back)
+                                        };
+
+                                    let pipeline = self.renderer.build_pipeline::<CombinedVertex>(
                                         swapchain_format,
                                         pipeline_layout.clone(),
                                         vs,
                                         fs,
-                                        material_constants.render_type() == RenderType::Translucent,
+                                        color_blend_state,
+                                        depth_stencil_state,
+                                        cull_mode,
                                     );
                                     let material_sets = HashMap::new();
                                     let prim_indices = HashSet::new();
