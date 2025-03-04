@@ -166,13 +166,10 @@ struct InputState {
 }
 
 struct RenderContext {
-    pipelines: Vec<PipelineContext>,
     cubemap_pipeline: Arc<GraphicsPipeline>,
     cubemap_index_buffer: Subbuffer<[u32]>,
     cubemap_vertex_buffer: Subbuffer<[CubemapVertex]>,
     cubemap_index_count: u32,
-    pipeline_map:
-        HashMap<MaterialSpecializationConstants, HashMap<ObjectSpecializationConstants, usize>>,
     intermediate_image_view: Arc<ImageView>,
     const_set: Arc<DescriptorSet>,
     skybox_set: Arc<DescriptorSet>,
@@ -1055,80 +1052,6 @@ fn build_material_texture_sets(
     (material_set, texture_set)
 }
 
-struct PipelineContext {
-    pipeline: Arc<GraphicsPipeline>,
-    material_sets: HashMap<usize, (Arc<DescriptorSet>, Arc<DescriptorSet>)>,
-    prim_indices: HashSet<usize>,
-}
-
-impl PipelineContext {
-    pub fn render(
-        &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        pipeline_layout: &Arc<PipelineLayout>,
-        primitives: &[PrimitiveDrawInfo],
-        objects: &[Object],
-    ) {
-        builder
-            .bind_pipeline_graphics(self.pipeline.clone())
-            .unwrap();
-
-        for prim_idx in self.prim_indices.iter().copied() {
-            let prim = &primitives[prim_idx];
-            let (mat_set, tex_set) = self.material_sets[&prim.mat_idx].clone();
-            builder
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    pipeline_layout.clone(),
-                    3,
-                    mat_set,
-                )
-                .unwrap();
-
-            builder
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    pipeline_layout.clone(),
-                    4,
-                    tex_set,
-                )
-                .unwrap();
-
-            for object in prim.object_ids.iter().filter_map(|idx| {
-                let object = &objects[*idx];
-                object.enabled.then_some(object)
-            }) {
-                let transform = object.transform;
-                let normal = transform
-                    .transpose()
-                    .invert()
-                    .unwrap_or_else(Matrix4::identity);
-                let model: [[f32; 4]; 4] = transform.into();
-                #[allow(clippy::useless_conversion)]
-                let data = fs::Object {
-                    u_ModelMatrix: model.into(),
-                    u_NormalMatrix: normal.into(),
-                };
-                builder
-                    .push_constants(pipeline_layout.clone(), 0, data)
-                    .unwrap();
-
-                unsafe {
-                    // We add a draw command.
-                    builder.draw_indexed(
-                        prim.index_count,
-                        1,
-                        prim.index_offset,
-                        prim.vertex_offset,
-                        0,
-                    )
-                }
-                .unwrap();
-            }
-        }
-    }
-}
-
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(primary_window_id) = self.renderer.windows.primary_window_id() {
@@ -1279,116 +1202,37 @@ impl ApplicationHandler for App {
         let vertex_shader = vs::load(self.renderer.context.device().clone()).unwrap();
         let fragment_shader = fs::load(self.renderer.context.device().clone()).unwrap();
 
-        let (pipelines, pipeline_map) = {
-            let mut pipelines = Vec::new();
-            let mut pipeline_map = HashMap::<
-                MaterialSpecializationConstants,
-                HashMap<ObjectSpecializationConstants, usize>,
-            >::new();
+        self.materials
+            .iter()
+            .enumerate()
+            .for_each(|(mat_idx, mat)| {
+                let (material_set, texture_set) = build_material_texture_sets(
+                    mat,
+                    &self.renderer.allocators.uniform_buffer,
+                    &self.renderer.allocators.descriptor_set,
+                    &new_rcx.pipeline_layout,
+                    &self.textures,
+                    &self.null_texture,
+                    &self.samplers.wrap_sampler_mipmap,
+                );
 
-            self.materials
-                .iter()
-                .enumerate()
-                .for_each(|(mat_idx, mat)| {
-                    let (material_set, texture_set) = build_material_texture_sets(
-                        mat,
-                        &self.renderer.allocators.uniform_buffer,
-                        &self.renderer.allocators.descriptor_set,
-                        &new_rcx.pipeline_layout,
-                        &self.textures,
-                        &self.null_texture,
-                        &self.samplers.wrap_sampler_mipmap,
+                for prim_idx in mat_prim_map[mat_idx].iter().copied() {
+                    let material_constants = mat.into();
+                    let prim = &self.prim_infos[prim_idx];
+
+                    self.renderer.add_pipeline(
+                        material_constants,
+                        prim.spec_const,
+                        new_rcx.pipeline_layout.clone(),
+                        vertex_shader.clone(),
+                        fragment_shader.clone(),
+                        material_set.clone(),
+                        texture_set.clone(),
+                        mat_idx,
+                        prim_idx,
                     );
-
-                    for prim_idx in mat_prim_map[mat_idx].iter().copied() {
-                        let material_constants = mat.into();
-                        let prim = &self.prim_infos[prim_idx];
-                        let pcx_idx = *pipeline_map
-                            .entry(material_constants)
-                            .or_default()
-                            .entry(prim.spec_const)
-                            .or_insert_with(|| {
-                                let spec_constants = SpecializationConstants {
-                                    object_constants: prim.spec_const,
-                                    material_constants,
-                                };
-                                let constants: Vec<_> = spec_constants.into();
-                                let vs = vertex_shader
-                                    .specialize(constants.clone().into_iter().collect())
-                                    .unwrap()
-                                    .entry_point("main")
-                                    .unwrap();
-                                let fs = fragment_shader
-                                    .specialize(constants.clone().into_iter().collect())
-                                    .unwrap()
-                                    .entry_point("main")
-                                    .unwrap();
-                                let (color_blend_state, depth_stencil_state, cull_mode) =
-                                    if material_constants.render_type() == RenderType::Translucent {
-                                        let color_blend_state =
-                                            ColorBlendState::with_attachment_states(
-                                                1,
-                                                ColorBlendAttachmentState {
-                                                    blend: Some(AttachmentBlend::alpha()),
-                                                    color_write_mask: ColorComponents::all(),
-                                                    color_write_enable: true,
-                                                },
-                                            );
-                                        let depth_stencil_state = DepthStencilState {
-                                            depth: Some(DepthState::default()),
-                                            ..Default::default()
-                                        };
-
-                                        (color_blend_state, depth_stencil_state, CullMode::None)
-                                    } else {
-                                        let color_blend_state =
-                                            ColorBlendState::with_attachment_states(
-                                                1,
-                                                ColorBlendAttachmentState::default(),
-                                            );
-                                        let depth_stencil_state = DepthStencilState {
-                                            depth: Some(DepthState::simple()),
-                                            ..Default::default()
-                                        };
-
-                                        (color_blend_state, depth_stencil_state, CullMode::Back)
-                                    };
-                                let pipeline = self.renderer.build_pipeline::<CombinedVertex>(
-                                    swapchain_format,
-                                    new_rcx.pipeline_layout.clone(),
-                                    vs,
-                                    fs,
-                                    color_blend_state,
-                                    depth_stencil_state,
-                                    cull_mode,
-                                );
-
-                                let material_sets = HashMap::new();
-
-                                let prim_indices = HashSet::new();
-
-                                let pipeline = PipelineContext {
-                                    pipeline,
-                                    material_sets,
-                                    prim_indices,
-                                };
-                                let pcx_idx = pipelines.len();
-                                pipelines.push(pipeline);
-
-                                pcx_idx
-                            });
-
-                        pipelines[pcx_idx].prim_indices.insert(prim_idx);
-
-                        pipelines[pcx_idx]
-                            .material_sets
-                            .entry(mat_idx)
-                            .or_insert_with(|| (material_set.clone(), texture_set.clone()));
-                    }
-                });
-
-            (pipelines, pipeline_map)
-        };
+                }
+            });
 
         let const_set = DescriptorSet::new(
             self.renderer.allocators.descriptor_set.clone(),
@@ -1501,7 +1345,8 @@ impl ApplicationHandler for App {
             let color_blend_state = ColorBlendState::with_attachment_states(1, Default::default());
             let depth_stencil_state = DepthStencilState::default();
 
-            self.renderer.build_pipeline::<CubemapVertex>(
+            renderer::build_pipeline::<CubemapVertex>(
+                self.renderer.context.device().clone(),
                 swapchain_format,
                 cubemap_layout,
                 vs,
@@ -1555,6 +1400,7 @@ impl ApplicationHandler for App {
             (vertex_buffer, index_buffer, index_count)
         };
 
+        /*
         println!("Rendering {} material variants:", pipelines.len());
         for (idx, (k, v)) in pipeline_map.iter().enumerate() {
             println!(" {}) {}", idx + 1, k);
@@ -1563,16 +1409,15 @@ impl ApplicationHandler for App {
                 println!("\t {}) {}", idx + 1, k);
             }
         }
+         */
 
         self.renderer.rcx = Some(new_rcx);
 
         self.rcx = Some(RenderContext {
-            pipelines,
             cubemap_pipeline,
             cubemap_index_buffer,
             cubemap_vertex_buffer,
             cubemap_index_count,
-            pipeline_map,
             intermediate_image_view,
             const_set,
             skybox_set,
@@ -1797,7 +1642,7 @@ impl ApplicationHandler for App {
                 let mut translucent_objects = Vec::<usize>::new();
                 let mut transmissive_objects = Vec::<usize>::new();
 
-                for (mat_specs, obj_pipelines) in &rcx.pipeline_map {
+                for (mat_specs, obj_pipelines) in &self.renderer.pipeline_manager.pipeline_map {
                     match mat_specs.render_type() {
                         RenderType::Opaque => opaque_objects.extend(obj_pipelines.values()),
                         RenderType::Translucent => {
@@ -1811,7 +1656,7 @@ impl ApplicationHandler for App {
 
                 let mut translucent_sorted = Vec::new();
                 for pcx_idx in translucent_objects.iter().copied() {
-                    let pcx = &rcx.pipelines[pcx_idx];
+                    let pcx = &self.renderer.pipeline_manager.pipelines[pcx_idx];
                     for prim_idx in pcx.prim_indices.iter().copied() {
                         let prim = &self.prim_infos[prim_idx];
                         for obj_idx in prim.object_ids.iter().copied() {
@@ -1978,7 +1823,7 @@ impl ApplicationHandler for App {
                 // Render opaque geometry
                 if !opaque_objects.is_empty() {
                     for pcx_idx in opaque_objects {
-                        rcx.pipelines[pcx_idx].render(
+                        self.renderer.pipeline_manager.pipelines[pcx_idx].render(
                             &mut builder,
                             &new_rcx.pipeline_layout,
                             &self.prim_infos,
@@ -1992,7 +1837,7 @@ impl ApplicationHandler for App {
                     let mut curr_pcx = None;
                     for (_, obj_idx, prim_idx, pcx_idx) in translucent_sorted {
                         let prim = &self.prim_infos[prim_idx];
-                        let pcx = &rcx.pipelines[pcx_idx];
+                        let pcx = &self.renderer.pipeline_manager.pipelines[pcx_idx];
                         if curr_pcx != Some(pcx_idx) {
                             builder
                                 .bind_pipeline_graphics(pcx.pipeline.clone())
@@ -2120,7 +1965,7 @@ impl ApplicationHandler for App {
                         .unwrap();
 
                     for pcx_idx in transmissive_objects {
-                        rcx.pipelines[pcx_idx].render(
+                        self.renderer.pipeline_manager.pipelines[pcx_idx].render(
                             &mut builder,
                             &new_rcx.pipeline_layout,
                             &self.prim_infos,
@@ -2231,7 +2076,8 @@ impl ApplicationHandler for App {
                         }
 
                         let checkbox_size = ui.frame_height();
-                        ui.same_line_with_pos(ui.content_region_max()[0] - checkbox_size);
+                        let pos = ui.content_region_max()[0] - checkbox_size;
+                        ui.same_line_with_pos(pos);
                         ui.checkbox(format!("##checkbox{idx}"), &mut scene.objects[idx].enabled);
 
                         if let Some(_token) = token {
@@ -2385,7 +2231,7 @@ impl ApplicationHandler for App {
 
                 if let Some(mat_idx) = self.scene.selected_material {
                     let mat = &mut self.materials[mat_idx];
-                    let old_mat_cons: MaterialSpecializationConstants = (&*mat).into();
+                    let old_mat_spec: MaterialSpecializationConstants = (&*mat).into();
 
                     let changed = ui.window("Material").build(|| {
                         let mut name = mat.name.clone().unwrap_or_default();
@@ -2567,113 +2413,38 @@ impl ApplicationHandler for App {
                     let pipeline_layout = new_rcx.pipeline_layout.clone();
 
                     if let Some(true) = changed {
-                        // TODO: as an optimization, check if the new spec constants differ from the old ones. If they don't, the pipeline
-                        // doesn't need to change, only the material sets.
-                        let material_constants: MaterialSpecializationConstants = (&*mat).into();
-                        // Material might have changed its specialization constants, meaning it needs to get rendered by a different pipeline.
-                        // First, remove the material's descriptor sets from its current pipeline, and remove any primitve that uses this mat
-                        // from the pipeline's primitives list.
-                        // TODO: maybe delete the pipeline if the primitive list becomes empty, although this might not be worth it
-                        for &pcx_idx in rcx.pipeline_map[&old_mat_cons].values() {
-                            let pcx = &mut rcx.pipelines[pcx_idx];
-                            pcx.material_sets.remove(&mat_idx);
-                            pcx.prim_indices
-                                .retain(|idx| !self.mat_prims[mat_idx].contains(idx));
-                        }
-                        // Once the material's old pipeline bindings have been removed, determine which pipeline it now belongs to after the change,
-                        // or create a new one if none exists.
-                        let pipeline_map = rcx.pipeline_map.entry(material_constants).or_default();
+                        self.renderer.remove_material_pipeline(
+                            old_mat_spec,
+                            mat_idx,
+                            &self.mat_prims[mat_idx],
+                        );
+
+                        let mat_spec: MaterialSpecializationConstants = (&*mat).into();
                         let (material_set, texture_set) = build_material_texture_sets(
                             mat,
                             &self.renderer.allocators.uniform_buffer,
                             &self.renderer.allocators.descriptor_set,
-                            &new_rcx.pipeline_layout,
+                            &pipeline_layout,
                             &self.textures,
                             &self.null_texture,
                             &self.samplers.wrap_sampler_mipmap,
                         );
+
+                        let vs = vs::load(self.renderer.context.device().clone()).unwrap();
+                        let fs = fs::load(self.renderer.context.device().clone()).unwrap();
                         for prim_idx in self.mat_prims[mat_idx].iter().copied() {
                             let prim = &self.prim_infos[prim_idx];
-                            let pcx_idx =
-                                *pipeline_map.entry(prim.spec_const).or_insert_with(|| {
-                                    let spec_constants = SpecializationConstants {
-                                        object_constants: prim.spec_const,
-                                        material_constants,
-                                    };
-                                    let constants: Vec<_> = spec_constants.into();
-                                    let vs = vs::load(self.renderer.context.device().clone())
-                                        .unwrap()
-                                        .specialize(constants.clone().into_iter().collect())
-                                        .unwrap()
-                                        .entry_point("main")
-                                        .unwrap();
-                                    let fs = fs::load(self.renderer.context.device().clone())
-                                        .unwrap()
-                                        .specialize(constants.clone().into_iter().collect())
-                                        .unwrap()
-                                        .entry_point("main")
-                                        .unwrap();
-
-                                    let (color_blend_state, depth_stencil_state, cull_mode) =
-                                        if material_constants.render_type()
-                                            == RenderType::Translucent
-                                        {
-                                            let color_blend_state =
-                                                ColorBlendState::with_attachment_states(
-                                                    1,
-                                                    ColorBlendAttachmentState {
-                                                        blend: Some(AttachmentBlend::alpha()),
-                                                        color_write_mask: ColorComponents::all(),
-                                                        color_write_enable: true,
-                                                    },
-                                                );
-                                            let depth_stencil_state = DepthStencilState {
-                                                depth: Some(DepthState::default()),
-                                                ..Default::default()
-                                            };
-
-                                            (color_blend_state, depth_stencil_state, CullMode::None)
-                                        } else {
-                                            let color_blend_state =
-                                                ColorBlendState::with_attachment_states(
-                                                    1,
-                                                    ColorBlendAttachmentState::default(),
-                                                );
-                                            let depth_stencil_state = DepthStencilState {
-                                                depth: Some(DepthState::simple()),
-                                                ..Default::default()
-                                            };
-
-                                            (color_blend_state, depth_stencil_state, CullMode::Back)
-                                        };
-
-                                    let pipeline = self.renderer.build_pipeline::<CombinedVertex>(
-                                        swapchain_format,
-                                        pipeline_layout.clone(),
-                                        vs,
-                                        fs,
-                                        color_blend_state,
-                                        depth_stencil_state,
-                                        cull_mode,
-                                    );
-                                    let material_sets = HashMap::new();
-                                    let prim_indices = HashSet::new();
-                                    let pipeline = PipelineContext {
-                                        pipeline,
-                                        material_sets,
-                                        prim_indices,
-                                    };
-                                    let pcx_idx = rcx.pipelines.len();
-                                    rcx.pipelines.push(pipeline);
-
-                                    pcx_idx
-                                });
-                            rcx.pipelines[pcx_idx].prim_indices.insert(prim_idx);
-
-                            rcx.pipelines[pcx_idx]
-                                .material_sets
-                                .entry(mat_idx)
-                                .or_insert_with(|| (material_set.clone(), texture_set.clone()));
+                            self.renderer.add_pipeline(
+                                mat_spec,
+                                prim.spec_const,
+                                pipeline_layout.clone(),
+                                vs.clone(),
+                                fs.clone(),
+                                material_set.clone(),
+                                texture_set.clone(),
+                                mat_idx,
+                                prim_idx,
+                            );
                         }
                     }
                 }
