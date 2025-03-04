@@ -1,10 +1,15 @@
-use crate::gltf::CombinedVertex;
-use crate::shader::{fs, vs, MaterialSpecializationConstants, RenderType, SpecializationConstants};
+use std::collections::{HashMap, HashSet};
+use std::mem::swap;
+use crate::gltf::{CombinedVertex, Object};
+use crate::shader::{fs, vs, MaterialSpecializationConstants, ObjectSpecializationConstants, RenderType, SpecializationConstants};
 use std::sync::Arc;
+use cgmath::{Matrix, Matrix4, SquareMatrix};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::BufferUsage;
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
+use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
+use vulkano::descriptor_set::DescriptorSet;
 use vulkano::descriptor_set::layout::{
     DescriptorSetLayout, DescriptorSetLayoutCreateInfo, DescriptorType,
 };
@@ -26,18 +31,18 @@ use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::ViewportState;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
-use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
-};
+use vulkano::pipeline::{DynamicState, GraphicsPipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::shader::{DescriptorBindingRequirements, EntryPoint, ShaderModule, ShaderStages};
 use vulkano_util::context::{VulkanoConfig, VulkanoContext};
 use vulkano_util::window::VulkanoWindows;
 use winit::window::WindowId;
+use crate::{PrimitiveDrawInfo};
 
 pub struct Renderer {
     pub context: VulkanoContext,
     pub windows: VulkanoWindows,
     pub allocators: Allocators,
+    pub pipeline_manager: PipelineManager,
     pub rcx: Option<RendererContext>,
 }
 
@@ -52,6 +57,96 @@ pub struct RendererContext {
     pub attachment_image_views: Vec<Arc<ImageView>>,
     pub depth_image_view: Arc<ImageView>,
     pub pipeline_layout: Arc<PipelineLayout>,
+}
+
+pub struct PipelineContext {
+    pub pipeline: Arc<GraphicsPipeline>,
+    pub material_sets: HashMap<usize, (Arc<DescriptorSet>, Arc<DescriptorSet>)>,
+    pub prim_indices: HashSet<usize>,
+}
+
+impl PipelineContext {
+    pub fn render(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        pipeline_layout: &Arc<PipelineLayout>,
+        primitives: &[PrimitiveDrawInfo],
+        objects: &[Object],
+    ) {
+        builder
+            .bind_pipeline_graphics(self.pipeline.clone())
+            .unwrap();
+
+        for prim_idx in self.prim_indices.iter().copied() {
+            let prim = &primitives[prim_idx];
+            let (mat_set, tex_set) = self.material_sets[&prim.mat_idx].clone();
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipeline_layout.clone(),
+                    3,
+                    mat_set,
+                )
+                .unwrap();
+
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipeline_layout.clone(),
+                    4,
+                    tex_set,
+                )
+                .unwrap();
+
+            for object in prim.object_ids.iter().filter_map(|idx| {
+                let object = &objects[*idx];
+                object.enabled.then_some(object)
+            }) {
+                let transform = object.transform;
+                let normal = transform
+                    .transpose()
+                    .invert()
+                    .unwrap_or_else(Matrix4::identity);
+                let model: [[f32; 4]; 4] = transform.into();
+                #[allow(clippy::useless_conversion)]
+                let data = fs::Object {
+                    u_ModelMatrix: model.into(),
+                    u_NormalMatrix: normal.into(),
+                };
+                builder
+                    .push_constants(pipeline_layout.clone(), 0, data)
+                    .unwrap();
+
+                unsafe {
+                    // We add a draw command.
+                    builder.draw_indexed(
+                        prim.index_count,
+                        1,
+                        prim.index_offset,
+                        prim.vertex_offset,
+                        0,
+                    )
+                }
+                    .unwrap();
+            }
+        }
+    }
+}
+
+pub struct PipelineManager {
+    pub pipelines: Vec<PipelineContext>,
+    pub pipeline_map: HashMap<MaterialSpecializationConstants, HashMap<ObjectSpecializationConstants, usize>>,
+}
+
+impl PipelineManager {
+    pub fn new() -> Self {
+        Self {
+            pipelines: Vec::new(),
+            pipeline_map: HashMap::new(),
+        }
+    }
+
+
 }
 
 impl Renderer {
@@ -76,12 +171,15 @@ impl Renderer {
 
         let allocators = Allocators::new(context.device());
 
+        let pipeline_manager = PipelineManager::new();
+
         let rcx = None;
 
         Self {
             context,
             windows,
             allocators,
+            pipeline_manager,
             rcx,
         }
     }
@@ -139,76 +237,188 @@ impl Renderer {
         .unwrap()
     }
 
-    pub fn build_pipeline<V: Vertex>(
-        &self,
-        swapchain_format: Format,
-        layout: Arc<PipelineLayout>,
-        vs: EntryPoint,
-        fs: EntryPoint,
-        color_blend_state: ColorBlendState,
-        depth_stencil_state: DepthStencilState,
-        cull_mode: CullMode,
-    ) -> Arc<GraphicsPipeline> {
-        // Automatically generate a vertex input state from the vertex shader's input
-        // interface, that takes a single vertex buffer containing `Vertex` structs.
-        let vertex_input_state = V::per_vertex().definition(&vs).unwrap();
-
-        // Make a list of the shader stages that the pipeline will have.
-        let stages = [
-            PipelineShaderStageCreateInfo::new(vs),
-            PipelineShaderStageCreateInfo::new(fs),
-        ];
-
-        // We describe the formats of attachment images where the colors, depth and/or stencil
-        // information will be written. The pipeline will only be usable with this particular
-        // configuration of the attachment images.
-        let subpass = PipelineRenderingCreateInfo {
-            // We specify a single color attachment that will be rendered to. When we begin
-            // rendering, we will specify a swapchain image to be used as this attachment, so
-            // here we set its format to be the same format as the swapchain.
-            color_attachment_formats: vec![Some(swapchain_format)],
-            depth_attachment_format: Some(Format::D32_SFLOAT),
-            ..Default::default()
-        };
-
-        // Finally, create the pipeline.
-        GraphicsPipeline::new(
-            self.context.device().clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                // How vertex data is read from the vertex buffers into the vertex shader.
-                vertex_input_state: Some(vertex_input_state),
-                // How vertices are arranged into primitive shapes. The default primitive shape
-                // is a triangle.
-                input_assembly_state: Some(InputAssemblyState::default()),
-                // How primitives are transformed and clipped to fit the framebuffer. We use a
-                // resizable viewport, set to draw over the entire window.
-                viewport_state: Some(ViewportState::default()),
-                // How polygons are culled and converted into a raster of pixels. The default
-                // value does not perform any culling.
-                rasterization_state: Some(RasterizationState {
-                    cull_mode,
-                    ..Default::default()
-                }),
-                // How multiple fragment shader samples are converted to a single pixel value.
-                // The default value does not perform any multisampling.
-                multisample_state: Some(MultisampleState::default()),
-                // How pixel values are combined with the values already present in the
-                // framebuffer. The default value overwrites the old value with the new one,
-                // without any blending.
-                color_blend_state: Some(color_blend_state),
-                depth_stencil_state: Some(depth_stencil_state),
-                // Dynamic states allows us to specify parts of the pipeline settings when
-                // recording the command buffer, before we perform drawing. Here, we specify
-                // that the viewport should be dynamic.
-                dynamic_state: std::iter::once(DynamicState::Viewport).collect(),
-                subpass: Some(subpass.into()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
-        .unwrap()
+    pub fn remove_material_pipeline(
+        &mut self,
+        mat_spec: MaterialSpecializationConstants,
+        mat_idx: usize,
+        mat_prims: &HashSet<usize>,
+    ) {
+        for &pcx_idx in self.pipeline_manager.pipeline_map[&mat_spec].values() {
+            let pcx = &mut self.pipeline_manager.pipelines[pcx_idx];
+            pcx.material_sets.remove(&mat_idx);
+            pcx.prim_indices.retain(|idx| !mat_prims.contains(idx));
+        }
     }
+
+    pub fn add_pipeline(
+        &mut self,
+        mat_spec: MaterialSpecializationConstants,
+        obj_spec: ObjectSpecializationConstants,
+        pipeline_layout: Arc<PipelineLayout>,
+        vs: Arc<ShaderModule>,
+        fs: Arc<ShaderModule>,
+        material_set: Arc<DescriptorSet>,
+        texture_set: Arc<DescriptorSet>,
+        mat_idx: usize,
+        prim_idx: usize,
+    ) {
+        let window_renderer = self.windows.get_primary_renderer_mut().unwrap();
+        let swapchain_format = window_renderer.swapchain_format();
+        let pcx_idx = self.pipeline_manager
+            .pipeline_map
+            .entry(mat_spec)
+            .or_default()
+            .entry(obj_spec)
+            .or_insert_with(|| {
+                let spec_constants = SpecializationConstants {
+                    object_constants: obj_spec,
+                    material_constants: mat_spec,
+                };
+                let constants: Vec<_> = spec_constants.into();
+                let vs = vs
+                    .specialize(constants.clone().into_iter().collect())
+                    .unwrap()
+                    .entry_point("main")
+                    .unwrap();
+                let fs = fs
+                    .specialize(constants.clone().into_iter().collect())
+                    .unwrap()
+                    .entry_point("main")
+                    .unwrap();
+                let (color_blend_state, depth_stencil_state, cull_mode) =
+                    if mat_spec.render_type() == RenderType::Translucent {
+                        let color_blend_state =
+                            ColorBlendState::with_attachment_states(
+                                1,
+                                ColorBlendAttachmentState {
+                                    blend: Some(AttachmentBlend::alpha()),
+                                    color_write_mask: ColorComponents::all(),
+                                    color_write_enable: true,
+                                },
+                            );
+                        let depth_stencil_state = DepthStencilState {
+                            depth: Some(DepthState::default()),
+                            ..Default::default()
+                        };
+
+                        (color_blend_state, depth_stencil_state, CullMode::None)
+                    } else {
+                        let color_blend_state =
+                            ColorBlendState::with_attachment_states(
+                                1,
+                                ColorBlendAttachmentState::default(),
+                            );
+                        let depth_stencil_state = DepthStencilState {
+                            depth: Some(DepthState::simple()),
+                            ..Default::default()
+                        };
+
+                        (color_blend_state, depth_stencil_state, CullMode::Back)
+                    };
+                let pipeline = build_pipeline::<CombinedVertex>(
+                    self.context.device().clone(),
+                    swapchain_format,
+                    pipeline_layout,
+                    vs,
+                    fs,
+                    color_blend_state,
+                    depth_stencil_state,
+                    cull_mode,
+                );
+
+                let material_sets = HashMap::new();
+
+                let prim_indices = HashSet::new();
+
+                let pipeline = PipelineContext {
+                    pipeline,
+                    material_sets,
+                    prim_indices,
+                };
+                let pcx_idx = self.pipeline_manager.pipelines.len();
+                self.pipeline_manager.pipelines.push(pipeline);
+
+                pcx_idx
+            });
+
+        self.pipeline_manager.pipelines[*pcx_idx].prim_indices.insert(prim_idx);
+
+        self.pipeline_manager.pipelines[*pcx_idx]
+            .material_sets
+            .entry(mat_idx)
+            .or_insert_with(|| (material_set, texture_set));
+    }
+}
+
+pub fn build_pipeline<V: Vertex>(
+    device: Arc<Device>,
+    swapchain_format: Format,
+    layout: Arc<PipelineLayout>,
+    vs: EntryPoint,
+    fs: EntryPoint,
+    color_blend_state: ColorBlendState,
+    depth_stencil_state: DepthStencilState,
+    cull_mode: CullMode,
+) -> Arc<GraphicsPipeline> {
+    // Automatically generate a vertex input state from the vertex shader's input
+    // interface, that takes a single vertex buffer containing `Vertex` structs.
+    let vertex_input_state = V::per_vertex().definition(&vs).unwrap();
+
+    // Make a list of the shader stages that the pipeline will have.
+    let stages = [
+        PipelineShaderStageCreateInfo::new(vs),
+        PipelineShaderStageCreateInfo::new(fs),
+    ];
+
+    // We describe the formats of attachment images where the colors, depth and/or stencil
+    // information will be written. The pipeline will only be usable with this particular
+    // configuration of the attachment images.
+    let subpass = PipelineRenderingCreateInfo {
+        // We specify a single color attachment that will be rendered to. When we begin
+        // rendering, we will specify a swapchain image to be used as this attachment, so
+        // here we set its format to be the same format as the swapchain.
+        color_attachment_formats: vec![Some(swapchain_format)],
+        depth_attachment_format: Some(Format::D32_SFLOAT),
+        ..Default::default()
+    };
+
+    // Finally, create the pipeline.
+    GraphicsPipeline::new(
+        device,
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            // How vertex data is read from the vertex buffers into the vertex shader.
+            vertex_input_state: Some(vertex_input_state),
+            // How vertices are arranged into primitive shapes. The default primitive shape
+            // is a triangle.
+            input_assembly_state: Some(InputAssemblyState::default()),
+            // How primitives are transformed and clipped to fit the framebuffer. We use a
+            // resizable viewport, set to draw over the entire window.
+            viewport_state: Some(ViewportState::default()),
+            // How polygons are culled and converted into a raster of pixels. The default
+            // value does not perform any culling.
+            rasterization_state: Some(RasterizationState {
+                cull_mode,
+                ..Default::default()
+            }),
+            // How multiple fragment shader samples are converted to a single pixel value.
+            // The default value does not perform any multisampling.
+            multisample_state: Some(MultisampleState::default()),
+            // How pixel values are combined with the values already present in the
+            // framebuffer. The default value overwrites the old value with the new one,
+            // without any blending.
+            color_blend_state: Some(color_blend_state),
+            depth_stencil_state: Some(depth_stencil_state),
+            // Dynamic states allows us to specify parts of the pipeline settings when
+            // recording the command buffer, before we perform drawing. Here, we specify
+            // that the viewport should be dynamic.
+            dynamic_state: std::iter::once(DynamicState::Viewport).collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+        .unwrap()
 }
 
 impl Allocators {
