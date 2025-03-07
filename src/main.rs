@@ -14,6 +14,7 @@
 
 use crate::camera::FirstPersonCamera;
 use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, Object, Scene, TextureFormat};
+use crate::gui::Gui;
 use crate::material::{AlphaMode, Material};
 use crate::renderer::{Renderer, RendererContext};
 use crate::shader::{
@@ -150,6 +151,7 @@ struct App {
     samplers: Samplers,
     camera: FirstPersonCamera,
     input_state: InputState,
+    gui: Gui,
     imgui_ctx: imgui::Context,
     last_frame: Instant,
     rcx: Option<RenderContext>,
@@ -797,11 +799,20 @@ impl App {
 
         let camera = FirstPersonCamera::new();
 
+        let input_state = InputState::default();
+
+        let gui = Gui {
+            selected_object: (!objects.is_empty()).then_some(0),
+            selected_material: None,
+        };
+
         let mut imgui_ctx = imgui::Context::create();
         imgui_ctx.io_mut().config_flags |=
             imgui::ConfigFlags::DOCKING_ENABLE | imgui::ConfigFlags::VIEWPORTS_ENABLE;
 
         let scene = Scene::new(objects);
+
+        let last_frame = Instant::now();
 
         Self {
             renderer,
@@ -817,9 +828,10 @@ impl App {
             skyboxes,
             samplers,
             camera,
-            input_state: InputState::default(),
+            input_state,
+            gui,
             imgui_ctx,
-            last_frame: Instant::now(),
+            last_frame,
             rcx: None,
         }
     }
@@ -1411,9 +1423,9 @@ impl ApplicationHandler for App {
         }
          */
 
-        self.renderer.rcx = Some(new_rcx);
+        self.renderer.rcx.replace(new_rcx);
 
-        self.rcx = Some(RenderContext {
+        self.rcx.replace(RenderContext {
             cubemap_pipeline,
             cubemap_index_buffer,
             cubemap_vertex_buffer,
@@ -1842,7 +1854,7 @@ impl ApplicationHandler for App {
                             builder
                                 .bind_pipeline_graphics(pcx.pipeline.clone())
                                 .unwrap();
-                            curr_pcx = Some(pcx_idx);
+                            curr_pcx.replace(pcx_idx);
                         }
 
                         let (mat_set, tex_set) = pcx.material_sets[&prim.mat_idx].clone();
@@ -2020,13 +2032,18 @@ impl ApplicationHandler for App {
                         );
 
                         igDockBuilderDockWindow(c_str!("Objects").as_ptr(), top_left);
-                        igDockBuilderDockWindow(c_str!("Primitives").as_ptr(), bottom_left);
+                        igDockBuilderDockWindow(c_str!("Materials").as_ptr(), bottom_left);
                         igDockBuilderDockWindow(c_str!("Transform").as_ptr(), bottom_left);
                     }
                 }
 
                 ui.window("Objects").build(|| {
-                    fn object_tree_builder(idx: usize, ui: &imgui::Ui, scene: &mut Scene) {
+                    fn object_tree_builder(
+                        idx: usize,
+                        ui: &imgui::Ui,
+                        scene: &mut Scene,
+                        selected: &mut Option<usize>,
+                    ) {
                         let object = &scene.objects[idx];
                         let name = object.name.as_deref().unwrap_or("Unnamed");
 
@@ -2039,7 +2056,7 @@ impl ApplicationHandler for App {
                             .leaf(scene.children[idx].is_empty());
 
                         let token = {
-                            let _color_token = (scene.selected_object == Some(idx)).then(|| {
+                            let _color_token = (*selected == Some(idx)).then(|| {
                                 ui.push_style_color(
                                     StyleColor::Header,
                                     ui.style_color(StyleColor::HeaderActive),
@@ -2049,13 +2066,13 @@ impl ApplicationHandler for App {
                         };
 
                         if ui.is_item_clicked() {
-                            scene.selected_object = Some(idx);
+                            selected.replace(idx);
                         }
 
-                        if scene.selected_object == Some(idx)
+                        if selected.is_some_and(|s| s == idx)
                             && ui.is_item_clicked_with_button(imgui::MouseButton::Right)
                         {
-                            scene.selected_object = None;
+                            selected.take();
                         }
 
                         if let Some(_token) = ui
@@ -2063,7 +2080,7 @@ impl ApplicationHandler for App {
                             .flags(DragDropFlags::empty())
                             .begin_payload(idx)
                         {
-                            object_tree_builder(idx, ui, scene);
+                            object_tree_builder(idx, ui, scene, selected);
                         }
 
                         if let Some(target) = ui.drag_drop_target() {
@@ -2085,7 +2102,7 @@ impl ApplicationHandler for App {
                                 scene.children[idx].clone().into_iter().collect();
                             children.sort_unstable();
                             for child in children.iter().copied() {
-                                object_tree_builder(child, ui, scene);
+                                object_tree_builder(child, ui, scene, selected);
                             }
                         }
                     }
@@ -2099,7 +2116,12 @@ impl ApplicationHandler for App {
                         .collect();
 
                     for root in roots {
-                        object_tree_builder(root, ui, &mut self.scene);
+                        object_tree_builder(
+                            root,
+                            ui,
+                            &mut self.scene,
+                            &mut self.gui.selected_object,
+                        );
                     }
 
                     ui.invisible_button("root_drop_region", ui.content_region_avail());
@@ -2114,122 +2136,34 @@ impl ApplicationHandler for App {
                     }
                 });
 
-                if let Some(selected) = self.scene.selected_object {
-                    ui.window("Transform").build(|| {
-                        let object = &mut self.scene.objects[selected];
-                        let mut changed = false;
-                        let mut transform = object.local_transform;
-                        if ui.collapsing_header("Position", TreeNodeFlags::DEFAULT_OPEN)
-                            && gui::drag_vec3(
-                                &mut [
-                                    &mut transform.position.x,
-                                    &mut transform.position.y,
-                                    &mut transform.position.z,
-                                ],
-                                ui,
-                                "position",
-                                "%.2f",
-                            )
-                        {
-                            changed = true;
-                        }
-                        if ui.collapsing_header("Rotation", TreeNodeFlags::empty())
-                            && gui::drag_vec3(
-                                &mut [
-                                    &mut transform.rotation.x.0,
-                                    &mut transform.rotation.y.0,
-                                    &mut transform.rotation.z.0,
-                                ],
-                                ui,
-                                "rotation",
-                                "%.2f",
-                            )
-                        {
-                            changed = true;
-                        }
-                        if ui.collapsing_header("Scale", TreeNodeFlags::empty())
-                            && gui::drag_vec3(
-                                &mut [
-                                    &mut transform.scale.x,
-                                    &mut transform.scale.y,
-                                    &mut transform.scale.z,
-                                ],
-                                ui,
-                                "scale",
-                                "%.2f",
-                            )
-                        {
-                            changed = true;
-                        }
-                        if ui.collapsing_header("Skew", TreeNodeFlags::empty())
-                            && gui::drag_vec3(
-                                &mut [
-                                    &mut transform.skew.x,
-                                    &mut transform.skew.y,
-                                    &mut transform.skew.z,
-                                ],
-                                ui,
-                                "skew",
-                                "%.2f",
-                            )
-                        {
-                            changed = true;
-                        }
-                        if changed {
-                            object.local_transform = transform;
-                            self.scene.regenerate();
-                        }
-                    });
+                if let Some(selected) = self.gui.selected_object {
+                    let object = &mut self.scene.objects[selected];
+                    if let Some(transform) = gui::object_transform(object, ui) {
+                        object.local_transform = transform;
+                        self.scene.regenerate();
+                    }
 
+                    // Note: need to repeat this line to avoid lifetime issues with the call to Scene::regenerate() above.
                     let object = &mut self.scene.objects[selected];
                     if let Some(mesh_idx) = object.mesh_idx {
-                        ui.window("Primitives")
-                            .flags(WindowFlags::NO_FOCUS_ON_APPEARING)
-                            .build(|| {
-                                let mesh = &self.mesh_infos[mesh_idx];
-                                if let Some(_token) = ui.begin_table_with_flags(
-                                    "Primitives",
-                                    2,
-                                    TableFlags::SIZING_FIXED_FIT,
-                                ) {
-                                    ui.table_setup_column("Vertices");
-                                    ui.table_setup_column("Material");
-                                    ui.table_headers_row();
-                                    for prim in self
-                                        .prim_infos
-                                        .iter()
-                                        .skip(mesh.prims_offset)
-                                        .take(mesh.prims_count)
-                                    {
-                                        ui.table_next_row();
-
-                                        ui.table_next_column();
-                                        ui.text(format!("{}", prim.index_count));
-
-                                        ui.table_next_column();
-                                        let mat = &self.materials[prim.mat_idx];
-                                        let color = mat.pbr_metallic_roughness.base_color_factor;
-                                        gui::color_square(ui, color, "");
-                                        ui.same_line();
-                                        let name =
-                                            mat.name.as_deref().unwrap_or("Unnamed Material");
-                                        let selected =
-                                            Some(prim.mat_idx) == self.scene.selected_material;
-                                        if ui
-                                            .selectable_config(name)
-                                            .selected(selected)
-                                            .span_all_columns(true)
-                                            .build()
-                                        {
-                                            self.scene.selected_material = Some(prim.mat_idx);
-                                        }
-                                    }
-                                }
-                            });
+                        let mesh = &self.mesh_infos[mesh_idx];
+                        let mat_ids: Vec<_> = self
+                            .prim_infos
+                            .iter()
+                            .skip(mesh.prims_offset)
+                            .take(mesh.prims_count)
+                            .map(|prim| prim.mat_idx)
+                            .collect();
+                        gui::mesh_materials(
+                            &mat_ids,
+                            &self.materials,
+                            &mut self.gui.selected_material,
+                            &ui,
+                        );
                     }
                 }
 
-                if let Some(mat_idx) = self.scene.selected_material {
+                if let Some(mat_idx) = self.gui.selected_material {
                     let mat = &mut self.materials[mat_idx];
                     let old_mat_spec: MaterialSpecializationConstants = (&*mat).into();
 
@@ -2238,9 +2172,9 @@ impl ApplicationHandler for App {
                         if ui.input_text("Name", &mut name)
                             .build() {
                             if name.is_empty() {
-                                mat.name = None;
+                                mat.name.take();
                             } else {
-                                mat.name = Some(name);
+                                mat.name.replace(name);
                             }
                         }
                         let mut changed = false;

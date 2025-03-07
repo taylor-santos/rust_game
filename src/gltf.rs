@@ -79,22 +79,13 @@ pub struct Object {
 pub struct Scene {
     pub objects: Vec<Object>,
     pub children: Vec<HashSet<usize>>,
-    pub selected_object: Option<usize>,
-    pub selected_material: Option<usize>,
 }
 
 impl Scene {
     pub fn new(mut objects: Vec<Object>) -> Self {
-        let selected_object = (!objects.is_empty()).then_some(0);
-        let selected_material = None;
         let children = Self::gen_children(&objects);
         Self::recalculate_transforms(&mut objects, &children);
-        Self {
-            objects,
-            children,
-            selected_object,
-            selected_material,
-        }
+        Self { objects, children }
     }
 
     fn gen_children(objects: &[Object]) -> Vec<HashSet<usize>> {
@@ -773,7 +764,7 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
                 eprintln!("WARN: Texture {idx} used in both sRGB and Linear contexts");
             }
         } else {
-            tex.usage = Some(usage);
+            tex.usage.replace(usage);
         }
     };
 
@@ -890,7 +881,7 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
 
     for obj in document.nodes() {
         for child in obj.children() {
-            objects[child.index()].parent = Some(obj.index());
+            objects[child.index()].parent.replace(obj.index());
         }
     }
 

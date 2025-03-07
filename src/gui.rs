@@ -1,9 +1,123 @@
 use cgmath::num_traits::Float;
 use hsv::hsv_to_rgb;
-use imgui::{Condition, StyleColor};
+use imgui::{Condition, StyleColor, TableFlags, TreeNodeFlags, WindowFlags};
 use std::ffi::CString;
 
+use crate::gltf::Object;
+use crate::material::Material;
+use crate::transform::Transform;
 use imgui::sys;
+
+pub struct Gui {
+    pub selected_object: Option<usize>,
+    pub selected_material: Option<usize>,
+}
+
+// Display a window titled "Transform" to manipulate the transformation properties of the given object.
+// Returns Some(transform) if any properties were changed
+pub fn object_transform(object: &Object, ui: &imgui::Ui) -> Option<Transform<f32>> {
+    ui.window("Transform")
+        .build(|| {
+            let mut transform = object.local_transform;
+            let mut changed = false;
+            if ui.collapsing_header("Position", TreeNodeFlags::DEFAULT_OPEN)
+                && drag_vec3(
+                    &mut [
+                        &mut transform.position.x,
+                        &mut transform.position.y,
+                        &mut transform.position.z,
+                    ],
+                    ui,
+                    "position",
+                    "%.2f",
+                )
+            {
+                changed = true;
+            }
+            if ui.collapsing_header("Rotation", TreeNodeFlags::empty())
+                && drag_vec3(
+                    &mut [
+                        &mut transform.rotation.x.0,
+                        &mut transform.rotation.y.0,
+                        &mut transform.rotation.z.0,
+                    ],
+                    ui,
+                    "rotation",
+                    "%.2f",
+                )
+            {
+                changed = true;
+            }
+            if ui.collapsing_header("Scale", TreeNodeFlags::empty())
+                && drag_vec3(
+                    &mut [
+                        &mut transform.scale.x,
+                        &mut transform.scale.y,
+                        &mut transform.scale.z,
+                    ],
+                    ui,
+                    "scale",
+                    "%.2f",
+                )
+            {
+                changed = true;
+            }
+            if ui.collapsing_header("Skew", TreeNodeFlags::empty())
+                && drag_vec3(
+                    &mut [
+                        &mut transform.skew.x,
+                        &mut transform.skew.y,
+                        &mut transform.skew.z,
+                    ],
+                    ui,
+                    "skew",
+                    "%.2f",
+                )
+            {
+                changed = true;
+            }
+
+            changed.then_some(transform)
+        })
+        .flatten()
+}
+
+pub fn mesh_materials(
+    mat_ids: &[usize],
+    materials: &[Material],
+    selected: &mut Option<usize>,
+    ui: &imgui::Ui,
+) {
+    ui.window("Materials")
+        .flags(WindowFlags::NO_FOCUS_ON_APPEARING)
+        .build(|| {
+            if let Some(_token) =
+                ui.begin_table_with_flags("Materials", 1, TableFlags::SIZING_FIXED_FIT)
+            {
+                ui.table_setup_column("Material");
+                ui.table_headers_row();
+                for mat_idx in mat_ids.iter().copied() {
+                    let mat = &materials[mat_idx];
+                    ui.table_next_row();
+
+                    ui.table_next_column();
+                    let color = mat.pbr_metallic_roughness.base_color_factor;
+                    color_square(ui, color, "");
+                    ui.same_line();
+                    let name = mat.name.as_deref().unwrap_or("Unnamed Material");
+                    let is_selected = selected.is_some_and(|s| s == mat_idx);
+                    if ui
+                        .selectable_config(name)
+                        .selected(is_selected)
+                        .span_all_columns(true)
+                        .build()
+                    {
+                        selected.replace(mat_idx);
+                    }
+                }
+            }
+        });
+}
 
 pub fn drag_float(
     val: &mut f32,
