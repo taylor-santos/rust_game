@@ -252,7 +252,7 @@ impl From<&Material> for fs::Material {
 }
 
 #[allow(non_snake_case)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct SpecializationConstants {
     pub object_constants: ObjectSpecializationConstants,
     pub material_constants: MaterialSpecializationConstants,

@@ -56,7 +56,7 @@ pub struct Primitive {
     pub vertices: Vec<CombinedVertex>,
     pub indices: Vec<u32>,
     pub mat_idx: Option<usize>,
-    pub spec_const: ObjectSpecializationConstants,
+    pub obj_spec: ObjectSpecializationConstants,
 }
 
 #[derive(Debug)]
@@ -990,7 +990,7 @@ pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
                         vertices,
                         indices,
                         mat_idx,
-                        spec_const: spec_constants,
+                        obj_spec: spec_constants,
                     };
 
                     if should_generate_tangents {

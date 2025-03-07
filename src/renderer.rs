@@ -1,18 +1,18 @@
-use std::collections::{HashMap, HashSet};
-use std::mem::swap;
 use crate::gltf::{CombinedVertex, Object};
-use crate::shader::{fs, vs, MaterialSpecializationConstants, ObjectSpecializationConstants, RenderType, SpecializationConstants};
-use std::sync::Arc;
+use crate::shader::{fs, RenderType, SpecializationConstants};
+use crate::PrimitiveDrawInfo;
 use cgmath::{Matrix, Matrix4, SquareMatrix};
+use std::collections::HashMap;
+use std::sync::Arc;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::BufferUsage;
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::descriptor_set::DescriptorSet;
 use vulkano::descriptor_set::layout::{
     DescriptorSetLayout, DescriptorSetLayoutCreateInfo, DescriptorType,
 };
+use vulkano::descriptor_set::DescriptorSet;
 use vulkano::device::{Device, DeviceExtensions, DeviceFeatures};
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
@@ -22,7 +22,7 @@ use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
     ColorComponents,
 };
-use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
@@ -31,18 +31,20 @@ use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::ViewportState;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
-use vulkano::pipeline::{DynamicState, GraphicsPipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::pipeline::{
+    DynamicState, GraphicsPipeline, PipelineBindPoint, PipelineLayout,
+    PipelineShaderStageCreateInfo,
+};
 use vulkano::shader::{DescriptorBindingRequirements, EntryPoint, ShaderModule, ShaderStages};
 use vulkano_util::context::{VulkanoConfig, VulkanoContext};
 use vulkano_util::window::VulkanoWindows;
 use winit::window::WindowId;
-use crate::{PrimitiveDrawInfo};
 
 pub struct Renderer {
     pub context: VulkanoContext,
     pub windows: VulkanoWindows,
     pub allocators: Allocators,
-    pub pipeline_manager: PipelineManager,
+    pub pipelines: HashMap<SpecializationConstants, PipelineContext>,
     pub rcx: Option<RendererContext>,
 }
 
@@ -62,7 +64,6 @@ pub struct RendererContext {
 pub struct PipelineContext {
     pub pipeline: Arc<GraphicsPipeline>,
     pub material_sets: HashMap<usize, (Arc<DescriptorSet>, Arc<DescriptorSet>)>,
-    pub prim_indices: HashSet<usize>,
 }
 
 impl PipelineContext {
@@ -77,15 +78,13 @@ impl PipelineContext {
             .bind_pipeline_graphics(self.pipeline.clone())
             .unwrap();
 
-        for prim_idx in self.prim_indices.iter().copied() {
-            let prim = &primitives[prim_idx];
-            let (mat_set, tex_set) = self.material_sets[&prim.mat_idx].clone();
+        for (&prim_idx, (mat_set, tex_set)) in &self.material_sets {
             builder
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
                     pipeline_layout.clone(),
                     3,
-                    mat_set,
+                    mat_set.clone(),
                 )
                 .unwrap();
 
@@ -94,10 +93,11 @@ impl PipelineContext {
                     PipelineBindPoint::Graphics,
                     pipeline_layout.clone(),
                     4,
-                    tex_set,
+                    tex_set.clone(),
                 )
                 .unwrap();
 
+            let prim = &primitives[prim_idx];
             for object in prim.object_ids.iter().filter_map(|idx| {
                 let object = &objects[*idx];
                 object.enabled.then_some(object)
@@ -127,26 +127,10 @@ impl PipelineContext {
                         0,
                     )
                 }
-                    .unwrap();
+                .unwrap();
             }
         }
     }
-}
-
-pub struct PipelineManager {
-    pub pipelines: Vec<PipelineContext>,
-    pub pipeline_map: HashMap<MaterialSpecializationConstants, HashMap<ObjectSpecializationConstants, usize>>,
-}
-
-impl PipelineManager {
-    pub fn new() -> Self {
-        Self {
-            pipelines: Vec::new(),
-            pipeline_map: HashMap::new(),
-        }
-    }
-
-
 }
 
 impl Renderer {
@@ -171,7 +155,7 @@ impl Renderer {
 
         let allocators = Allocators::new(context.device());
 
-        let pipeline_manager = PipelineManager::new();
+        let pipelines = HashMap::new();
 
         let rcx = None;
 
@@ -179,7 +163,7 @@ impl Renderer {
             context,
             windows,
             allocators,
-            pipeline_manager,
+            pipelines,
             rcx,
         }
     }
@@ -237,119 +221,78 @@ impl Renderer {
         .unwrap()
     }
 
-    pub fn remove_material_pipeline(
-        &mut self,
-        mat_spec: MaterialSpecializationConstants,
-        mat_idx: usize,
-        mat_prims: &HashSet<usize>,
-    ) {
-        for &pcx_idx in self.pipeline_manager.pipeline_map[&mat_spec].values() {
-            let pcx = &mut self.pipeline_manager.pipelines[pcx_idx];
-            pcx.material_sets.remove(&mat_idx);
-            pcx.prim_indices.retain(|idx| !mat_prims.contains(idx));
-        }
-    }
-
     pub fn add_pipeline(
         &mut self,
-        mat_spec: MaterialSpecializationConstants,
-        obj_spec: ObjectSpecializationConstants,
+        spec: SpecializationConstants,
         pipeline_layout: Arc<PipelineLayout>,
         vs: Arc<ShaderModule>,
         fs: Arc<ShaderModule>,
-        material_set: Arc<DescriptorSet>,
-        texture_set: Arc<DescriptorSet>,
-        mat_idx: usize,
-        prim_idx: usize,
-    ) {
+    ) -> &mut PipelineContext {
         let window_renderer = self.windows.get_primary_renderer_mut().unwrap();
         let swapchain_format = window_renderer.swapchain_format();
-        let pcx_idx = self.pipeline_manager
-            .pipeline_map
-            .entry(mat_spec)
-            .or_default()
-            .entry(obj_spec)
-            .or_insert_with(|| {
-                let spec_constants = SpecializationConstants {
-                    object_constants: obj_spec,
-                    material_constants: mat_spec,
-                };
-                let constants: Vec<_> = spec_constants.into();
-                let vs = vs
-                    .specialize(constants.clone().into_iter().collect())
-                    .unwrap()
-                    .entry_point("main")
-                    .unwrap();
-                let fs = fs
-                    .specialize(constants.clone().into_iter().collect())
-                    .unwrap()
-                    .entry_point("main")
-                    .unwrap();
-                let (color_blend_state, depth_stencil_state, cull_mode) =
-                    if mat_spec.render_type() == RenderType::Translucent {
-                        let color_blend_state =
-                            ColorBlendState::with_attachment_states(
-                                1,
-                                ColorBlendAttachmentState {
-                                    blend: Some(AttachmentBlend::alpha()),
-                                    color_write_mask: ColorComponents::all(),
-                                    color_write_enable: true,
-                                },
-                            );
-                        let depth_stencil_state = DepthStencilState {
-                            depth: Some(DepthState::default()),
-                            ..Default::default()
-                        };
 
-                        (color_blend_state, depth_stencil_state, CullMode::None)
-                    } else {
-                        let color_blend_state =
-                            ColorBlendState::with_attachment_states(
-                                1,
-                                ColorBlendAttachmentState::default(),
-                            );
-                        let depth_stencil_state = DepthStencilState {
-                            depth: Some(DepthState::simple()),
-                            ..Default::default()
-                        };
-
-                        (color_blend_state, depth_stencil_state, CullMode::Back)
+        self.pipelines.entry(spec).or_insert_with(|| {
+            let constants: Vec<_> = spec.into();
+            let vs = vs
+                .specialize(constants.clone().into_iter().collect())
+                .unwrap()
+                .entry_point("main")
+                .unwrap();
+            let fs = fs
+                .specialize(constants.clone().into_iter().collect())
+                .unwrap()
+                .entry_point("main")
+                .unwrap();
+            let (color_blend_state, depth_stencil_state, cull_mode) =
+                if spec.material_constants.render_type() == RenderType::Translucent {
+                    let color_blend_state = ColorBlendState::with_attachment_states(
+                        1,
+                        ColorBlendAttachmentState {
+                            blend: Some(AttachmentBlend::alpha()),
+                            color_write_mask: ColorComponents::all(),
+                            color_write_enable: true,
+                        },
+                    );
+                    let depth_stencil_state = DepthStencilState {
+                        depth: Some(DepthState::default()),
+                        ..Default::default()
                     };
-                let pipeline = build_pipeline::<CombinedVertex>(
-                    self.context.device().clone(),
-                    swapchain_format,
-                    pipeline_layout,
-                    vs,
-                    fs,
-                    color_blend_state,
-                    depth_stencil_state,
-                    cull_mode,
-                );
 
-                let material_sets = HashMap::new();
+                    (color_blend_state, depth_stencil_state, CullMode::None)
+                } else {
+                    let color_blend_state = ColorBlendState::with_attachment_states(
+                        1,
+                        ColorBlendAttachmentState::default(),
+                    );
+                    let depth_stencil_state = DepthStencilState {
+                        depth: Some(DepthState::simple()),
+                        ..Default::default()
+                    };
 
-                let prim_indices = HashSet::new();
-
-                let pipeline = PipelineContext {
-                    pipeline,
-                    material_sets,
-                    prim_indices,
+                    (color_blend_state, depth_stencil_state, CullMode::Back)
                 };
-                let pcx_idx = self.pipeline_manager.pipelines.len();
-                self.pipeline_manager.pipelines.push(pipeline);
 
-                pcx_idx
-            });
+            let pipeline = build_pipeline::<CombinedVertex>(
+                self.context.device().clone(),
+                swapchain_format,
+                pipeline_layout,
+                vs,
+                fs,
+                color_blend_state,
+                depth_stencil_state,
+                cull_mode,
+            );
+            let material_sets = HashMap::new();
 
-        self.pipeline_manager.pipelines[*pcx_idx].prim_indices.insert(prim_idx);
-
-        self.pipeline_manager.pipelines[*pcx_idx]
-            .material_sets
-            .entry(mat_idx)
-            .or_insert_with(|| (material_set, texture_set));
+            PipelineContext {
+                pipeline,
+                material_sets,
+            }
+        })
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_pipeline<V: Vertex>(
     device: Arc<Device>,
     swapchain_format: Format,
@@ -418,7 +361,7 @@ pub fn build_pipeline<V: Vertex>(
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
-        .unwrap()
+    .unwrap()
 }
 
 impl Allocators {
