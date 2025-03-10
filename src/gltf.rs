@@ -308,7 +308,7 @@ impl From<gltf::material::Specular<'_>> for Specular {
     }
 }
 
-fn to_array<const N: usize>(value: Value) -> [f32; N] {
+fn to_array<const N: usize>(value: &Value) -> [f32; N] {
     value
         .as_array()
         .unwrap()
@@ -325,7 +325,7 @@ impl From<Value> for Sheen {
 
         let mut sheen = Self::default();
 
-        if let Some(color_factor) = map.remove("sheenColorFactor").map(to_array) {
+        if let Some(color_factor) = map.remove("sheenColorFactor").as_ref().map(to_array) {
             sheen.color_factor = color_factor;
         }
         sheen.color_texture = map.remove("sheenColorTexture").map(Into::into);
@@ -484,7 +484,11 @@ impl From<Value> for DiffuseTransmission {
             diffuse_transmission.factor = factor;
         }
         diffuse_transmission.texture = map.remove("diffuseTransmissionTexture").map(Into::into);
-        if let Some(color_factor) = map.remove("diffuseTransmissionColorFactor").map(to_array) {
+        if let Some(color_factor) = map
+            .remove("diffuseTransmissionColorFactor")
+            .as_ref()
+            .map(to_array)
+        {
             diffuse_transmission.color_factor = color_factor;
         }
         diffuse_transmission.color_texture = map
@@ -508,13 +512,13 @@ impl From<Value> for TextureTransform {
 
         let mut texture_transform = Self::default();
 
-        if let Some(offset) = map.remove("offset").map(to_array) {
+        if let Some(offset) = map.remove("offset").as_ref().map(to_array) {
             texture_transform.offset = offset;
         }
         if let Some(rotation) = map.remove("rotation").map(|v| v.as_f64().unwrap() as f32) {
             texture_transform.rotation = rotation;
         }
-        if let Some(scale) = map.remove("scale").map(to_array) {
+        if let Some(scale) = map.remove("scale").as_ref().map(to_array) {
             texture_transform.scale = scale;
         }
         texture_transform.tex_coord = map.remove("texCoord").map(|v| v.as_i64().unwrap() as u32);
@@ -729,6 +733,7 @@ pub struct TextureMap {
     pub usage: Option<TextureUsage>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<Gltf, Error> {
     let mut start_time = Instant::now();
     let f = File::open(&path)?;

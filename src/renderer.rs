@@ -12,12 +12,14 @@ use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, BufferImageCopy, CopyBufferToImageInfo, PrimaryAutoCommandBuffer,
 };
-use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
+use vulkano::descriptor_set::allocator::{
+    StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
+};
 use vulkano::descriptor_set::layout::{
     DescriptorSetLayout, DescriptorSetLayoutCreateInfo, DescriptorType,
 };
 use vulkano::descriptor_set::DescriptorSet;
-use vulkano::device::{Device, DeviceExtensions, DeviceFeatures, Queue};
+use vulkano::device::{Device, DeviceExtensions, DeviceFeatures};
 use vulkano::format::Format;
 use vulkano::half::f16;
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
@@ -25,11 +27,9 @@ use vulkano::image::{
     Image, ImageAspects, ImageCreateFlags, ImageCreateInfo, ImageFormatInfo,
     ImageSubresourceLayers, ImageType, ImageUsage,
 };
-use vulkano::instance::InstanceCreateInfo;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::color_blend::{
-    AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
-    ColorComponents,
+    AttachmentBlend, ColorBlendAttachmentState, ColorBlendState, ColorComponents,
 };
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
@@ -185,8 +185,6 @@ struct FormatGraphNode {
 
 #[derive(Clone, Copy)]
 struct FormatGraphEdge {
-    pub from: TextureType,
-    pub to: TextureType,
     pub conv: fn(&[u8]) -> Vec<u8>,
 }
 
@@ -194,9 +192,9 @@ pub struct FormatGraph {
     nodes: HashMap<TextureType, FormatGraphNode>,
 }
 
-impl Into<TextureType> for Format {
-    fn into(self) -> TextureType {
-        match self {
+impl From<Format> for TextureType {
+    fn from(format: Format) -> Self {
+        match format {
             Format::R8_UNORM => TextureType {
                 format: TextureFormat::R8,
                 is_srgb: false,
@@ -253,12 +251,13 @@ impl Into<TextureType> for Format {
                 format: TextureFormat::R32G32B32A32FLOAT,
                 is_srgb: false,
             },
-            _ => panic!("Unsupported format: {:?}", self),
+            _ => panic!("Unsupported format: {format:?}"),
         }
     }
 }
 
 impl FormatGraph {
+    #[allow(clippy::too_many_lines)]
     fn new(supported_formats: Vec<Format>) -> FormatGraph {
         dbg!(&supported_formats);
         let mut nodes = HashMap::new();
@@ -290,8 +289,6 @@ impl FormatGraph {
                     .insert(
                         to,
                         FormatGraphEdge {
-                            from,
-                            to,
                             conv: |pixels| {
                                 pixels
                                     .chunks_exact(3)
@@ -317,8 +314,6 @@ impl FormatGraph {
                     .insert(
                         to,
                         FormatGraphEdge {
-                            from,
-                            to,
                             conv: |pixels| {
                                 pixels
                                     .chunks_exact(2)
@@ -345,11 +340,7 @@ impl FormatGraph {
                     .insert(
                         to,
                         FormatGraphEdge {
-                            from,
-                            to,
-                            conv: |pixels| {
-                                pixels.into_iter().flat_map(|&pixel| [pixel, 0]).collect()
-                            },
+                            conv: |pixels| pixels.iter().flat_map(|&pixel| [pixel, 0]).collect(),
                         },
                     );
             }
@@ -369,8 +360,6 @@ impl FormatGraph {
                     .insert(
                         to,
                         FormatGraphEdge {
-                            from,
-                            to,
                             conv: |pixels| {
                                 pixels
                                     .chunks_exact(2)
@@ -391,17 +380,13 @@ impl FormatGraph {
         let mut queue = vec![(&from, Vec::<FormatGraphEdge>::new())];
         let mut visited = HashSet::new();
 
-        print!("Converting {}", from);
-
         while let Some((format, edges)) = queue.pop() {
-            if let Some(node) = self.nodes.get(&format) {
+            if let Some(node) = self.nodes.get(format) {
                 if let Some(out) = node.out {
                     let mut bytes = bytes.to_vec();
                     for edge in edges {
-                        print!(" -> {}", edge.to);
                         bytes = (edge.conv)(&bytes);
                     }
-                    println!(" -> {:?}", out);
                     return (out, bytes);
                 }
 
@@ -417,7 +402,7 @@ impl FormatGraph {
                 }
             }
         }
-        panic!("No suitable conversion from {:?} found!", from);
+        panic!("No suitable conversion from {from:?} found!");
     }
 }
 
@@ -550,8 +535,8 @@ impl Renderer {
         spec: SpecializationConstants,
         pipeline_layout: Arc<PipelineLayout>,
         format: Format,
-        vs: Arc<ShaderModule>,
-        fs: Arc<ShaderModule>,
+        vs: &Arc<ShaderModule>,
+        fs: &Arc<ShaderModule>,
     ) -> &mut PipelineContext {
         self.pipelines.entry(spec).or_insert_with(|| {
             let constants: Vec<_> = spec.into();
@@ -619,6 +604,7 @@ impl Renderer {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upload_pixels<T: BufferContents + Send + Sync, I: IntoIterator<Item = T>>(
         &self,
         pixels: I,
@@ -892,7 +878,7 @@ impl Allocators {
 
         let descriptor_set = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
-            Default::default(),
+            StandardDescriptorSetAllocatorCreateInfo::default(),
         ));
 
         let command_buffer = Arc::new(StandardCommandBufferAllocator::new(

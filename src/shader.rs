@@ -495,6 +495,7 @@ impl std::fmt::Display for ObjectSpecializationConstants {
 }
 
 impl std::fmt::Display for MaterialSpecializationConstants {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut sep = "";
         let delim = " ";
