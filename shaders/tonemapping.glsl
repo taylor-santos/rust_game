@@ -102,11 +102,36 @@ vec3 toneMap_KhronosPbrNeutral( vec3 color )
     float g = 1. - 1. / (desaturation * (peak - newPeak) + 1.);
     return mix(color, newPeak * vec3(1, 1, 1), g);
 }
+
+vec3 toneMap_InverseKhronosPbrNeutral( vec3 color )
+{
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak > startCompression) {
+        const float d = 1. - startCompression;
+        float oldPeak = d * d / (1 - peak) - d + startCompression;
+        float fInv = desaturation * (oldPeak - peak) + 1;
+        float f = 1. / fInv;
+        float scale = oldPeak / peak;
+        color = (color + vec3((f - 1) * peak)) * fInv * scale;
+    }
+    float y = min(color.r, min(color.g, color.b));
+    float offset = 0.04;
+    if (y < 0.04) {
+        float x = sqrt(y / 6.25);
+        offset = x - 6.25 * x * x;
+    }
+    color += vec3(offset);
+
+    return color;
+}
 #endif
 
-vec3 toneMap(vec3 color)
+vec3 toneMap(vec3 color, float exposure)
 {
-    color *= c.u_Exposure;
+    color *= exposure;
 
 #ifdef TONEMAP_ACES_NARKOWICZ
     color = toneMapACES_Narkowicz(color);

@@ -16,15 +16,15 @@ use crate::camera::FirstPersonCamera;
 use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, Scene, TextureFormat};
 use crate::gui::Gui;
 use crate::material::{AlphaMode, Material};
-use crate::renderer::{PipelineContext, Renderer, RendererContext};
+use crate::renderer::{PipelineContext, Pixels, Renderer, RendererContext, TextureType};
 use crate::shader::{
-    cubemap_fs, cubemap_vs, fs, vs, MaterialSpecializationConstants, ObjectSpecializationConstants,
-    RenderType, SpecializationConstants,
+    cubemap_fs, cubemap_vs, fs, tonemap_fs, tonemap_vs, vs, MaterialSpecializationConstants,
+    ObjectSpecializationConstants, RenderType, SpecializationConstants,
 };
 use c_str_macro::c_str;
 use cgmath::num_traits::Float;
 use cgmath::{EuclideanSpace, Matrix, Matrix4, MetricSpace, SquareMatrix};
-use image::{ColorType, DynamicImage, ImageBuffer, ImageReader};
+use image::{ColorType, DynamicImage, GrayImage, ImageBuffer, ImageReader};
 use imgui::sys::{
     igDockSpaceOverViewport, igGetMainViewport, ImGuiDockNodeFlags_PassthruCentralNode,
 };
@@ -36,6 +36,7 @@ use rayon::prelude::*;
 use std::cmp::min;
 use std::collections::{HashSet, VecDeque};
 use std::f32::consts::PI;
+use std::net::Shutdown::Write;
 use std::ptr::null;
 use std::time::{Duration, Instant};
 use std::{error::Error, sync::Arc};
@@ -160,115 +161,19 @@ struct RenderContext {
     cubemap_index_buffer: Subbuffer<[u32]>,
     cubemap_vertex_buffer: Subbuffer<[CubemapVertex]>,
     cubemap_index_count: u32,
-    intermediate_image_view: Arc<ImageView>,
+    tonemap_pipeline: Arc<GraphicsPipeline>,
+    transmissive_framebuffer_view: Arc<ImageView>,
+    tonemap_framebuffer_view: Arc<ImageView>,
     const_set: Arc<DescriptorSet>,
     skybox_set: Arc<DescriptorSet>,
-    framebuffer_set: Arc<DescriptorSet>,
+    transmissive_framebuffer_set: Arc<DescriptorSet>,
     viewport: Viewport,
     frame_times: VecDeque<Instant>,
     imgui_platform: WinitPlatform,
     imgui_renderer: imgui_vulkano_renderer::Renderer,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn upload_image<T: BufferContents + Send + Sync, I: IntoIterator<Item = T>>(
-    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    pixels: I,
-    extent: [u32; 3],
-    mip_levels: u32,
-    array_layers: u32,
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
-    queue: &Arc<Queue>,
-    format: Format,
-) -> Result<Arc<ImageView>, impl Error>
-where
-    I::IntoIter: ExactSizeIterator,
-{
-    let upload_buffer = create_buffer(
-        memory_allocator.clone(),
-        command_buffer_allocator.clone(),
-        queue,
-        BufferUsage::TRANSFER_SRC,
-        pixels,
-    );
-
-    let flags = if array_layers == 6 {
-        ImageCreateFlags::CUBE_COMPATIBLE
-    } else {
-        ImageCreateFlags::empty()
-    };
-
-    let image = Image::new(
-        memory_allocator.clone(),
-        ImageCreateInfo {
-            flags,
-            array_layers,
-            image_type: ImageType::Dim2d,
-            mip_levels,
-            format,
-            extent,
-            usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
-            ..Default::default()
-        },
-        AllocationCreateInfo::default(),
-    )
-    .unwrap();
-
-    let regions = {
-        let mut buffer_offset = 0;
-        let mut mip_width = extent[0];
-        let mut mip_height = extent[1];
-        (0..mip_levels)
-            .map(|mip_level| {
-                let region = BufferImageCopy {
-                    buffer_offset,
-                    image_subresource: ImageSubresourceLayers {
-                        aspects: ImageAspects::COLOR,
-                        mip_level,
-                        array_layers: 0..array_layers,
-                    },
-                    image_extent: [mip_width, mip_height, 1],
-                    ..Default::default()
-                };
-
-                buffer_offset +=
-                    format.block_size() * DeviceSize::from(array_layers * mip_width * mip_height);
-                // Each successive Mip level is 4x smaller than the last, each dimension must be divided by 2
-                mip_width /= 2;
-                mip_height /= 2;
-
-                region
-            })
-            .collect()
-    };
-
-    builder.copy_buffer_to_image(CopyBufferToImageInfo {
-        regions,
-        ..CopyBufferToImageInfo::buffer_image(upload_buffer, image.clone())
-    })?;
-
-    let view_type = if array_layers == 6 {
-        ImageViewType::Cube
-    } else {
-        ImageViewType::Dim2d
-    };
-
-    let create_info = ImageViewCreateInfo {
-        view_type,
-        ..ImageViewCreateInfo::from_image(&image)
-    };
-
-    ImageView::new(image, create_info)
-}
-
-fn load_ktx2(
-    path: &str,
-    image_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
-    queue: &Arc<Queue>,
-) -> Result<Arc<ImageView>, Box<dyn Error>> {
+fn load_ktx2(path: &str) -> Result<(Pixels, ktx2::Header), Box<dyn Error>> {
     let buf = std::fs::read(path)?;
     let reader = ktx2::Reader::new(buf)?;
     let header = reader.header();
@@ -290,7 +195,7 @@ fn load_ktx2(
         })
         .sum::<u32>();
 
-    let bytes: Vec<u8> = reader.levels().fold(
+    let pixels: Vec<u8> = reader.levels().fold(
         Vec::with_capacity(total_bytes as usize),
         |mut bytes, level| {
             let data = match header.supercompression_scheme {
@@ -303,33 +208,15 @@ fn load_ktx2(
         },
     );
     assert_eq!(
-        bytes.len(),
+        pixels.len(),
         total_bytes as usize,
         "Mip levels did not add up to the expected number of bytes",
     );
 
-    let extent: [u32; 3] = [header.pixel_width, header.pixel_height, 1];
-
-    Ok(upload_image(
-        image_builder,
-        bytes,
-        extent,
-        header.level_count,
-        header.face_count,
-        memory_allocator,
-        command_buffer_allocator,
-        queue,
-        Format::R16G16B16A16_SFLOAT,
-    )?)
+    Ok((Pixels::U8(pixels), header))
 }
 
-fn load_png(
-    path: &str,
-    image_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
-    queue: &Arc<Queue>,
-) -> Result<Arc<ImageView>, Box<dyn Error>> {
+fn load_png(path: &str) -> Result<(Pixels, [u32; 3], Format), Box<dyn Error>> {
     let img = ImageReader::open(path)?.decode()?;
     let color = img.color();
     let width = img.width();
@@ -337,31 +224,19 @@ fn load_png(
     match color {
         ColorType::Rgb8 => {
             let pixels = img.to_rgba8().as_raw().to_owned();
-            Ok(upload_image(
-                image_builder,
-                pixels,
+            Ok((
+                Pixels::U8(pixels),
                 [width, height, 1],
-                1,
-                1,
-                memory_allocator,
-                command_buffer_allocator,
-                queue,
                 Format::R8G8B8A8_UNORM,
-            )?)
+            ))
         }
         ColorType::Rgb16 => {
             let pixels = img.to_rgba16().as_raw().to_owned();
-            Ok(upload_image(
-                image_builder,
-                pixels,
+            Ok((
+                Pixels::U16(pixels),
                 [width, height, 1],
-                1,
-                1,
-                memory_allocator,
-                command_buffer_allocator,
-                queue,
                 Format::R16G16B16A16_UNORM,
-            )?)
+            ))
         }
         _ => panic!("Unsupported color type {color:?}"),
     }
@@ -377,7 +252,7 @@ impl App {
             texture_maps,
             mut materials,
             objects,
-        } = load_gltf("models/DragonDispersion.glb").expect("Couldn't load gltf model");
+        } = load_gltf("models/CarConcept/CarConcept.gltf").expect("Couldn't load gltf model");
 
         let timer = Instant::now();
 
@@ -484,10 +359,19 @@ impl App {
             let timer = Instant::now();
 
             let textures: Vec<_> = texture_maps
-                .into_par_iter()
+                .into_iter() // TODO: into_par_iter
                 .map(|texture_map| {
                     let texture = &textures[texture_map.index];
+
                     let is_srgb = texture_map.usage.as_ref().is_some_and(Either::is_left);
+
+                    let conv_pixels = renderer.format_conv.convert(
+                        TextureType {
+                            format: texture.format,
+                            is_srgb,
+                        },
+                        &texture.pixels,
+                    );
 
                     let (pixels, format) = match texture.format {
                         TextureFormat::R16 => {
@@ -590,18 +474,16 @@ impl App {
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|(pixels, extent, format)| {
-                    upload_image(
-                        &mut image_builder,
-                        pixels,
-                        extent,
-                        1,
-                        1,
-                        &renderer.allocators.memory,
-                        &renderer.allocators.command_buffer,
-                        renderer.context.graphics_queue(),
-                        format,
-                    )
-                    .unwrap()
+                    renderer
+                        .upload_image(
+                            &mut image_builder,
+                            Pixels::U8(pixels), // TODO
+                            extent,
+                            1,
+                            1,
+                            format,
+                        )
+                        .unwrap()
                 })
                 .collect();
 
@@ -618,48 +500,42 @@ impl App {
             let pixel = vec![0u8, 0, 0, 255]; // RGBA black
             let extent: [u32; 3] = [1, 1, 1]; // 1x1 texture
 
-            upload_image(
-                &mut image_builder,
-                pixel,
-                extent,
-                1,
-                1,
-                &renderer.allocators.memory,
-                &renderer.allocators.command_buffer,
-                renderer.context.graphics_queue(),
-                Format::R8G8B8A8_UNORM,
-            )
-            .unwrap()
+            renderer
+                .upload_image(
+                    &mut image_builder,
+                    Pixels::U8(pixel),
+                    extent,
+                    1,
+                    1,
+                    Format::R8G8B8A8_UNORM,
+                )
+                .unwrap()
         };
 
         let skyboxes = {
             let env = "helipad";
 
-            let lambertian = load_ktx2(
-                format!("textures/{env}/lambertian/diffuse.ktx2").as_str(),
-                &mut image_builder,
-                &renderer.allocators.memory,
-                &renderer.allocators.command_buffer,
-                renderer.context.graphics_queue(),
-            )
-            .unwrap();
-            let ggx = load_ktx2(
-                format!("textures/{env}/ggx/specular.ktx2").as_str(),
-                &mut image_builder,
-                &renderer.allocators.memory,
-                &renderer.allocators.command_buffer,
-                renderer.context.graphics_queue(),
-            )
-            .unwrap();
-
-            let charlie = load_ktx2(
-                format!("textures/{env}/charlie/sheen.ktx2").as_str(),
-                &mut image_builder,
-                &renderer.allocators.memory,
-                &renderer.allocators.command_buffer,
-                renderer.context.graphics_queue(),
-            )
-            .unwrap();
+            let [lambertian, ggx, charlie] = {
+                ["lambertian/diffuse", "ggx/specular", "charlie/sheen"].map(|path| {
+                    let (pixels, header) =
+                        load_ktx2(format!("textures/{env}/{path}.ktx2").as_str()).unwrap();
+                    let extent = [header.pixel_width, header.pixel_height, 1];
+                    let format = match header.format {
+                        Some(ktx2::Format::R16G16B16A16_SFLOAT) => Format::R16G16B16A16_SFLOAT,
+                        _ => panic!("Unsupported KTX2 format: {:?}", header.format),
+                    };
+                    renderer
+                        .upload_image(
+                            &mut image_builder,
+                            pixels,
+                            extent,
+                            header.level_count,
+                            header.face_count,
+                            format,
+                        )
+                        .unwrap()
+                })
+            };
 
             // let lut_charlie = load_png(
             //     "textures/lut_charlie.png",
@@ -680,57 +556,53 @@ impl App {
             // .unwrap();
 
             let lut_charlie = {
-                let bytes: Vec<_> = include_bytes!("../textures/lut_charlie.bin")
+                let pixels: Vec<_> = include_bytes!("../textures/lut_charlie.bin")
                     .chunks_exact(2)
                     .map(|chunk| {
                         let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                         f16::from_bits(bits)
                     })
                     .collect();
-                upload_image(
-                    &mut image_builder,
-                    bytes,
-                    [1024, 1024, 1],
-                    1,
-                    1,
-                    &renderer.allocators.memory,
-                    &renderer.allocators.command_buffer,
-                    renderer.context.graphics_queue(),
-                    Format::R16G16B16A16_SFLOAT,
-                )
-                .unwrap()
+
+                renderer
+                    .upload_image(
+                        &mut image_builder,
+                        Pixels::F16(pixels),
+                        [1024, 1024, 1],
+                        1,
+                        1,
+                        Format::R16G16B16A16_SFLOAT,
+                    )
+                    .unwrap()
             };
 
             let lut_ggx = {
-                let bytes: Vec<_> = include_bytes!("../textures/lut_ggx.bin")
+                let pixels: Vec<_> = include_bytes!("../textures/lut_ggx.bin")
                     .chunks_exact(2)
                     .map(|chunk| {
                         let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                         f16::from_bits(bits)
                     })
                     .collect();
-                upload_image(
-                    &mut image_builder,
-                    bytes,
-                    [1024, 1024, 1],
-                    1,
-                    1,
-                    &renderer.allocators.memory,
-                    &renderer.allocators.command_buffer,
-                    renderer.context.graphics_queue(),
-                    Format::R16G16B16A16_SFLOAT,
-                )
-                .unwrap()
+                renderer
+                    .upload_image(
+                        &mut image_builder,
+                        Pixels::F16(pixels),
+                        [1024, 1024, 1],
+                        1,
+                        1,
+                        Format::R16G16B16A16_SFLOAT,
+                    )
+                    .unwrap()
             };
 
-            let lut_sheen_e = load_png(
-                "textures/lut_sheen_E.png",
-                &mut image_builder,
-                &renderer.allocators.memory,
-                &renderer.allocators.command_buffer,
-                renderer.context.graphics_queue(),
-            )
-            .unwrap();
+            let lut_sheen_e = {
+                let (pixels, extent, format) = load_png("textures/lut_sheen_E.png").unwrap();
+
+                renderer
+                    .upload_image(&mut image_builder, pixels, extent, 1, 1, format)
+                    .unwrap()
+            };
 
             Skybox {
                 lambertian,
@@ -945,7 +817,7 @@ fn build_material_texture_sets(
 
     let material_set = DescriptorSet::new(
         descriptor_set_allocator.clone(),
-        pipeline_layout.set_layouts().get(3).unwrap().clone(),
+        pipeline_layout.set_layouts()[3].clone(),
         [material_set, mat_sampler_set],
         [],
     )
@@ -953,7 +825,7 @@ fn build_material_texture_sets(
 
     let texture_set = DescriptorSet::new(
         descriptor_set_allocator.clone(),
-        pipeline_layout.set_layouts().get(4).unwrap().clone(),
+        pipeline_layout.set_layouts()[4].clone(),
         textures
             .into_iter()
             .map(|t| t.unwrap_or(null_texture))
@@ -979,8 +851,8 @@ impl ApplicationHandler for App {
             &self.renderer.context,
             &WindowDescriptor {
                 present_mode: PresentMode::Immediate,
-                width: 1920.,
-                height: 1080.,
+                width: 1768.,
+                height: 1891.,
                 scale_factor_override: Some(1.0),
                 ..Default::default()
             },
@@ -1011,25 +883,63 @@ impl ApplicationHandler for App {
         )
         .unwrap();
 
-        let mip_levels = max_mip_levels([window_size.width, window_size.height, 1]);
-        let intermediate_image = Image::new(
-            self.renderer.allocators.memory.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: window_renderer.swapchain_format(),
-                extent: [window_size.width, window_size.height, 1],
-                mip_levels,
-                usage: ImageUsage::COLOR_ATTACHMENT
-                    | ImageUsage::SAMPLED
-                    | ImageUsage::TRANSFER_SRC
-                    | ImageUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .unwrap();
+        let transmissive_framebuffer_view = {
+            let mip_levels = max_mip_levels([window_size.width, window_size.height, 1]);
+            let image = Image::new(
+                self.renderer.allocators.memory.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: Format::R16G16B16A16_SFLOAT,
+                    extent: [window_size.width, window_size.height, 1],
+                    mip_levels,
+                    usage: ImageUsage::COLOR_ATTACHMENT
+                        | ImageUsage::SAMPLED
+                        | ImageUsage::TRANSFER_SRC
+                        | ImageUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .unwrap();
 
-        let intermediate_image_view = ImageView::new_default(intermediate_image).unwrap();
+            ImageView::new_default(image).unwrap()
+        };
+
+        let transmissive_framebuffer_set = {
+            let layout = new_rcx.pipeline_layout.set_layouts()[5].clone();
+            let write_set = WriteDescriptorSet::image_view_sampler(
+                0,
+                transmissive_framebuffer_view.clone(),
+                self.samplers.mirror_sampler_mipmap.clone(),
+            );
+            DescriptorSet::new(
+                self.renderer.allocators.descriptor_set.clone(),
+                layout,
+                [write_set],
+                [],
+            )
+            .unwrap()
+        };
+
+        let tonemap_framebuffer_view = {
+            let image = Image::new(
+                self.renderer.allocators.memory.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: Format::R16G16B16A16_SFLOAT,
+                    extent: [window_size.width, window_size.height, 1],
+                    usage: ImageUsage::COLOR_ATTACHMENT
+                        | ImageUsage::SAMPLED
+                        | ImageUsage::TRANSFER_SRC
+                        | ImageUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .unwrap();
+
+            ImageView::new_default(image).unwrap()
+        };
 
         // Dynamic viewports allow us to recreate just the viewport when the window is resized.
         // Otherwise we would have to recreate the whole pipeline.
@@ -1142,6 +1052,7 @@ impl ApplicationHandler for App {
                     let pcx = self.renderer.add_pipeline(
                         spec,
                         new_rcx.pipeline_layout.clone(),
+                        Format::R16G16B16A16_SFLOAT,
                         vertex_shader.clone(),
                         fragment_shader.clone(),
                     );
@@ -1154,50 +1065,18 @@ impl ApplicationHandler for App {
         let const_set = DescriptorSet::new(
             self.renderer.allocators.descriptor_set.clone(),
             #[allow(clippy::get_first)]
-            new_rcx
-                .pipeline_layout
-                .set_layouts()
-                .get(0)
-                .unwrap()
-                .clone(),
+            new_rcx.pipeline_layout.set_layouts()[0].clone(),
             [const_set],
             [],
         )
         .unwrap();
         let skybox_set = DescriptorSet::new(
             self.renderer.allocators.descriptor_set.clone(),
-            new_rcx
-                .pipeline_layout
-                .set_layouts()
-                .get(2)
-                .unwrap()
-                .clone(),
+            new_rcx.pipeline_layout.set_layouts()[2].clone(),
             skybox_set.clone(),
             [],
         )
         .unwrap();
-
-        // Create descriptor set for the intermediate image (set 5)
-        let framebuffer_set = {
-            let layout = new_rcx
-                .pipeline_layout
-                .set_layouts()
-                .get(5)
-                .unwrap()
-                .clone();
-            let write_set = WriteDescriptorSet::image_view_sampler(
-                0,
-                intermediate_image_view.clone(),
-                self.samplers.mirror_sampler_mipmap.clone(),
-            );
-            DescriptorSet::new(
-                self.renderer.allocators.descriptor_set.clone(),
-                layout,
-                [write_set],
-                [],
-            )
-            .unwrap()
-        };
 
         let cubemap_pipeline = {
             let cubemap_layout = {
@@ -1264,7 +1143,7 @@ impl ApplicationHandler for App {
 
             renderer::build_pipeline::<CubemapVertex>(
                 self.renderer.context.device().clone(),
-                swapchain_format,
+                Format::R16G16B16A16_SFLOAT,
                 cubemap_layout,
                 vs,
                 fs,
@@ -1328,6 +1207,74 @@ impl ApplicationHandler for App {
         }
          */
 
+        let tonemap_pipeline = {
+            let tonemap_layout = {
+                let bindings = [
+                    // set = 0
+                    vec![
+                        DescriptorType::CombinedImageSampler, // binding = 0 uniform sampler2D u_framebuffer
+                    ],
+                ];
+
+                PipelineLayout::new(
+                    self.renderer.context.device().clone(),
+                    PipelineLayoutCreateInfo {
+                        set_layouts: bindings
+                            .into_iter()
+                            .map(|set| {
+                                DescriptorSetLayout::new(
+                                    self.renderer.context.device().clone(),
+                                    DescriptorSetLayoutCreateInfo {
+                                        bindings: set
+                                            .into_iter()
+                                            .enumerate()
+                                            .map(|(idx, binding)| {
+                                                (
+                                                    idx as u32,
+                                                    (&DescriptorBindingRequirements {
+                                                        descriptor_types: vec![binding],
+                                                        descriptor_count: Some(1),
+                                                        stages: ShaderStages::all_graphics(),
+                                                        ..Default::default()
+                                                    })
+                                                        .into(),
+                                                )
+                                            })
+                                            .collect(),
+                                        ..Default::default()
+                                    },
+                                )
+                                .unwrap()
+                            })
+                            .collect::<Vec<_>>(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            };
+            let vs = tonemap_vs::load(self.renderer.context.device().clone())
+                .unwrap()
+                .entry_point("main")
+                .unwrap();
+            let fs = tonemap_fs::load(self.renderer.context.device().clone())
+                .unwrap()
+                .entry_point("main")
+                .unwrap();
+
+            let color_blend_state = ColorBlendState::with_attachment_states(1, Default::default());
+            let depth_stencil_state = DepthStencilState::default();
+
+            renderer::build_fullscreen_pipeline(
+                self.renderer.context.device().clone(),
+                swapchain_format,
+                tonemap_layout,
+                vs,
+                fs,
+                color_blend_state,
+                depth_stencil_state,
+            )
+        };
+
         self.renderer.rcx.replace(new_rcx);
 
         self.rcx.replace(RenderContext {
@@ -1335,10 +1282,12 @@ impl ApplicationHandler for App {
             cubemap_index_buffer,
             cubemap_vertex_buffer,
             cubemap_index_count,
-            intermediate_image_view,
+            tonemap_pipeline,
+            transmissive_framebuffer_view,
+            tonemap_framebuffer_view,
             const_set,
             skybox_set,
-            framebuffer_set,
+            transmissive_framebuffer_set,
             viewport,
             frame_times,
             imgui_platform,
@@ -1456,38 +1405,54 @@ impl ApplicationHandler for App {
                             .map(|image| ImageView::new_default(image.image().clone()).unwrap())
                             .collect();
 
-                        let mip_levels = max_mip_levels([window_size.width, window_size.height, 1]);
-                        let intermediate_image = Image::new(
-                            self.renderer.allocators.memory.clone(),
-                            ImageCreateInfo {
-                                image_type: ImageType::Dim2d,
-                                format: swapchain_format,
-                                extent: [window_size.width, window_size.height, 1],
-                                mip_levels,
-                                usage: ImageUsage::COLOR_ATTACHMENT
-                                    | ImageUsage::SAMPLED
-                                    | ImageUsage::TRANSFER_SRC
-                                    | ImageUsage::TRANSFER_DST,
-                                ..Default::default()
-                            },
-                            AllocationCreateInfo::default(),
-                        )
-                        .expect("Failed to create intermediate image");
+                        rcx.tonemap_framebuffer_view = {
+                            let image = Image::new(
+                                self.renderer.allocators.memory.clone(),
+                                ImageCreateInfo {
+                                    image_type: ImageType::Dim2d,
+                                    format: Format::R16G16B16A16_SFLOAT,
+                                    extent: [window_size.width, window_size.height, 1],
+                                    usage: ImageUsage::COLOR_ATTACHMENT
+                                        | ImageUsage::SAMPLED
+                                        | ImageUsage::TRANSFER_SRC
+                                        | ImageUsage::TRANSFER_DST,
+                                    ..Default::default()
+                                },
+                                AllocationCreateInfo::default(),
+                            )
+                            .unwrap();
 
-                        rcx.intermediate_image_view = ImageView::new_default(intermediate_image)
-                            .expect("Failed to create intermediate image view");
+                            ImageView::new_default(image).unwrap()
+                        };
 
-                        // Update framebuffer descriptor set with new intermediate image
-                        rcx.framebuffer_set = {
-                            let layout = new_rcx
-                                .pipeline_layout
-                                .set_layouts()
-                                .get(5)
-                                .unwrap()
-                                .clone();
+                        rcx.transmissive_framebuffer_view = {
+                            let mip_levels =
+                                max_mip_levels([window_size.width, window_size.height, 1]);
+                            let image = Image::new(
+                                self.renderer.allocators.memory.clone(),
+                                ImageCreateInfo {
+                                    image_type: ImageType::Dim2d,
+                                    format: Format::R16G16B16A16_SFLOAT,
+                                    extent: [window_size.width, window_size.height, 1],
+                                    mip_levels,
+                                    usage: ImageUsage::COLOR_ATTACHMENT
+                                        | ImageUsage::SAMPLED
+                                        | ImageUsage::TRANSFER_SRC
+                                        | ImageUsage::TRANSFER_DST,
+                                    ..Default::default()
+                                },
+                                AllocationCreateInfo::default(),
+                            )
+                            .unwrap();
+
+                            ImageView::new_default(image).unwrap()
+                        };
+
+                        rcx.transmissive_framebuffer_set = {
+                            let layout = new_rcx.pipeline_layout.set_layouts()[5].clone();
                             let write_set = WriteDescriptorSet::image_view_sampler(
                                 0,
-                                rcx.intermediate_image_view.clone(),
+                                rcx.transmissive_framebuffer_view.clone(),
                                 self.samplers.mirror_sampler_mipmap.clone(),
                             );
                             DescriptorSet::new(
@@ -1594,6 +1559,29 @@ impl ApplicationHandler for App {
                     b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
+                let mut transmissive_sorted = Vec::new();
+                for pcx in transmissive_objects {
+                    for &prim_idx in pcx.material_sets.keys() {
+                        let prim = &self.prim_infos[prim_idx];
+                        for obj_idx in prim.object_ids.iter().copied() {
+                            let object = &self.scene.objects[obj_idx];
+                            if !object.enabled {
+                                continue;
+                            }
+                            let transform = object.transform;
+                            let dist = self
+                                .camera
+                                .position
+                                .to_vec()
+                                .distance2(transform.w.truncate());
+                            transmissive_sorted.push((dist, obj_idx, prim_idx, pcx));
+                        }
+                    }
+                }
+                transmissive_sorted.sort_by(|(a, ..), (b, ..)| {
+                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
                 let cam_set = {
                     let aspect_ratio = window_size.width as f32 / window_size.height as f32;
                     let proj = self.camera.projection_matrix(aspect_ratio);
@@ -1619,12 +1607,7 @@ impl ApplicationHandler for App {
 
                     DescriptorSet::new(
                         self.renderer.allocators.descriptor_set.clone(),
-                        new_rcx
-                            .pipeline_layout
-                            .set_layouts()
-                            .get(1)
-                            .unwrap()
-                            .clone(),
+                        new_rcx.pipeline_layout.set_layouts()[1].clone(),
                         [write_set],
                         [],
                     )
@@ -1635,6 +1618,7 @@ impl ApplicationHandler for App {
                     .set_viewport(0, std::iter::once(rcx.viewport.clone()).collect())
                     .unwrap();
 
+                // Skybox/Opaque/translucent pass
                 builder
                     .begin_rendering(RenderingInfo {
                         color_attachments: vec![Some(RenderingAttachmentInfo {
@@ -1642,9 +1626,7 @@ impl ApplicationHandler for App {
                             store_op: AttachmentStoreOp::Store,
                             clear_value: Some(ClearValue::Float([1.0, 0.0, 1.0, 1.0])),
                             ..RenderingAttachmentInfo::image_view(
-                                new_rcx.attachment_image_views
-                                    [window_renderer.image_index() as usize]
-                                    .clone(),
+                                rcx.tonemap_framebuffer_view.clone(),
                             )
                         })],
                         depth_attachment: Some(RenderingAttachmentInfo {
@@ -1732,7 +1714,7 @@ impl ApplicationHandler for App {
                         PipelineBindPoint::Graphics,
                         new_rcx.pipeline_layout.clone(),
                         5,
-                        rcx.framebuffer_set.clone(),
+                        rcx.transmissive_framebuffer_set.clone(),
                     )
                     .unwrap();
 
@@ -1814,84 +1796,182 @@ impl ApplicationHandler for App {
                     .end_rendering()
                     .unwrap();
 
-                if !transmissive_objects.is_empty() {
-                    // Render transmissive geometry
-                    let src_image = new_rcx.attachment_image_views
-                        [window_renderer.image_index() as usize]
-                        .image();
-                    let dst_image = rcx.intermediate_image_view.image();
+                if !transmissive_sorted.is_empty() {
                     builder
-                        .blit_image(BlitImageInfo::images(src_image.clone(), dst_image.clone()))
+                        .bind_descriptor_sets(
+                            PipelineBindPoint::Graphics,
+                            new_rcx.pipeline_layout.clone(),
+                            5,
+                            rcx.transmissive_framebuffer_set.clone(),
+                        )
                         .unwrap();
-                    let dimensions = src_image.extent();
-                    let mip_levels = max_mip_levels(dimensions);
-                    for mip_level in 1..mip_levels {
-                        let regions = [ImageBlit {
-                            src_subresource: ImageSubresourceLayers {
-                                aspects: dst_image.format().aspects(),
-                                mip_level: mip_level - 1,
-                                array_layers: 0..dst_image.array_layers(),
-                            },
-                            dst_subresource: ImageSubresourceLayers {
-                                aspects: dst_image.format().aspects(),
-                                mip_level,
-                                array_layers: 0..dst_image.array_layers(),
-                            },
-                            src_offsets: [
-                                [0, 0, 0],
-                                mip_level_extent(dimensions, mip_level - 1).unwrap(),
-                            ],
-                            dst_offsets: [
-                                [0, 0, 0],
-                                mip_level_extent(dimensions, mip_level).unwrap(),
-                            ],
-                            ..Default::default()
-                        }];
+                    // Render transmissive geometry
+                    let mut curr_pcx = None;
+                    for (_, obj_idx, prim_idx, pcx) in transmissive_sorted {
+                        let src_image = rcx.tonemap_framebuffer_view.image();
+                        let dst_image = rcx.transmissive_framebuffer_view.image();
                         builder
-                            .blit_image(BlitImageInfo {
-                                src_image_layout: ImageLayout::General,
-                                dst_image_layout: ImageLayout::General,
-                                regions: regions.into(),
-                                filter: Filter::Linear,
-                                ..BlitImageInfo::images(dst_image.clone(), dst_image.clone())
+                            .blit_image(BlitImageInfo::images(src_image.clone(), dst_image.clone()))
+                            .unwrap();
+                        let dimensions = src_image.extent();
+                        let mip_levels = max_mip_levels(dimensions);
+                        for mip_level in 1..mip_levels {
+                            let regions = [ImageBlit {
+                                src_subresource: ImageSubresourceLayers {
+                                    aspects: dst_image.format().aspects(),
+                                    mip_level: mip_level - 1,
+                                    array_layers: 0..dst_image.array_layers(),
+                                },
+                                dst_subresource: ImageSubresourceLayers {
+                                    aspects: dst_image.format().aspects(),
+                                    mip_level,
+                                    array_layers: 0..dst_image.array_layers(),
+                                },
+                                src_offsets: [
+                                    [0, 0, 0],
+                                    mip_level_extent(dimensions, mip_level - 1).unwrap(),
+                                ],
+                                dst_offsets: [
+                                    [0, 0, 0],
+                                    mip_level_extent(dimensions, mip_level).unwrap(),
+                                ],
+                                ..Default::default()
+                            }];
+                            builder
+                                .blit_image(BlitImageInfo {
+                                    src_image_layout: ImageLayout::General,
+                                    dst_image_layout: ImageLayout::General,
+                                    regions: regions.into(),
+                                    filter: Filter::Linear,
+                                    ..BlitImageInfo::images(dst_image.clone(), dst_image.clone())
+                                })
+                                .unwrap();
+                        }
+                        builder
+                            .begin_rendering(RenderingInfo {
+                                color_attachments: vec![Some(RenderingAttachmentInfo {
+                                    load_op: AttachmentLoadOp::Load, // Load previous contents
+                                    store_op: AttachmentStoreOp::Store,
+                                    ..RenderingAttachmentInfo::image_view(
+                                        rcx.tonemap_framebuffer_view.clone(),
+                                    )
+                                })],
+                                depth_attachment: Some(RenderingAttachmentInfo {
+                                    load_op: AttachmentLoadOp::Load, // Keep depth buffer
+                                    store_op: AttachmentStoreOp::Store,
+                                    ..RenderingAttachmentInfo::image_view(
+                                        new_rcx.depth_image_view.clone(),
+                                    )
+                                }),
+                                ..Default::default()
                             })
                             .unwrap();
-                    }
-                    builder
-                        .begin_rendering(RenderingInfo {
-                            color_attachments: vec![Some(RenderingAttachmentInfo {
-                                load_op: AttachmentLoadOp::Load, // Load previous contents
-                                store_op: AttachmentStoreOp::Store,
-                                ..RenderingAttachmentInfo::image_view(
-                                    new_rcx.attachment_image_views
-                                        [window_renderer.image_index() as usize]
-                                        .clone(),
-                                )
-                            })],
-                            depth_attachment: Some(RenderingAttachmentInfo {
-                                load_op: AttachmentLoadOp::Load, // Keep depth buffer
-                                store_op: AttachmentStoreOp::Store,
-                                ..RenderingAttachmentInfo::image_view(
-                                    new_rcx.depth_image_view.clone(),
-                                )
-                            }),
-                            ..Default::default()
-                        })
+
+                        let prim = &self.prim_infos[prim_idx];
+                        if curr_pcx.is_none_or(|p| p != (pcx as *const _)) {
+                            builder
+                                .bind_pipeline_graphics(pcx.pipeline.clone())
+                                .unwrap();
+                            curr_pcx.replace(pcx as *const _);
+                        }
+
+                        let (mat_set, tex_set) = pcx.material_sets[&prim_idx].clone();
+
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                new_rcx.pipeline_layout.clone(),
+                                3,
+                                mat_set,
+                            )
+                            .unwrap();
+
+                        builder
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                new_rcx.pipeline_layout.clone(),
+                                4,
+                                tex_set,
+                            )
+                            .unwrap();
+
+                        let object = &self.scene.objects[obj_idx];
+                        let transform = object.transform;
+                        let normal = transform
+                            .transpose()
+                            .invert()
+                            .unwrap_or_else(Matrix4::identity);
+                        let model: [[f32; 4]; 4] = transform.into();
+                        #[allow(clippy::useless_conversion)]
+                        let data = fs::Object {
+                            u_ModelMatrix: model.into(),
+                            u_NormalMatrix: normal.into(),
+                        };
+                        builder
+                            .push_constants(new_rcx.pipeline_layout.clone(), 0, data)
+                            .unwrap();
+                        unsafe {
+                            // We add a draw command.
+                            builder.draw_indexed(
+                                prim.index_count,
+                                1,
+                                prim.index_offset,
+                                prim.vertex_offset,
+                                0,
+                            )
+                        }
                         .unwrap();
 
-                    for pcx in transmissive_objects {
-                        pcx.render(
-                            &mut builder,
-                            &new_rcx.pipeline_layout,
-                            &self.prim_infos,
-                            &self.scene.objects,
-                        );
+                        builder
+                            // We leave the render pass.
+                            .end_rendering()
+                            .unwrap();
                     }
-                    builder
-                        // We leave the render pass.
-                        .end_rendering()
-                        .unwrap();
                 }
+
+                builder
+                    .begin_rendering(RenderingInfo {
+                        color_attachments: vec![Some(RenderingAttachmentInfo {
+                            load_op: AttachmentLoadOp::DontCare,
+                            store_op: AttachmentStoreOp::Store,
+                            ..RenderingAttachmentInfo::image_view(
+                                new_rcx.attachment_image_views
+                                    [window_renderer.image_index() as usize]
+                                    .clone(),
+                            )
+                        })],
+                        ..Default::default()
+                    })
+                    .unwrap();
+
+                let tonemap_set = DescriptorSet::new(
+                    self.renderer.allocators.descriptor_set.clone(),
+                    rcx.tonemap_pipeline.layout().set_layouts()[0].clone(),
+                    [WriteDescriptorSet::image_view_sampler(
+                        0,
+                        rcx.tonemap_framebuffer_view.clone(),
+                        self.samplers.clamp_sampler_no_mipmap.clone(),
+                    )],
+                    [],
+                )
+                .unwrap();
+
+                builder
+                    .bind_pipeline_graphics(rcx.tonemap_pipeline.clone())
+                    .unwrap()
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        rcx.tonemap_pipeline.layout().clone(),
+                        0,
+                        tonemap_set,
+                    )
+                    .unwrap();
+
+                unsafe {
+                    builder.draw(3, 1, 0, 0).unwrap();
+                }
+
+                builder.end_rendering().unwrap();
 
                 let ui = self.imgui_ctx.frame();
 
@@ -2057,12 +2137,23 @@ impl ApplicationHandler for App {
                             .take(mesh.prims_count)
                             .map(|prim| prim.mat_idx)
                             .collect();
-                        gui::mesh_materials(
-                            &mat_ids,
-                            &self.materials,
-                            &mut self.gui.selected_material,
-                            ui,
-                        );
+
+                        if !mat_ids.is_empty() {
+                            if self
+                                .gui
+                                .selected_material
+                                .is_none_or(|idx| !mat_ids.contains(&idx))
+                            {
+                                self.gui.selected_material.replace(mat_ids[0]);
+                            }
+
+                            gui::mesh_materials(
+                                &mat_ids,
+                                &self.materials,
+                                &mut self.gui.selected_material,
+                                ui,
+                            );
+                        }
                     }
                 }
 
@@ -2249,17 +2340,23 @@ impl ApplicationHandler for App {
 
                     let pipeline_layout = new_rcx.pipeline_layout.clone();
 
-                    if let Some(true) = changed {
-                        for prim_idx in self.mat_prims[mat_idx].iter().copied() {
-                            let prim = &self.prim_infos[prim_idx];
-                            let spec = SpecializationConstants {
-                                material_constants: old_mat_spec,
-                                object_constants: prim.obj_spec,
-                            };
-                            let pcx = self.renderer.pipelines.get_mut(&spec).unwrap();
-                            pcx.material_sets.remove(&prim_idx);
-                            if pcx.material_sets.is_empty() {
-                                self.renderer.pipelines.remove(&spec);
+                    if changed.is_some_and(|c| c) {
+                        let new_mat_spec: MaterialSpecializationConstants = (&*mat).into();
+                        if old_mat_spec != new_mat_spec {
+                            // We only need to clean up the old pipeline if the material's specialization
+                            // constants changed. If not, the same pipeline will be used with updated
+                            // descriptor sets.
+                            for prim_idx in self.mat_prims[mat_idx].iter().copied() {
+                                let prim = &self.prim_infos[prim_idx];
+                                let spec = SpecializationConstants {
+                                    material_constants: old_mat_spec,
+                                    object_constants: prim.obj_spec,
+                                };
+                                let pcx = self.renderer.pipelines.get_mut(&spec).unwrap();
+                                pcx.material_sets.remove(&prim_idx);
+                                if pcx.material_sets.is_empty() {
+                                    self.renderer.pipelines.remove(&spec);
+                                }
                             }
                         }
 
@@ -2273,23 +2370,27 @@ impl ApplicationHandler for App {
                             &self.samplers.wrap_sampler_mipmap,
                         );
 
-                        let material_constants: MaterialSpecializationConstants = (&*mat).into();
                         let vs = vs::load(self.renderer.context.device().clone()).unwrap();
                         let fs = fs::load(self.renderer.context.device().clone()).unwrap();
                         for prim_idx in self.mat_prims[mat_idx].iter().copied() {
                             let prim = &self.prim_infos[prim_idx];
                             let spec = SpecializationConstants {
-                                material_constants,
+                                material_constants: new_mat_spec,
                                 object_constants: prim.obj_spec,
                             };
                             let pcx = self.renderer.add_pipeline(
                                 spec,
                                 pipeline_layout.clone(),
+                                Format::R16G16B16A16_SFLOAT,
                                 vs.clone(),
                                 fs.clone(),
                             );
                             pcx.material_sets
                                 .insert(prim_idx, (material_set.clone(), texture_set.clone()));
+                        }
+
+                        for (spec, pcx) in &self.renderer.pipelines {
+                            assert!(!pcx.material_sets.is_empty(), "{:?} is empty!", spec);
                         }
                     }
                 }

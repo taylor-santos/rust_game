@@ -58,6 +58,11 @@ vec3 getTransmissionSample(vec2 fragCoord, float roughness, float ior)
     float framebufferLod = (c.u_FramebufferMipCount-1) * applyIorToRoughness(roughness, ior);
     vec3 transmittedLight = textureLod(u_TransmissionFramebufferSampler, fragCoord.xy, framebufferLod).rgb;
 
+    // transmittedLight = sRGBToLinear(transmittedLight);
+    // transmittedLight = toneMap_InverseKhronosPbrNeutral(transmittedLight);
+    // transmittedLight /= c.u_Exposure;
+
+
     return transmittedLight;
 }
 

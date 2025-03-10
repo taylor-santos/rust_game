@@ -24,12 +24,6 @@ pub mod fs {
             ("USE_IBL", "1"),
             // ("USE_PUNCTUAL", "1"),
 
-            ("TONEMAP_KHR_PBR_NEUTRAL", "1"),
-            // ("TONEMAP_ACES_HILL", "1"),
-            // ("TONEMAP_ACES_HILL_EXPOSURE_BOOST", "1"),
-            // ("TONEMAP_ACES_NARKOWICZ", "1"),
-            // ("LINEAR_OUTPUT", "1"),
-
             ("DEBUG", "DEBUG_NONE"),
             // ("DEBUG", "DEBUG_ALPHA"),
             // ("DEBUG", "DEBUG_ANISOTROPIC_DIRECTION"),
@@ -75,6 +69,22 @@ pub mod cubemap_fs {
     vulkano_shaders::shader! {
         ty: "fragment",
         path: "shaders/cubemap.frag",
+        include: ["shaders"],
+    }
+}
+
+pub mod tonemap_vs {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        path: "shaders/tonemap.vert",
+        include: ["shaders"],
+    }
+}
+
+pub mod tonemap_fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        path: "shaders/tonemap.frag",
         include: ["shaders"],
         define: [
             ("TONEMAP_KHR_PBR_NEUTRAL", "1"),

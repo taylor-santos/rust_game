@@ -15,7 +15,6 @@ layout (set = 0, binding = 0) uniform Constants {
 
 layout (set = 2, binding = 1) uniform samplerCube   u_GGXEnvSampler;
 
-#include <tonemapping.glsl>
 
 void main()
 {
@@ -23,9 +22,5 @@ void main()
     color.rgb *= c.u_EnvIntensity;
     color.a = 1.0;
 
-#ifdef LINEAR_OUTPUT
     FragColor = color.rgba;
-#else
-    FragColor = vec4(toneMap(color.rgb), color.a);
-#endif
 }

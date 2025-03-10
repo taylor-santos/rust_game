@@ -56,7 +56,6 @@ layout (location = 4) in vec3 v_Normal;
 layout (location = 5) in mat3 v_TBN;
 
 #include <shared.glsl>
-#include <tonemapping.glsl>
 #include <textures.glsl>
 #include <functions.glsl>
 #include <brdf.glsl>
@@ -408,11 +407,7 @@ void main()
 
 #if DEBUG == DEBUG_NONE
 
-#ifdef LINEAR_OUTPUT
     g_finalColor = vec4(color.rgb, baseColor.a);
-#else
-    g_finalColor = vec4(toneMap(color), baseColor.a);
-#endif
 
 #else
     // In case of missing data for a debug view, render a checkerboard.
