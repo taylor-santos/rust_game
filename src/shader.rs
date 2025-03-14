@@ -57,18 +57,18 @@ pub mod fs {
     }
 }
 
-pub mod cubemap_vs {
+pub mod skybox_vs {
     vulkano_shaders::shader! {
         ty: "vertex",
-        path: "shaders/cubemap.vert",
+        path: "shaders/skybox.vert",
         include: ["shaders"],
     }
 }
 
-pub mod cubemap_fs {
+pub mod skybox_fs {
     vulkano_shaders::shader! {
         ty: "fragment",
-        path: "shaders/cubemap.frag",
+        path: "shaders/skybox.frag",
         include: ["shaders"],
     }
 }

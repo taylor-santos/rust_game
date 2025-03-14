@@ -1,23 +1,23 @@
 vec3 getDiffuseLight(vec3 n)
 {
-    vec4 textureSample = texture(u_LambertianEnvSampler, c.u_EnvRotation * n);
-    textureSample.rgb *= c.u_EnvIntensity;
+    vec4 textureSample = texture(u_LambertianEnvSampler, env.u_EnvRotation * n);
+    textureSample.rgb *= env.u_EnvIntensity;
     return textureSample.rgb;
 }
 
 
 vec4 getSpecularSample(vec3 reflection, float lod)
 {
-    vec4 textureSample = textureLod(u_GGXEnvSampler, c.u_EnvRotation * reflection, lod);
-    textureSample.rgb *= c.u_EnvIntensity;
+    vec4 textureSample = textureLod(u_GGXEnvSampler, env.u_EnvRotation * reflection, lod);
+    textureSample.rgb *= env.u_EnvIntensity;
     return textureSample;
 }
 
 
 vec4 getSheenSample(vec3 reflection, float lod)
 {
-    vec4 textureSample =  textureLod(u_CharlieEnvSampler, c.u_EnvRotation * reflection, lod);
-    textureSample.rgb *= c.u_EnvIntensity;
+    vec4 textureSample =  textureLod(u_CharlieEnvSampler, env.u_EnvRotation * reflection, lod);
+    textureSample.rgb *= env.u_EnvIntensity;
     return textureSample;
 }
 
@@ -43,7 +43,7 @@ vec3 getIBLGGXFresnel(vec3 n, vec3 v, float roughness, vec3 F0, float specularWe
 vec3 getIBLRadianceGGX(vec3 n, vec3 v, float roughness)
 {
     float NdotV = clampedDot(n, v);
-    float lod = roughness * float(c.u_MipCount - 1);
+    float lod = roughness * float(env.u_MipCount - 1);
     vec3 reflection = normalize(reflect(-v, n));
     vec4 specularSample = getSpecularSample(reflection, lod);
 
@@ -55,13 +55,8 @@ vec3 getIBLRadianceGGX(vec3 n, vec3 v, float roughness)
 
 vec3 getTransmissionSample(vec2 fragCoord, float roughness, float ior)
 {
-    float framebufferLod = (c.u_FramebufferMipCount-1) * applyIorToRoughness(roughness, ior);
+    float framebufferLod = (env.u_FramebufferMipCount-1) * applyIorToRoughness(roughness, ior);
     vec3 transmittedLight = textureLod(u_TransmissionFramebufferSampler, fragCoord.xy, framebufferLod).rgb;
-
-    // transmittedLight = sRGBToLinear(transmittedLight);
-    // transmittedLight = toneMap_InverseKhronosPbrNeutral(transmittedLight);
-    // transmittedLight /= c.u_Exposure;
-
 
     return transmittedLight;
 }
@@ -129,7 +124,7 @@ vec3 getIBLRadianceAnisotropy(vec3 n, vec3 v, float roughness, float anisotropy,
     float bendFactorPow4      = bendFactor * bendFactor * bendFactor * bendFactor;
     vec3  bentNormal          = normalize(mix(anisotropicNormal, n, bendFactorPow4));
 
-    float lod = roughness * float(c.u_MipCount - 1);
+    float lod = roughness * float(env.u_MipCount - 1);
     vec3 reflection = normalize(reflect(-v, bentNormal));
 
     vec4 specularSample = getSpecularSample(reflection, lod);
@@ -143,7 +138,7 @@ vec3 getIBLRadianceAnisotropy(vec3 n, vec3 v, float roughness, float anisotropy,
 vec3 getIBLRadianceCharlie(vec3 n, vec3 v, float sheenRoughness, vec3 sheenColor)
 {
     float NdotV = clampedDot(n, v);
-    float lod = sheenRoughness * float(c.u_MipCount - 1);
+    float lod = sheenRoughness * float(env.u_MipCount - 1);
     vec3 reflection = normalize(reflect(-v, n));
 
     vec2 brdfSamplePoint = clamp(vec2(NdotV, sheenRoughness), vec2(0.0, 0.0), vec2(1.0, 1.0));

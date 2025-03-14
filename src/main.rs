@@ -13,12 +13,15 @@
 // original triangle example.
 
 use crate::camera::FirstPersonCamera;
-use crate::gltf::{load_gltf, CombinedVertex, CubemapVertex, Gltf, Scene};
+use crate::gltf::{load_gltf, CombinedVertex, Gltf, Scene};
 use crate::gui::Gui;
 use crate::material::{AlphaMode, Material};
-use crate::renderer::{PipelineContext, Pixels, Renderer, RendererContext, TextureType};
+use crate::renderer::skybox::{SkyboxTask, SkyboxVertex};
+use crate::renderer::tonemap::TonemapTask;
+use crate::renderer_core::{RendererCore, SwapchainManager};
+use crate::renderer_old::{PipelineContext, Pixels, Renderer, RendererContext, TextureType};
 use crate::shader::{
-    cubemap_fs, cubemap_vs, fs, tonemap_fs, tonemap_vs, vs, MaterialSpecializationConstants,
+    fs, skybox_fs, skybox_vs, tonemap_fs, tonemap_vs, vs, MaterialSpecializationConstants,
     ObjectSpecializationConstants, RenderType, SpecializationConstants,
 };
 use c_str_macro::c_str;
@@ -38,33 +41,43 @@ use std::collections::{HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::ptr::null;
 use std::time::{Duration, Instant};
-use std::{error::Error, sync::Arc};
+use std::{error::Error, slice, sync::Arc};
 use vulkano::buffer::allocator::SubbufferAllocator;
-use vulkano::command_buffer::{
-    BlitImageInfo, CopyBufferInfo, ImageBlit, PrimaryCommandBufferAbstract,
-};
+use vulkano::buffer::IndexType;
+use vulkano::command_buffer::{BlitImageInfo, ImageBlit, PrimaryCommandBufferAbstract};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::layout::{
     DescriptorSetLayout, DescriptorSetLayoutCreateInfo, DescriptorType,
 };
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::DeviceOwned;
-use vulkano::format::{ClearValue, Format};
+use vulkano::device::{Device, DeviceExtensions, DeviceFeatures, DeviceOwned};
+use vulkano::format::{ClearValue, Format, NumericFormat};
 use vulkano::half::f16;
 use vulkano::image::sampler::SamplerAddressMode::{ClampToEdge, MirroredRepeat, Repeat};
-use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo};
+use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
+use vulkano::image::view::{ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{
-    max_mip_levels, mip_level_extent, ImageCreateInfo, ImageLayout, ImageSubresourceLayers,
-    ImageType,
+    max_mip_levels, mip_level_extent, ImageAspects, ImageCreateFlags, ImageCreateInfo, ImageLayout,
+    ImageSubresourceLayers, ImageSubresourceRange, ImageType,
 };
+use vulkano::memory::allocator::DeviceLayout;
 use vulkano::padded::Padded;
 use vulkano::pipeline::graphics::color_blend::ColorBlendAttachmentState;
 use vulkano::pipeline::graphics::depth_stencil::DepthStencilState;
-use vulkano::pipeline::graphics::rasterization::CullMode;
-use vulkano::pipeline::layout::PipelineLayoutCreateInfo;
-use vulkano::pipeline::{Pipeline, PipelineBindPoint};
+use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
+use vulkano::pipeline::graphics::multisample::MultisampleState;
+use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
+use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
+use vulkano::pipeline::graphics::viewport::ViewportState;
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
+use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
+use vulkano::pipeline::{DynamicState, Pipeline, PipelineBindPoint, PipelineShaderStageCreateInfo};
+use vulkano::render_pass::Subpass;
 use vulkano::shader::{DescriptorBindingRequirements, ShaderStages};
-use vulkano::swapchain::PresentMode;
+use vulkano::swapchain::{
+    ColorSpace, CompositeAlpha, PresentMode, Surface, Swapchain, SwapchainCreateInfo,
+};
+use vulkano::sync::PipelineStages;
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
@@ -80,11 +93,27 @@ use vulkano::{
     },
     render_pass::{AttachmentLoadOp, AttachmentStoreOp},
     sync::{self, GpuFuture},
+    DeviceSize, Validated, VulkanError,
 };
-use vulkano_util::window::WindowDescriptor;
+use vulkano_taskgraph::command_buffer::{
+    BufferImageCopy, CopyBufferInfo, CopyBufferToImageInfo, DependencyInfo, ImageMemoryBarrier,
+    RecordingCommandBuffer,
+};
+use vulkano_taskgraph::graph::{
+    AttachmentInfo, CompileInfo, ExecutableTaskGraph, ExecuteError, TaskGraph,
+};
+use vulkano_taskgraph::resource::{
+    AccessTypes, Flight, HostAccessType, ImageLayoutType, Resources, ResourcesCreateInfo,
+};
+use vulkano_taskgraph::{
+    resource_map, ClearValues, Id, QueueFamilyType, Task, TaskContext, TaskResult,
+};
+use vulkano_util::context::{VulkanoConfig, VulkanoContext};
+use vulkano_util::renderer::VulkanoWindowRenderer;
+use vulkano_util::window::{VulkanoWindows, WindowDescriptor};
 use winit::event::{DeviceEvent, DeviceId, ElementState, Event, MouseButton, StartCause};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::CursorGrabMode;
+use winit::window::{CursorGrabMode, Window};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -96,7 +125,12 @@ mod camera;
 mod gltf;
 mod gui;
 mod material;
-mod renderer;
+mod renderer {
+    pub mod skybox;
+    pub mod tonemap;
+}
+mod renderer_core;
+mod renderer_old;
 mod shader;
 mod transform;
 
@@ -105,6 +139,1373 @@ fn main() -> Result<(), impl Error> {
     let mut app = App::new();
 
     event_loop.run_app(&mut app)
+}
+
+struct App {
+    context: VulkanoContext,
+    resources: Arc<Resources>,
+    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+    flight_id: Id<Flight>,
+    frame_timer: FrameTimer,
+    input_state: InputState,
+    rcx: Option<RenderContext>,
+}
+
+pub struct RenderContext {
+    window: Arc<Window>,
+    task_graph: ExecutableTaskGraph<Self>,
+    swapchain_id: Id<Swapchain>,
+    virtual_swapchain_id: Id<Swapchain>,
+    virtual_intermediate_image_id: Id<Image>,
+    intermediate_image_id: Id<Image>,
+    viewport: Viewport,
+    camera: FirstPersonCamera,
+    recreate_swapchain: bool,
+}
+
+struct InputState {
+    forward: bool,
+    backward: bool,
+    left: bool,
+    right: bool,
+    mouse_dx: f64,
+    mouse_dy: f64,
+    cursor_confined: bool,
+}
+
+struct FrameTimer {
+    frequency: Duration,
+    frames: u32,
+    frame_time: Instant,
+    last_frame: Instant,
+}
+
+impl App {
+    fn new() -> Self {
+        let context = VulkanoContext::new(VulkanoConfig {
+            device_features: DeviceFeatures {
+                dynamic_rendering: true,
+                ..Default::default()
+            },
+            device_extensions: DeviceExtensions {
+                khr_swapchain: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let resources = Resources::new(context.device(), &ResourcesCreateInfo::default());
+        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+            context.device().clone(),
+            Default::default(),
+        ));
+        let flight_id = resources.create_flight(8).unwrap();
+        let frame_timer = FrameTimer::new(Duration::from_secs(1));
+        let input_state = InputState::default();
+        let rcx = None;
+
+        Self {
+            context,
+            resources,
+            descriptor_set_allocator,
+            flight_id,
+            frame_timer,
+            input_state,
+            rcx,
+        }
+    }
+
+    fn set_cursor_confinement(&mut self, confined: bool) {
+        let window = &self.rcx.as_ref().unwrap().window;
+        if confined {
+            window
+                .set_cursor_grab(CursorGrabMode::Confined)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
+                .unwrap();
+        } else {
+            window.set_cursor_grab(CursorGrabMode::None).unwrap();
+        }
+        window.set_cursor_visible(!confined);
+        self.input_state.cursor_confined = confined;
+    }
+
+    fn upload_texture(
+        &self,
+        pixels: &[u8],
+        format: Format,
+        extent: [u32; 3],
+        mip_levels: u32,
+        array_layers: u32,
+    ) -> Id<Image> {
+        let staging_buffer_id = self
+            .resources
+            .create_buffer(
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_SRC,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                DeviceLayout::for_value(pixels).unwrap(),
+            )
+            .unwrap();
+
+        let buffer_id = self
+            .resources
+            .create_buffer(
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                    ..Default::default()
+                },
+                DeviceLayout::for_value(pixels).unwrap(),
+            )
+            .unwrap();
+
+        let image_id = {
+            let flags = if array_layers == 6 {
+                ImageCreateFlags::CUBE_COMPATIBLE
+            } else {
+                ImageCreateFlags::empty()
+            };
+            self.resources
+                .create_image(
+                    ImageCreateInfo {
+                        flags,
+                        image_type: ImageType::Dim2d,
+                        mip_levels,
+                        array_layers,
+                        format,
+                        extent,
+                        usage: ImageUsage::COLOR_ATTACHMENT
+                            | ImageUsage::TRANSFER_DST
+                            | ImageUsage::SAMPLED,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo::default(),
+                )
+                .unwrap()
+        };
+
+        let regions: Vec<_> = {
+            let mut buffer_offset = 0;
+            let mut mip_width = extent[0];
+            let mut mip_height = extent[1];
+            (0..mip_levels)
+                .map(|mip_level| {
+                    let region = BufferImageCopy {
+                        buffer_offset,
+                        image_subresource: ImageSubresourceLayers {
+                            aspects: ImageAspects::COLOR,
+                            mip_level,
+                            array_layers: 0..array_layers,
+                        },
+                        image_extent: [mip_width, mip_height, 1],
+                        ..Default::default()
+                    };
+
+                    buffer_offset += format.block_size()
+                        * DeviceSize::from(array_layers * mip_width * mip_height);
+                    // Each successive Mip level is 4x smaller than the last, each dimension must be divided by 2
+                    mip_width /= 2;
+                    mip_height /= 2;
+
+                    region
+                })
+                .collect()
+        };
+
+        unsafe {
+            vulkano_taskgraph::execute(
+                &self.context.graphics_queue(),
+                &self.resources,
+                self.flight_id,
+                |cbf, tcx| {
+                    tcx.write_buffer::<[u8]>(staging_buffer_id, ..)?
+                        .copy_from_slice(pixels);
+                    cbf.copy_buffer(&CopyBufferInfo {
+                        src_buffer: staging_buffer_id,
+                        dst_buffer: buffer_id,
+                        ..Default::default()
+                    })?;
+
+                    cbf.pipeline_barrier(&DependencyInfo {
+                        image_memory_barriers: &[ImageMemoryBarrier {
+                            old_layout: ImageLayout::Undefined,
+                            new_layout: ImageLayout::TransferDstOptimal,
+                            image: image_id,
+                            subresource_range: ImageSubresourceRange {
+                                aspects: ImageAspects::COLOR,
+                                mip_levels: 0..mip_levels,
+                                array_layers: 0..array_layers,
+                            },
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })?;
+
+                    cbf.copy_buffer_to_image(&CopyBufferToImageInfo {
+                        src_buffer: buffer_id,
+                        dst_image: image_id,
+                        dst_image_layout: ImageLayoutType::Optimal,
+                        regions: &regions,
+                        ..Default::default()
+                    })?;
+
+                    cbf.pipeline_barrier(&DependencyInfo {
+                        image_memory_barriers: &[ImageMemoryBarrier {
+                            old_layout: ImageLayout::TransferDstOptimal,
+                            new_layout: ImageLayout::ShaderReadOnlyOptimal,
+                            image: image_id,
+                            subresource_range: ImageSubresourceRange {
+                                aspects: ImageAspects::COLOR,
+                                mip_levels: 0..mip_levels,
+                                array_layers: 0..array_layers,
+                            },
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })?;
+
+                    Ok(())
+                },
+                [(staging_buffer_id, HostAccessType::Write)],
+                [
+                    (staging_buffer_id, AccessTypes::COPY_TRANSFER_READ),
+                    (buffer_id, AccessTypes::COPY_TRANSFER_WRITE),
+                    (buffer_id, AccessTypes::COPY_TRANSFER_READ),
+                ],
+                [(
+                    image_id,
+                    AccessTypes::COLOR_ATTACHMENT_WRITE,
+                    ImageLayoutType::Optimal,
+                )],
+            )
+        }
+        .unwrap();
+
+        image_id
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let window = Arc::new(
+            event_loop
+                .create_window(Window::default_attributes())
+                .unwrap(),
+        );
+        let surface =
+            Surface::from_window(self.context.instance().clone(), window.clone()).unwrap();
+        let window_size = window.inner_size();
+
+        let (swapchain_format, swapchain_id) = {
+            let surface_capabilities = self
+                .context
+                .device()
+                .physical_device()
+                .surface_capabilities(&surface, Default::default())
+                .unwrap();
+            let (swapchain_format, _) = self
+                .context
+                .device()
+                .physical_device()
+                .surface_formats(&surface, Default::default())
+                .unwrap()[0];
+
+            let swapchain_id = self
+                .resources
+                .create_swapchain(
+                    self.flight_id,
+                    surface,
+                    SwapchainCreateInfo {
+                        min_image_count: surface_capabilities
+                            .min_image_count
+                            .max(self.resources.flight(self.flight_id).unwrap().frame_count()),
+                        image_format: swapchain_format,
+                        image_extent: window_size.into(),
+                        image_usage: ImageUsage::COLOR_ATTACHMENT,
+                        composite_alpha: surface_capabilities
+                            .supported_composite_alpha
+                            .into_iter()
+                            .next()
+                            .unwrap(),
+                        present_mode: PresentMode::Immediate,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            (swapchain_format, swapchain_id)
+        };
+
+        let mut task_graph = TaskGraph::new(&self.resources, 2, 2);
+
+        let virtual_swapchain_id = task_graph.add_swapchain(&SwapchainCreateInfo {
+            image_format: swapchain_format,
+            ..Default::default()
+        });
+        let virtual_framebuffer_id = task_graph.add_framebuffer();
+
+        let skybox_pipeline_layout = {
+            let descriptor_sets = vec![vec![DescriptorType::CombinedImageSampler]];
+
+            let push_constants_size = size_of::<skybox_vs::Camera>() as u32;
+
+            PipelineLayout::new(
+                self.context.device().clone(),
+                PipelineLayoutCreateInfo {
+                    set_layouts: descriptor_sets
+                        .into_iter()
+                        .map(|set| {
+                            let bindings = set
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, binding)| {
+                                    (
+                                        idx as u32,
+                                        (&DescriptorBindingRequirements {
+                                            descriptor_types: vec![binding],
+                                            descriptor_count: Some(1),
+                                            stages: ShaderStages::all_graphics(),
+                                            ..Default::default()
+                                        })
+                                            .into(),
+                                    )
+                                })
+                                .collect();
+
+                            DescriptorSetLayoutCreateInfo {
+                                bindings,
+                                ..Default::default()
+                            }
+                        })
+                        .map(|create_info| {
+                            DescriptorSetLayout::new(self.context.device().clone(), create_info)
+                                .unwrap()
+                        })
+                        .collect(),
+                    push_constant_ranges: vec![PushConstantRange {
+                        stages: ShaderStages::all_graphics(),
+                        offset: 0,
+                        size: push_constants_size,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        let tonemap_pipeline_layout = {
+            let descriptor_sets = vec![vec![DescriptorType::CombinedImageSampler]];
+
+            PipelineLayout::new(
+                self.context.device().clone(),
+                PipelineLayoutCreateInfo {
+                    set_layouts: descriptor_sets
+                        .into_iter()
+                        .map(|set| {
+                            let bindings = set
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, binding)| {
+                                    (
+                                        idx as u32,
+                                        (&DescriptorBindingRequirements {
+                                            descriptor_types: vec![binding],
+                                            descriptor_count: Some(1),
+                                            stages: ShaderStages::all_graphics(),
+                                            ..Default::default()
+                                        })
+                                            .into(),
+                                    )
+                                })
+                                .collect();
+
+                            DescriptorSetLayoutCreateInfo {
+                                bindings,
+                                ..Default::default()
+                            }
+                        })
+                        .map(|create_info| {
+                            DescriptorSetLayout::new(self.context.device().clone(), create_info)
+                                .unwrap()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        let sampler = Sampler::new(
+            self.context.device().clone(),
+            SamplerCreateInfo {
+                address_mode: [Repeat; 3],
+                ..SamplerCreateInfo {
+                    mag_filter: Filter::Linear,
+                    min_filter: Filter::Linear,
+                    address_mode: [Repeat; 3],
+                    ..Default::default()
+                }
+            },
+        )
+        .unwrap();
+
+        let skybox_image_id = {
+            let (pixels, header) =
+                load_ktx2("textures/helipad/ggx/specular.ktx2".to_string().as_str()).unwrap();
+            let extent = [header.pixel_width, header.pixel_height, 1];
+            let format = match header.format {
+                Some(ktx2::Format::R16G16B16A16_SFLOAT) => Format::R16G16B16A16_SFLOAT,
+                _ => panic!("Unsupported KTX2 format: {:?}", header.format),
+            };
+            assert_eq!(header.face_count, 6, "Must be cubemap!");
+            let mip_levels = header.level_count;
+            let array_layers = header.face_count;
+
+            self.upload_texture(&pixels, format, extent, mip_levels, array_layers)
+        };
+
+        let intermediate_format = Format::R16G16B16A16_SFLOAT;
+        let virtual_intermediate_image_id = task_graph.add_image(&ImageCreateInfo {
+            format: intermediate_format,
+            ..Default::default()
+        });
+
+        let intermediate_image_id = self
+            .resources
+            .create_image(
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: intermediate_format,
+                    extent: [window.inner_size().width, window.inner_size().height, 1],
+                    usage: ImageUsage::COLOR_ATTACHMENT
+                        | ImageUsage::SAMPLED
+                        | ImageUsage::TRANSFER_SRC
+                        | ImageUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .unwrap();
+
+        let skybox_node_id = task_graph
+            .create_task_node(
+                "Skybox",
+                QueueFamilyType::Graphics,
+                SkyboxTask::new(
+                    self,
+                    skybox_pipeline_layout,
+                    swapchain_format,
+                    skybox_image_id,
+                    sampler.clone(),
+                ),
+            )
+            .framebuffer(virtual_framebuffer_id)
+            .color_attachment(
+                virtual_intermediate_image_id,
+                AccessTypes::COLOR_ATTACHMENT_WRITE,
+                ImageLayoutType::Optimal,
+                &AttachmentInfo {
+                    clear: true,
+                    format: intermediate_format,
+                    ..Default::default()
+                },
+            )
+            .build();
+
+        let tonemap_node_id = task_graph
+            .create_task_node(
+                "Tonemap",
+                QueueFamilyType::Graphics,
+                TonemapTask::new(
+                    self,
+                    tonemap_pipeline_layout,
+                    swapchain_format,
+                    intermediate_image_id,
+                    sampler,
+                ),
+            )
+            .framebuffer(virtual_framebuffer_id)
+            .color_attachment(
+                virtual_swapchain_id.current_image_id(),
+                AccessTypes::COLOR_ATTACHMENT_WRITE,
+                ImageLayoutType::Optimal,
+                &AttachmentInfo {
+                    clear: true,
+                    format: swapchain_format,
+                    ..Default::default()
+                },
+            )
+            .image_access(
+                virtual_intermediate_image_id,
+                AccessTypes::FRAGMENT_SHADER_SAMPLED_READ,
+                ImageLayoutType::Optimal,
+            )
+            .build();
+
+        task_graph
+            .add_edge(skybox_node_id, tonemap_node_id)
+            .unwrap();
+
+        let mut task_graph = unsafe {
+            task_graph.compile(&CompileInfo {
+                queues: &[self.context.graphics_queue()],
+                present_queue: Some(self.context.graphics_queue()),
+                flight_id: self.flight_id,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+
+        let viewport = Viewport {
+            offset: [0.0, 0.0],
+            extent: window.inner_size().into(),
+            depth_range: 0.0..=1.0,
+        };
+
+        let recreate_swapchain = false;
+
+        let camera = FirstPersonCamera::new();
+
+        self.rcx.replace(RenderContext {
+            window,
+            task_graph,
+            swapchain_id,
+            virtual_swapchain_id,
+            virtual_intermediate_image_id,
+            intermediate_image_id,
+            viewport,
+            camera,
+            recreate_swapchain,
+        });
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let rcx = self.rcx.as_mut().unwrap();
+        match event {
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+            }
+            WindowEvent::Resized(_) => {
+                rcx.recreate_swapchain = true;
+            }
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.set_cursor_confinement(true);
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if self.input_state.cursor_confined {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        let pressed = match event.state {
+                            ElementState::Pressed => true,
+                            ElementState::Released => false,
+                        };
+                        match code {
+                            KeyCode::Escape => self.set_cursor_confinement(false),
+                            KeyCode::KeyW => self.input_state.forward = pressed,
+                            KeyCode::KeyA => self.input_state.left = pressed,
+                            KeyCode::KeyS => self.input_state.backward = pressed,
+                            KeyCode::KeyD => self.input_state.right = pressed,
+                            KeyCode::KeyQ => event_loop.exit(),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                let delta_t = self.frame_timer.next_frame();
+
+                if self.input_state.forward {
+                    rcx.camera.move_forward(delta_t);
+                }
+                if self.input_state.backward {
+                    rcx.camera.move_backward(delta_t);
+                }
+                if self.input_state.left {
+                    rcx.camera.move_left(delta_t);
+                }
+                if self.input_state.right {
+                    rcx.camera.move_right(delta_t);
+                }
+                if self.input_state.mouse_dy != 0.0 || self.input_state.mouse_dx != 0.0 {
+                    rcx.camera.rotate(
+                        self.input_state.mouse_dx as f32,
+                        self.input_state.mouse_dy as f32,
+                    );
+                }
+                self.input_state.mouse_dx = 0.0;
+                self.input_state.mouse_dy = 0.0;
+
+                let flight = self.resources.flight(self.flight_id).unwrap();
+                let window_size = rcx.window.inner_size();
+                if window_size.width == 0 || window_size.height == 0 {
+                    return;
+                }
+
+                if rcx.recreate_swapchain {
+                    rcx.swapchain_id = self
+                        .resources
+                        .recreate_swapchain(rcx.swapchain_id, |create_info| SwapchainCreateInfo {
+                            image_extent: window_size.into(),
+                            ..create_info
+                        })
+                        .expect("failed to recreate swapchain");
+
+                    rcx.viewport.extent = window_size.into();
+
+                    rcx.recreate_swapchain = false;
+                }
+
+                flight.wait(None).unwrap();
+                let resource_map = resource_map!(
+                    &rcx.task_graph,
+                    rcx.virtual_swapchain_id => rcx.swapchain_id,
+                    rcx.virtual_intermediate_image_id => rcx.intermediate_image_id,
+                )
+                .unwrap();
+                match unsafe {
+                    rcx.task_graph.execute(resource_map, rcx, || {
+                        rcx.window.pre_present_notify();
+                    })
+                } {
+                    Ok(()) => {}
+                    Err(ExecuteError::Swapchain {
+                        error: Validated::Error(VulkanError::OutOfDate),
+                        ..
+                    }) => {
+                        rcx.recreate_swapchain = true;
+                    }
+                    Err(e) => {
+                        panic!("failed to execute next frame: {e:?}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        #[allow(clippy::single_match)]
+        match event {
+            DeviceEvent::MouseMotion { delta: (dx, dy) } => {
+                if self.input_state.cursor_confined {
+                    self.input_state.mouse_dx += dx;
+                    self.input_state.mouse_dy += dy;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        self.rcx.as_ref().unwrap().window.request_redraw();
+    }
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self {
+            forward: false,
+            backward: false,
+            left: false,
+            right: false,
+            mouse_dx: 0.0,
+            mouse_dy: 0.0,
+            cursor_confined: false,
+        }
+    }
+}
+
+/*
+struct SkyboxTask {
+    pipeline: Option<Arc<GraphicsPipeline>>,
+    vertex_buffer_id: Id<Buffer>,
+    index_buffer_id: Id<Buffer>,
+    index_buffer_count: u32,
+    env_set: Arc<DescriptorSet>,
+    sampler_set: Arc<DescriptorSet>,
+}
+
+impl ApplicationHandler for NewApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(primary_window_id) = self.windows.primary_window_id() {
+            self.windows.remove_renderer(primary_window_id);
+        }
+
+        let window_id = self.windows.create_window(
+            event_loop,
+            &self.context,
+            &WindowDescriptor {
+                width: 1920.,
+                height: 1080.,
+                title: "rust_game".to_string(),
+                present_mode: PresentMode::Immediate,
+                ..Default::default()
+            },
+            |info| {
+                // Framebuffer needs TRANSFER_SRC so that it can be blitted onto the TransmissionFramebufferSampler
+                info.image_usage |= ImageUsage::TRANSFER_SRC;
+                info.min_image_count = 8;
+            },
+        );
+
+        let resources = Resources::new(&self.context.device(), &ResourcesCreateInfo::default());
+        let mut task_graph = TaskGraph::new(&resources, 3, 2);
+
+        let surface = self.windows.get_primary_renderer().unwrap().surface();
+
+        // let swapchain_format = self.windows.get_primary_renderer().unwrap().swapchain_format();
+        let (swapchain_format, _) = self
+            .context
+            .device()
+            .physical_device()
+            .surface_formats(&surface, Default::default())
+            .unwrap()
+            .into_iter()
+            .find(|&(format, color_space)| {
+                format.numeric_format_color() == Some(NumericFormat::SRGB)
+                    && color_space == ColorSpace::SrgbNonLinear
+            })
+            .unwrap();
+
+        let virtual_swapchain_id = task_graph.add_swapchain(&SwapchainCreateInfo {
+            image_format: swapchain_format,
+            ..Default::default()
+        });
+
+        let flight_id = resources.create_flight(2).unwrap();
+
+        let skybox_layout = {
+            let bindings = [
+                // set = 0
+                vec![DescriptorType::UniformBuffer], // binding = 0 uniform Environment
+
+                // set = 1
+                vec![DescriptorType::CombinedImageSampler],
+            ];
+
+            let push_constant_size = std::mem::size_of::<skybox_vs::Camera>();
+
+            PipelineLayout::new(
+                self.context.device().clone(),
+                PipelineLayoutCreateInfo {
+                    set_layouts: bindings
+                        .into_iter()
+                        .map(|set| {
+                            DescriptorSetLayout::new(
+                                self.context.device().clone(),
+                                DescriptorSetLayoutCreateInfo {
+                                    bindings: set
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(idx, binding)| {
+                                            (
+                                                idx as u32,
+                                                (&DescriptorBindingRequirements {
+                                                    descriptor_types: vec![binding],
+                                                    descriptor_count: Some(1),
+                                                    stages: ShaderStages::all_graphics(),
+                                                    ..Default::default()
+                                                })
+                                                    .into(),
+                                            )
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                },
+                            )
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>(),
+                    push_constant_ranges: vec![PushConstantRange {
+                        stages: ShaderStages::all_graphics(),
+                        offset: 0,
+                        size: push_constant_size as u32,
+                    }],
+                    ..Default::default()
+                },
+            )
+                .unwrap()
+        };
+
+        let (skybox_sampler_set, env_set) = {
+            let (pixels, header) = load_ktx2("textures/helipad/ggx/specular.ktx2".to_string().as_str()).unwrap();
+            let extent = [header.pixel_width, header.pixel_height, 1];
+            let format = match header.format {
+                Some(ktx2::Format::R16G16B16A16_SFLOAT) => Format::R16G16B16A16_SFLOAT,
+                _ => panic!("Unsupported KTX2 format: {:?}", header.format),
+            };
+            let texture_id = resources.create_image(
+                ImageCreateInfo {
+                    flags: ImageCreateFlags::CUBE_COMPATIBLE,
+                    image_type: ImageType::Dim2d,
+                    mip_levels: header.level_count,
+                    array_layers: header.face_count,
+                    format,
+                    extent,
+                    usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default()
+            ).unwrap();
+
+            let buffer_id = resources.create_buffer(
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                DeviceLayout::for_value(pixels.as_slice()).unwrap(),
+            ).unwrap();
+
+            let regions: Vec<_> = {
+                let mut buffer_offset = 0;
+                let mut mip_width = extent[0];
+                let mut mip_height = extent[1];
+                (0..header.level_count)
+                    .map(|mip_level| {
+                        let region = BufferImageCopy {
+                            buffer_offset,
+                            image_subresource: ImageSubresourceLayers {
+                                aspects: ImageAspects::COLOR,
+                                mip_level,
+                                array_layers: 0..header.face_count,
+                            },
+                            image_extent: [mip_width, mip_height, 1],
+                            ..Default::default()
+                        };
+
+                        buffer_offset += format.block_size()
+                            * DeviceSize::from(header.face_count * mip_width * mip_height);
+                        // Each successive Mip level is 4x smaller than the last, each dimension must be divided by 2
+                        mip_width /= 2;
+                        mip_height /= 2;
+
+                        region
+                    })
+                    .collect()
+            };
+
+            resources.flight(flight_id).unwrap().wait(None).unwrap();
+            unsafe {
+                vulkano_taskgraph::execute(
+                    &self.context.graphics_queue(),
+                    &resources,
+                    flight_id,
+                    |cbf, tcx| {
+                        tcx.write_buffer::<[u8]>(buffer_id, ..)?
+                            .copy_from_slice(&pixels);
+
+                        cbf.copy_buffer_to_image(
+                            &CopyBufferToImageInfo {
+                                src_buffer: buffer_id,
+                                dst_image: texture_id,
+                                dst_image_layout: ImageLayoutType::Optimal,
+                                regions: &regions,
+                                ..Default::default()
+                            }
+                        ).unwrap();
+                        Ok(())
+                    },
+                    [(buffer_id, HostAccessType::Write)],
+                    [(
+                        buffer_id,
+                        AccessTypes::COPY_TRANSFER_READ,
+                    )],
+                    [(
+                        texture_id,
+                        AccessTypes::COLOR_ATTACHMENT_WRITE,
+                        ImageLayoutType::Optimal,
+                    )],
+                ).unwrap()
+            }
+
+
+            let sampler = Sampler::new(
+                self.context.device().clone(),
+                SamplerCreateInfo {
+                    address_mode: [Repeat; 3],
+                    ..SamplerCreateInfo::simple_repeat_linear()
+                },
+            ).unwrap();
+
+            let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+                self.context.device().clone(),
+                Default::default(),
+            ));
+
+            let sampler_set = {
+                let state = resources.image(texture_id).unwrap();
+                let texture = state.image();
+
+                DescriptorSet::new(
+                    descriptor_set_allocator.clone(),
+                    skybox_layout.set_layouts()[1].clone(),
+                    [WriteDescriptorSet::image_view_sampler(
+                        0,
+                        ImageView::new_default(texture.clone()).unwrap(),
+                        sampler.clone(),
+                    )],
+                    [],
+                ).unwrap()
+            };
+
+            let env_set = {
+                let uniform = skybox_vs::Environment {
+                    u_MipCount: (header.level_count as i32).into(),
+                    u_EnvRotation: [
+                        Padded([0f32, 0., -1.]),
+                        Padded([0., 1., 0.]),
+                        Padded([1., 0., 0.]),
+                    ]
+                        .into(),
+                    u_EnvIntensity: 1.0.into(),
+                };
+                let buffer_id = resources.create_buffer(
+                    BufferCreateInfo {
+                        usage: BufferUsage::UNIFORM_BUFFER,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    DeviceLayout::new_sized::<skybox_vs::Environment>(),
+                ).unwrap();
+
+                resources.flight(flight_id).unwrap().wait(None).unwrap();
+                unsafe {
+                    vulkano_taskgraph::execute(
+                        &self.context.graphics_queue(),
+                        &resources,
+                        flight_id,
+                        |cbf, tcx| {
+                            *tcx.write_buffer(buffer_id, ..)? = uniform;
+                            Ok(())
+                        },
+                        [(buffer_id, HostAccessType::Write)],
+                        [],
+                        [],
+                    ).unwrap()
+                }
+
+                let buffer_state = resources.buffer(buffer_id).unwrap();
+                let buffer = buffer_state.buffer();
+
+                DescriptorSet::new(
+                    descriptor_set_allocator.clone(),
+                    skybox_layout.set_layouts()[0].clone(),
+                    [WriteDescriptorSet::buffer(0, buffer.clone().into())],
+                    [],
+                ).unwrap()
+            };
+
+            (sampler_set, env_set)
+        };
+        let virtual_framebuffer_id = task_graph.add_framebuffer();
+
+        let skybox_node_id = task_graph
+            .create_task_node(
+                "Scene",
+                QueueFamilyType::Graphics,
+                SkyboxTask::new(&resources, self.context.graphics_queue(), flight_id.clone(), env_set, skybox_sampler_set,),
+            )
+            .framebuffer(virtual_framebuffer_id)
+            .color_attachment(
+                virtual_swapchain_id.current_image_id(),
+                AccessTypes::COLOR_ATTACHMENT_WRITE,
+                ImageLayoutType::Optimal,
+                &AttachmentInfo {
+                    clear: true,
+                    format: swapchain_format,
+                    ..Default::default()
+                },
+            )
+            .image_access(
+                virtual_swapchain_id.current_image_id(),
+                AccessTypes::COLOR_ATTACHMENT_READ,
+                ImageLayoutType::Optimal,
+            )
+            .build();
+
+        let viewport = Viewport {
+            offset: [0.0, 0.0],
+            extent: self.windows.get_primary_window().unwrap().inner_size().into(),
+            depth_range: 0.0..=1.0,
+        };
+
+        let mut task_graph = unsafe {
+            task_graph.compile(&CompileInfo {
+                queues: &[&self.context.graphics_queue()],
+                present_queue: Some(&self.context.graphics_queue()),
+                flight_id,
+                ..Default::default()
+            })
+        }.unwrap();
+
+
+        let skybox_node = task_graph.task_node_mut(skybox_node_id).unwrap();
+        skybox_node
+            .task_mut()
+            .downcast_mut::<SkyboxTask>()
+            .unwrap()
+            .create_pipeline(&self.context.device(), Format::R16G16B16A16_SFLOAT, skybox_layout);
+
+        let surface_capabilities = self
+            .context
+            .device()
+            .physical_device()
+            .surface_capabilities(&surface, Default::default())
+            .unwrap();
+
+        let (swapchain_format, _) = self
+            .context
+            .device()
+            .physical_device()
+            .surface_formats(&surface, Default::default())
+            .unwrap()
+            .into_iter()
+            .find(|&(format, color_space)| {
+                format.numeric_format_color() == Some(NumericFormat::SRGB)
+                    && color_space == ColorSpace::SrgbNonLinear
+            })
+            .unwrap();
+
+        let swapchain_id = resources
+            .create_swapchain(
+                flight_id,
+                surface,
+                SwapchainCreateInfo {
+                    min_image_count: surface_capabilities.min_image_count.max(3),
+                    image_format: swapchain_format,
+                    image_extent: [1920, 1080].into(), //TODO
+                    image_usage: ImageUsage::COLOR_ATTACHMENT,
+                    composite_alpha: surface_capabilities
+                        .supported_composite_alpha
+                        .into_iter()
+                        .next()
+                        .unwrap(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let camera = FirstPersonCamera::default();
+
+        self.rcx.replace(NewRenderContext {
+            resources,
+            task_graph,
+            viewport,
+            flight_id,
+            virtual_swapchain_id,
+            swapchain_id,
+            camera,
+        });
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(_) => {
+                self.windows
+                    .get_primary_renderer_mut()
+                    .map(VulkanoWindowRenderer::resize);
+            },
+            WindowEvent::RedrawRequested => {
+                self.frame_timer.next_frame();
+
+                let rcx = self.rcx.as_mut().unwrap();
+
+                let flight = rcx.resources.flight(rcx.flight_id).unwrap();
+                flight.wait(None).unwrap();
+
+                let resource_map = resource_map!(
+                    &rcx.task_graph,
+                    rcx.virtual_swapchain_id => rcx.swapchain_id,
+                ).unwrap();
+
+                match unsafe {
+                    rcx.task_graph.execute(resource_map, rcx, ||{})
+                } {
+                    Ok(_) => (),
+                    Err(ExecuteError::Swapchain {
+                            error: Validated::Error(VulkanError::OutOfDate),
+                            ..
+                        }) => {
+                        // TODO: recreate swapchain
+                    }
+                    Err(e) => {
+                        panic!("failed to execute next frame: {e:?}");
+                    }
+                }
+
+                /*
+                let mut frame = self.core.begin_frame();
+
+                {
+                    // Skybox / Opaque / Translucent pass
+                    let mut pass = frame.opaque_pass();
+                }
+
+                 */
+
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+        self
+            .windows
+            .get_primary_renderer_mut()
+            .unwrap()
+            .window()
+            .request_redraw();
+    }
+}
+
+impl SkyboxTask {
+    fn new(
+        resources: &Arc<Resources>,
+        queue: &Arc<Queue>,
+        flight_id: Id<Flight>,
+        env_set: Arc<DescriptorSet>,
+        sampler_set: Arc<DescriptorSet>,
+    ) -> Self {
+        let (vertex_buffer_id, index_buffer_id, index_buffer_count) = {
+            let vertices: Vec<SkyboxVertex> = [
+                [-1.0, -1.0, -1.0],
+                [1.0, -1.0, -1.0],
+                [1.0, 1.0, -1.0],
+                [-1.0, 1.0, -1.0],
+                [-1.0, -1.0, 1.0],
+                [1.0, -1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [-1.0, 1.0, 1.0],
+            ]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+
+            let indices: Vec<u32> = [
+                1, 2, 0,
+                2, 3, 0,
+                6, 2, 1,
+                1, 5, 6,
+                6, 5, 4,
+                4, 7, 6,
+                6, 3, 2,
+                7, 3, 6,
+                3, 7, 0,
+                7, 4, 0,
+                5, 1, 0,
+                4, 5, 0,
+            ]
+                .into_iter()
+                .collect();
+
+            let index_buffer_count = indices.len() as u32;
+
+            let vertex_buffer_id = resources.create_buffer(
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                DeviceLayout::for_value(vertices.as_slice()).unwrap(),
+            )
+                .unwrap();
+
+            resources.flight(flight_id).unwrap().wait(None).unwrap();
+            unsafe {
+                vulkano_taskgraph::execute(
+                    queue,
+                    &resources,
+                    flight_id,
+                    |_cbf, tcx| {
+                        tcx.write_buffer::<[SkyboxVertex]>(vertex_buffer_id, ..)?
+                            .copy_from_slice(&vertices);
+                        Ok(())
+                    },
+                    [(vertex_buffer_id, HostAccessType::Write)],
+                    [],
+                    [],
+                )
+            }.unwrap();
+
+            let index_buffer_id = resources.create_buffer(
+                BufferCreateInfo {
+                    usage: BufferUsage::INDEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                DeviceLayout::for_value(indices.as_slice()).unwrap(),
+            )
+                .unwrap();
+
+            resources.flight(flight_id).unwrap().wait(None).unwrap();
+            unsafe {
+                vulkano_taskgraph::execute(
+                    queue,
+                    &resources,
+                    flight_id,
+                    |_cbf, tcx| {
+                        tcx.write_buffer::<[u32]>(index_buffer_id, ..)?
+                            .copy_from_slice(&indices);
+                        Ok(())
+                    },
+                    [(index_buffer_id, HostAccessType::Write)],
+                    [],
+                    [],
+                )
+            }.unwrap();
+
+            (vertex_buffer_id, index_buffer_id, index_buffer_count)
+        };
+
+        Self {
+            pipeline: None,
+            vertex_buffer_id,
+            index_buffer_id,
+            index_buffer_count,
+            env_set,
+            sampler_set,
+        }
+    }
+
+    fn create_pipeline(&mut self, device: &Arc<Device>, format: Format, layout: Arc<PipelineLayout>) {
+        let vs = skybox_vs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+        let fs = skybox_fs::load(device.clone())
+            .unwrap()
+            .entry_point("main")
+            .unwrap();
+
+        let color_blend_state =
+            ColorBlendState::with_attachment_states(1, ColorBlendAttachmentState::default());
+        let depth_stencil_state = DepthStencilState::default();
+
+        self.pipeline = Some(
+            renderer::build_pipeline::<SkyboxVertex>(
+                device.clone(),
+                format,
+                layout,
+                vs,
+                fs,
+                color_blend_state,
+                depth_stencil_state,
+                CullMode::None,
+        ));
+    }
+}
+
+impl vulkano_taskgraph::Task for SkyboxTask {
+    type World = NewRenderContext;
+
+    unsafe fn execute(&self, cbf: &mut RecordingCommandBuffer<'_>, tcx: &mut TaskContext<'_>, rcx: &Self::World) -> TaskResult {
+        cbf.set_viewport(0, slice::from_ref(&rcx.viewport))?;
+        cbf.bind_pipeline_graphics(self.pipeline.as_ref().unwrap())?;
+        cbf.bind_vertex_buffers(0, &[self.vertex_buffer_id], &[0], &[], &[])?;
+        cbf.bind_index_buffer(self.index_buffer_id, 0, 0, IndexType::U32)?;
+        cbf.as_raw().bind_descriptor_sets(
+            PipelineBindPoint::Graphics,
+            self.pipeline.as_ref().unwrap().layout(),
+            0,
+            &[
+                self.env_set.as_raw(),
+                self.sampler_set.as_raw(),
+            ],
+            &[],
+        )?;
+
+        let aspect_ratio = 1920. / 1080.; // TODO
+        let proj = rcx.camera.projection_matrix(aspect_ratio);
+        let view = rcx.camera.view_matrix();
+        let position = rcx.camera.position;
+        let view_proj = proj * view;
+
+        cbf.push_constants(
+            self.pipeline.as_ref().unwrap().layout(),
+            0,
+            &skybox_vs::Camera {
+                u_ViewMatrix: view.into(),
+                u_ProjectionMatrix: proj.into(),
+                u_ViewProjectionMatrix: view_proj.into(),
+                u_Camera: position.into(),
+            },
+        ).unwrap();
+
+        unsafe { cbf.draw_indexed(self.index_buffer_count, 1, 0, 0, 0) }?;
+
+        Ok(())
+    }
+}
+
+ */
+
+impl FrameTimer {
+    fn new(frequency: Duration) -> Self {
+        Self {
+            frequency,
+            frames: 0,
+            frame_time: Instant::now(),
+            last_frame: Instant::now(),
+        }
+    }
+
+    fn next_frame(&mut self) -> Duration {
+        let frame_start = Instant::now();
+        self.frames += 1;
+        let total_time = self.frame_time.elapsed();
+        if total_time >= self.frequency {
+            let frame_time = total_time / self.frames;
+            let fps = self.frames as f64 / total_time.as_secs_f64();
+            println!("{} fps ({:.2?})", fps as u32, frame_time);
+            self.frames = 0;
+            self.frame_time = frame_start;
+        }
+        let delta_t = self.last_frame.elapsed();
+        self.last_frame = frame_start;
+
+        delta_t
+    }
 }
 
 struct Skybox {
@@ -122,7 +1523,7 @@ struct Samplers {
     wrap_sampler_mipmap: Arc<Sampler>,
 }
 
-struct App {
+struct OldApp {
     renderer: Renderer,
     vertex_buffer: Subbuffer<[CombinedVertex]>,
     index_buffer: Subbuffer<[u32]>,
@@ -140,28 +1541,18 @@ struct App {
     gui: Gui,
     imgui_ctx: imgui::Context,
     last_frame: Instant,
-    rcx: Option<RenderContext>,
+    rcx: Option<OldRenderContext>,
 }
 
-struct InputState {
-    forward: bool,
-    backward: bool,
-    left: bool,
-    right: bool,
-    mouse_dx: f64,
-    mouse_dy: f64,
-    cursor_confined: bool,
-}
-
-struct RenderContext {
+struct OldRenderContext {
     cubemap_pipeline: Arc<GraphicsPipeline>,
     cubemap_index_buffer: Subbuffer<[u32]>,
-    cubemap_vertex_buffer: Subbuffer<[CubemapVertex]>,
+    cubemap_vertex_buffer: Subbuffer<[SkyboxVertex]>,
     cubemap_index_count: u32,
     tonemap_pipeline: Arc<GraphicsPipeline>,
     transmissive_framebuffer_view: Arc<ImageView>,
     tonemap_framebuffer_view: Arc<ImageView>,
-    const_set: Arc<DescriptorSet>,
+    env_set: Arc<DescriptorSet>,
     skybox_set: Arc<DescriptorSet>,
     transmissive_framebuffer_set: Arc<DescriptorSet>,
     viewport: Viewport,
@@ -170,7 +1561,7 @@ struct RenderContext {
     imgui_renderer: imgui_vulkano_renderer::Renderer,
 }
 
-fn load_ktx2(path: &str) -> Result<(Pixels, ktx2::Header), Box<dyn Error>> {
+fn load_ktx2(path: &str) -> Result<(Vec<u8>, ktx2::Header), Box<dyn Error>> {
     let buf = std::fs::read(path)?;
     let reader = ktx2::Reader::new(buf)?;
     let header = reader.header();
@@ -210,7 +1601,7 @@ fn load_ktx2(path: &str) -> Result<(Pixels, ktx2::Header), Box<dyn Error>> {
         "Mip levels did not add up to the expected number of bytes",
     );
 
-    Ok((Pixels::U8(pixels), header))
+    Ok((pixels, header))
 }
 
 fn load_png(path: &str) -> Result<(Pixels, [u32; 3], Format), Box<dyn Error>> {
@@ -239,7 +1630,7 @@ fn load_png(path: &str) -> Result<(Pixels, [u32; 3], Format), Box<dyn Error>> {
     }
 }
 
-impl App {
+impl OldApp {
     #[allow(clippy::too_many_lines)]
     fn new() -> Self {
         let renderer = Renderer::new();
@@ -424,7 +1815,7 @@ impl App {
                     renderer
                         .upload_image(
                             &mut image_builder,
-                            pixels,
+                            Pixels::U8(pixels),
                             extent,
                             header.level_count,
                             header.face_count,
@@ -608,20 +1999,6 @@ impl App {
     }
 }
 
-impl Default for InputState {
-    fn default() -> Self {
-        Self {
-            forward: false,
-            backward: false,
-            left: false,
-            right: false,
-            mouse_dx: 0.0,
-            mouse_dy: 0.0,
-            cursor_confined: false,
-        }
-    }
-}
-
 fn build_material_texture_sets(
     mat: &Material,
     uniform_buffer_allocator: &SubbufferAllocator,
@@ -737,7 +2114,7 @@ fn build_material_texture_sets(
     (material_set, texture_set)
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler for OldApp {
     #[allow(clippy::too_many_lines)]
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(primary_window_id) = self.renderer.windows.primary_window_id() {
@@ -757,6 +2134,7 @@ impl ApplicationHandler for App {
             |info| {
                 // Framebuffer needs TRANSFER_SRC so that it can be blitted onto the TransmissionFramebufferSampler
                 info.image_usage |= ImageUsage::TRANSFER_SRC;
+                info.min_image_count = 8;
             },
         );
 
@@ -862,9 +2240,9 @@ impl ApplicationHandler for App {
             mat_prim_map
         };
 
-        let const_set = {
+        let env_set = {
             #[allow(clippy::useless_conversion)]
-            let uniform = fs::Constants {
+            let uniform = fs::Environment {
                 u_MipCount: min(
                     self.skyboxes.ggx.image().mip_levels() as i32,
                     self.skyboxes.charlie.image().mip_levels() as i32,
@@ -951,11 +2329,11 @@ impl ApplicationHandler for App {
                 }
             });
 
-        let const_set = DescriptorSet::new(
+        let env_set = DescriptorSet::new(
             self.renderer.allocators.descriptor_set.clone(),
             #[allow(clippy::get_first)]
             new_rcx.pipeline_layout.set_layouts()[0].clone(),
-            [const_set],
+            [env_set],
             [],
         )
         .unwrap();
@@ -1018,11 +2396,11 @@ impl ApplicationHandler for App {
                 )
                 .unwrap()
             };
-            let vs = cubemap_vs::load(self.renderer.context.device().clone())
+            let vs = skybox_vs::load(self.renderer.context.device().clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap();
-            let fs = cubemap_fs::load(self.renderer.context.device().clone())
+            let fs = skybox_fs::load(self.renderer.context.device().clone())
                 .unwrap()
                 .entry_point("main")
                 .unwrap();
@@ -1031,9 +2409,10 @@ impl ApplicationHandler for App {
                 ColorBlendState::with_attachment_states(1, ColorBlendAttachmentState::default());
             let depth_stencil_state = DepthStencilState::default();
 
-            renderer::build_pipeline::<CubemapVertex>(
+            renderer_old::build_pipeline::<SkyboxVertex>(
                 self.renderer.context.device().clone(),
-                Format::R16G16B16A16_SFLOAT,
+                // Format::R16G16B16A16_SFLOAT,
+                swapchain_format, // TODO
                 cubemap_layout,
                 vs,
                 fs,
@@ -1044,7 +2423,7 @@ impl ApplicationHandler for App {
         };
 
         let (cubemap_vertex_buffer, cubemap_index_buffer, cubemap_index_count) = {
-            let vertices: Vec<CubemapVertex> = [
+            let vertices: Vec<SkyboxVertex> = [
                 [-1.0, -1.0, -1.0],
                 [1.0, -1.0, -1.0],
                 [1.0, 1.0, -1.0],
@@ -1155,7 +2534,7 @@ impl ApplicationHandler for App {
                 ColorBlendState::with_attachment_states(1, ColorBlendAttachmentState::default());
             let depth_stencil_state = DepthStencilState::default();
 
-            renderer::build_fullscreen_pipeline(
+            renderer_old::build_fullscreen_pipeline(
                 self.renderer.context.device().clone(),
                 swapchain_format,
                 tonemap_layout,
@@ -1168,7 +2547,7 @@ impl ApplicationHandler for App {
 
         self.renderer.rcx.replace(new_rcx);
 
-        self.rcx.replace(RenderContext {
+        self.rcx.replace(OldRenderContext {
             cubemap_pipeline,
             cubemap_index_buffer,
             cubemap_vertex_buffer,
@@ -1176,7 +2555,7 @@ impl ApplicationHandler for App {
             tonemap_pipeline,
             transmissive_framebuffer_view,
             tonemap_framebuffer_view,
-            const_set,
+            env_set,
             skybox_set,
             transmissive_framebuffer_set,
             viewport,
@@ -1286,6 +2665,7 @@ impl ApplicationHandler for App {
                 // Begin rendering by acquiring the gpu future from the window renderer.
                 let previous_frame_end = window_renderer
                     .acquire(Some(Duration::from_millis(1000)), |swapchain_images| {
+                        dbg!(swapchain_images.len());
                         // Whenever the window resizes we need to recreate everything dependent
                         // on the window size. In this example that
                         // includes the swapchain, the framebuffers
@@ -1354,25 +2734,34 @@ impl ApplicationHandler for App {
                             .unwrap()
                         };
 
-                        let depth_image = Image::new(
-                            self.renderer.allocators.memory.clone(),
-                            ImageCreateInfo {
-                                image_type: ImageType::Dim2d,
-                                format: Format::D32_SFLOAT,
-                                extent: [window_size.width, window_size.height, 1],
-                                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
-                                ..Default::default()
-                            },
-                            AllocationCreateInfo::default(),
-                        )
-                        .expect("Failed to create depth image");
+                        let depth_image_views = swapchain_images
+                            .iter()
+                            .map(|image| {
+                                let extent = image.image().extent();
+                                let depth_image = Image::new(
+                                    self.renderer.allocators.memory.clone(),
+                                    ImageCreateInfo {
+                                        image_type: ImageType::Dim2d,
+                                        format: Format::D32_SFLOAT,
+                                        extent,
+                                        usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                                        ..Default::default()
+                                    },
+                                    AllocationCreateInfo::default(),
+                                )
+                                .expect("Failed to create depth image");
 
-                        new_rcx.depth_image_view = ImageView::new_default(depth_image)
-                            .expect("Failed to create depth image view");
+                                ImageView::new_default(depth_image)
+                                    .expect("Failed to create depth image view")
+                            })
+                            .collect::<Vec<_>>();
+
+                        new_rcx.depth_image_views = depth_image_views;
                         rcx.viewport.extent = window_size.into();
                     })
                     .unwrap();
 
+                /*
                 if self.input_state.forward {
                     self.camera.move_forward(delta_t);
                 }
@@ -1393,6 +2782,8 @@ impl ApplicationHandler for App {
                 }
                 self.input_state.mouse_dx = 0.0;
                 self.input_state.mouse_dy = 0.0;
+
+                 */
 
                 // In order to draw, we have to record a *command buffer*. The command buffer
                 // object holds the list of commands that are going to be executed.
@@ -1516,14 +2907,20 @@ impl ApplicationHandler for App {
                             store_op: AttachmentStoreOp::Store,
                             clear_value: Some(ClearValue::Float([1.0, 0.0, 1.0, 1.0])),
                             ..RenderingAttachmentInfo::image_view(
-                                rcx.tonemap_framebuffer_view.clone(),
+                                // rcx.tonemap_framebuffer_view.clone(),
+                                new_rcx.attachment_image_views
+                                    [window_renderer.image_index() as usize]
+                                    .clone(),
                             )
                         })],
                         depth_attachment: Some(RenderingAttachmentInfo {
                             load_op: AttachmentLoadOp::Clear,
                             store_op: AttachmentStoreOp::Store,
                             clear_value: Some(1.0f32.into()),
-                            ..RenderingAttachmentInfo::image_view(new_rcx.depth_image_view.clone())
+                            ..RenderingAttachmentInfo::image_view(
+                                new_rcx.depth_image_views[window_renderer.image_index() as usize]
+                                    .clone(),
+                            )
                         }),
                         ..Default::default()
                     })
@@ -1539,7 +2936,7 @@ impl ApplicationHandler for App {
                             PipelineBindPoint::Graphics,
                             rcx.cubemap_pipeline.layout().clone(),
                             0,
-                            rcx.const_set.clone(),
+                            rcx.env_set.clone(),
                         )
                         .unwrap();
                     builder
@@ -1567,6 +2964,10 @@ impl ApplicationHandler for App {
 
                     unsafe { builder.draw_indexed(rcx.cubemap_index_count, 1, 0, 0, 0) }.unwrap();
                 }
+
+                builder.end_rendering().unwrap(); // TODO
+
+                /*
 
                 builder
                     .bind_vertex_buffers(0, self.vertex_buffer.clone())
@@ -1750,7 +3151,7 @@ impl ApplicationHandler for App {
                                     load_op: AttachmentLoadOp::Load, // Keep depth buffer
                                     store_op: AttachmentStoreOp::Store,
                                     ..RenderingAttachmentInfo::image_view(
-                                        new_rcx.depth_image_view.clone(),
+                                        new_rcx.depth_image_views[window_renderer.image_index() as usize].clone(),
                                     )
                                 }),
                                 ..Default::default()
@@ -2306,6 +3707,8 @@ impl ApplicationHandler for App {
                         .unwrap();
                 }
 
+                 */
+
                 // Finish recording the command buffer by calling `end`.
                 let command_buffer = builder.build().unwrap();
 
@@ -2318,7 +3721,10 @@ impl ApplicationHandler for App {
                     .boxed();
 
                 let window_renderer = self.renderer.windows.get_primary_renderer_mut().unwrap();
-                window_renderer.present(future, true);
+                let time = Instant::now();
+                let future = Box::new(future.then_signal_fence_and_flush().unwrap());
+                window_renderer.present(future, false);
+                dbg!(time.elapsed());
             }
             _ => {}
         }
@@ -2402,7 +3808,7 @@ where
     )
     .unwrap();
     builder
-        .copy_buffer(CopyBufferInfo::buffers(
+        .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
             staging_buffer,
             device_local_buffer.clone(),
         ))

@@ -72,13 +72,13 @@ layout (push_constant) uniform Object {
     mat4 u_NormalMatrix;
 } object;
 
-layout (set = 0, binding = 0) uniform Constants {
+layout (set = 0, binding = 0) uniform Environment {
     int     u_MipCount;
     int     u_FramebufferMipCount;
     mat3    u_EnvRotation;
     float   u_EnvIntensity;
     float   u_Exposure;
-} c;
+} env;
 
 layout (set = 1, binding = 0) uniform Camera {
     mat4 u_ViewMatrix;

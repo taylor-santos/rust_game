@@ -1,9 +1,9 @@
-use std::f32::consts::{FRAC_PI_4, PI};
-use std::ops::Neg;
-
 use cgmath::num_traits::clamp;
 use cgmath::prelude::*;
 use cgmath::{Deg, Matrix4, Point3, Rad, Vector3};
+use std::f32::consts::{FRAC_PI_4, PI};
+use std::ops::Neg;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct FirstPersonCamera {
@@ -33,24 +33,24 @@ impl FirstPersonCamera {
         );
     }
 
-    pub fn move_forward(&mut self, delta_time: f32) {
+    pub fn move_forward(&mut self, delta_time: Duration) {
         let forward = self.forward();
-        self.position += forward * self.speed * delta_time;
+        self.position += forward * self.speed * delta_time.as_secs_f32();
     }
 
-    pub fn move_backward(&mut self, delta_time: f32) {
+    pub fn move_backward(&mut self, delta_time: Duration) {
         let forward = self.forward();
-        self.position -= forward * self.speed * delta_time;
+        self.position -= forward * self.speed * delta_time.as_secs_f32();
     }
 
-    pub fn move_left(&mut self, delta_time: f32) {
+    pub fn move_left(&mut self, delta_time: Duration) {
         let right = self.right();
-        self.position -= right * self.speed * delta_time;
+        self.position -= right * self.speed * delta_time.as_secs_f32();
     }
 
-    pub fn move_right(&mut self, delta_time: f32) {
+    pub fn move_right(&mut self, delta_time: Duration) {
         let right = self.right();
-        self.position += right * self.speed * delta_time;
+        self.position += right * self.speed * delta_time.as_secs_f32();
     }
 
     fn forward(&self) -> Vector3<f32> {

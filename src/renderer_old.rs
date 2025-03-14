@@ -68,7 +68,7 @@ pub struct Allocators {
 
 pub struct RendererContext {
     pub attachment_image_views: Vec<Arc<ImageView>>,
-    pub depth_image_view: Arc<ImageView>,
+    pub depth_image_views: Vec<Arc<ImageView>>,
     pub pipeline_layout: Arc<PipelineLayout>,
 }
 
@@ -912,20 +912,26 @@ impl RendererContext {
 
         let attachment_image_views = window_renderer.swapchain_image_views().to_vec();
 
-        let depth_image = Image::new(
-            renderer.allocators.memory.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: Format::D32_SFLOAT,
-                extent: [window_size.width, window_size.height, 1],
-                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .expect("Failed to create depth image");
-        let depth_image_view =
-            ImageView::new_default(depth_image).expect("Failed to create depth image view");
+        let depth_image_views = attachment_image_views
+            .iter()
+            .map(|image| {
+                let extent = image.image().extent();
+                let depth_image = Image::new(
+                    renderer.allocators.memory.clone(),
+                    ImageCreateInfo {
+                        image_type: ImageType::Dim2d,
+                        format: Format::D32_SFLOAT,
+                        extent,
+                        usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo::default(),
+                )
+                .expect("Failed to create depth image");
+
+                ImageView::new_default(depth_image).expect("Failed to create depth image view")
+            })
+            .collect::<Vec<_>>();
 
         let pipeline_layout = renderer.build_pipeline_layout(
             &[
@@ -954,7 +960,7 @@ impl RendererContext {
 
         Self {
             attachment_image_views,
-            depth_image_view,
+            depth_image_views,
             pipeline_layout,
         }
     }
